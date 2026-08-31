@@ -1,0 +1,14 @@
+project_id                     = "elevate-cyvisser"
+region                         = "europe-west4"
+firestore_database_id          = "redwood"
+firestore_edition              = "ENTERPRISE"
+enable_pitr                    = true
+bigquery_dataset_id            = "redwood_retail"
+gcs_bucket_name_prefix         = "redwood-retail"
+service_account_id             = "dataflow-redwood-sa"
+service_account_display_name   = "Dataflow Redwood Retail Service Account"
+enable_change_stream           = true
+change_stream_name             = "orders-stream"
+change_stream_collection_group = "orders"
+change_stream_retention        = "7d"
+dataflow_job_name              = "firestore-orders-to-bigquery"
