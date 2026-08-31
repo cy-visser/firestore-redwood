@@ -14,43 +14,7 @@ This project implements a production-ready Change Data Capture (CDC) streaming p
 
 ---
 
-## 2. Directory Layout
-
-```text
-firestore/redwood/
-├── README.md                                 # Complete project and deployment documentation
-├── firestore_auth.py                         # Centralized IAM / MONGODB-OIDC authentication provider
-├── retail_catalog.py                         # Retail dataset schemas and synthetic data generator models
-├── generate_retail_dataset.py                # Multithreaded retail order generator storing docs in Firestore
-├── test_change_stream_watch.py               # Interactive CLI test capturing live insert/update/delete events
-├── bigquery_churn_sentiment_analysis.sql     # SQL analytics suite for customer churn and revenue intelligence
-├── dataflow/                                 # Dataflow streaming pipeline source package
-│   ├── dataflow_firestore_to_bigquery_beam.py# Apache Beam streaming CDC pipeline
-│   ├── setup.py                              # Worker package distribution and dependency specification
-│   └── firestore_auth.py -> ../firestore_auth.py # Symlinked auth module for worker packaging
-└── terraform/                                # Infrastructure as Code (IaC) configuration
-    ├── providers.tf                          # Google & Google-Beta Terraform provider definitions
-    ├── services.tf                           # Required Google Cloud API enablement
-    ├── firestore.tf                          # Firestore Enterprise database resource
-    ├── change_stream.tf                      # Firestore Change Stream lifecycle orchestration
-    ├── network.tf                            # Dedicated VPC network, subnetwork, Router, NAT & Firewall
-    ├── iam.tf                                # Service account and least-privilege IAM role bindings
-    ├── storage.tf                            # Cloud Storage staging & temporary bucket for Dataflow
-    ├── bigquery.tf                           # BigQuery dataset and orders_cdc table with schema
-    ├── dataflow.tf                           # Dataflow streaming job launch and teardown orchestration
-    ├── variables.tf                          # Input variable declarations and defaults
-    ├── terraform.tfvars                      # Environment-specific configuration values
-    ├── outputs.tf                            # Output values (table IDs, bucket URLs, Service Accounts)
-    └── scripts/                              # Shell automation helpers
-        ├── setup_change_stream.sh            # Provisions change stream and waits for startTime activation
-        ├── cleanup_change_stream.sh          # Deletes change stream on terraform destroy
-        ├── launch_dataflow_job.sh            # Submits the streaming pipeline to Cloud Dataflow
-        └── cleanup_dataflow_job.sh           # Drains/cancels the Cloud Dataflow job on terraform destroy
-```
-
----
-
-## 3. Prerequisites
+## 2. Prerequisites
 
 Ensure you have the following installed and authenticated:
 
@@ -77,7 +41,7 @@ Ensure you have the following installed and authenticated:
 
 ---
 
-## 4. Greenfield Deployment Guide
+## 3. Greenfield Deployment Guide
 
 The entire infrastructure—including Firestore Enterprise, Change Streams, dedicated VPC networking, IAM service accounts, BigQuery tables, and the Cloud Dataflow streaming job—is provisioned deterministically with Terraform.
 
@@ -121,7 +85,7 @@ terraform apply -auto-approve
 
 ---
 
-## 5. Verification & Monitoring
+## 4. Verification & Monitoring
 
 ### 1. Verify Firestore Change Stream
 ```bash
@@ -146,7 +110,7 @@ bq show elevate-cyvisser:redwood_retail.orders_cdc
 
 ---
 
-## 6. Testing Real-Time Replication
+## 5. Testing Real-Time Replication
 
 ### A. Run Interactive Change Stream Test
 Execute [`test_change_stream_watch.py`](file:///usr/local/google/home/cyvisser/source/firestore/redwood/test_change_stream_watch.py) to watch live `insert`, `update`, and `delete` events captured over IAM authentication:
@@ -180,7 +144,7 @@ LIMIT 10;
 
 ---
 
-## 7. BigQuery Retail Analytics
+## 6. BigQuery Retail Analytics
 
 The file [`bigquery_churn_sentiment_analysis.sql`](file:///usr/local/google/home/cyvisser/source/firestore/redwood/bigquery_churn_sentiment_analysis.sql) provides comprehensive analytical queries including:
 
@@ -190,7 +154,7 @@ The file [`bigquery_churn_sentiment_analysis.sql`](file:///usr/local/google/home
 
 ---
 
-## 8. Teardown & Cleanup
+## 7. Teardown & Cleanup
 
 To destroy all cloud resources and stop all billing:
 
@@ -211,7 +175,7 @@ terraform destroy -auto-approve
 
 ---
 
-## 9. Security & Authentication Architecture
+## 8. Security & Authentication Architecture
 
 * **Zero-Secret Design**: No usernames, passwords, or `.env` files are stored in code or on disk.
 * **IAM `MONGODB-OIDC` Authentication**: Python applications and Beam worker VMs exchange Google Cloud OAuth2 / Application Default Credentials tokens with Firestore's MongoDB endpoint on port 443 over TLS.
