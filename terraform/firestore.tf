@@ -1,14 +1,20 @@
-resource "google_firestore_database" "database" {
-  provider = google-beta
-  project  = var.project_id
-  name     = var.firestore_database_id
+resource "terraform_data" "firestore_database" {
+  triggers_replace = [
+    var.project_id,
+    var.region,
+    var.firestore_database_id,
+    var.firestore_edition,
+    var.enable_pitr
+  ]
 
-  location_id                       = var.region
-  type                              = "FIRESTORE_NATIVE"
-  database_edition                  = var.firestore_edition
-  point_in_time_recovery_enablement = var.enable_pitr ? "POINT_IN_TIME_RECOVERY_ENABLED" : "POINT_IN_TIME_RECOVERY_DISABLED"
-  deletion_policy                   = "DELETE"
-  delete_protection_state           = "DELETE_PROTECTION_DISABLED"
+  provisioner "local-exec" {
+    command = "bash ${path.module}/scripts/manage_firestore_database.sh create '${var.project_id}' '${var.firestore_database_id}' '${var.region}' '${lower(var.firestore_edition)}' '${var.enable_pitr}'"
+  }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = "bash ${path.module}/scripts/manage_firestore_database.sh delete '${self.triggers_replace[0]}' '${self.triggers_replace[2]}' '${self.triggers_replace[1]}'"
+  }
 
   depends_on = [
     google_project_service.services["firestore.googleapis.com"]

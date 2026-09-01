@@ -95,3 +95,21 @@ COMPLAINT_REASONS = [
     "LATE_DELIVERY", "DEFECTIVE_COMPONENT", "DAMAGED_FREIGHT",
     "BILLING_DISPUTE", "POOR_SUPPORT_RESPONSE", "RMA_DELAY"
 ]
+
+# Loyalty Program Tiers
+LOYALTY_TIERS = [
+    {"tier": "NONE", "isMember": 0, "discountRate": 0.0, "weight": 0.35},
+    {"tier": "BRONZE", "isMember": 1, "discountRate": 0.05, "weight": 0.25},
+    {"tier": "SILVER", "isMember": 1, "discountRate": 0.10, "weight": 0.20},
+    {"tier": "GOLD", "isMember": 1, "discountRate": 0.15, "weight": 0.12},
+    {"tier": "PLATINUM", "isMember": 1, "discountRate": 0.20, "weight": 0.06},
+    {"tier": "ENTERPRISE_VIP", "isMember": 1, "discountRate": 0.25, "weight": 0.02}
+]
+
+# Sentiment Score Ranges (-1.0 to +1.0)
+FEEDBACK_SENTIMENT_RANGES = {
+    "POSITIVE": (0.60, 0.98),
+    "NEUTRAL": (-0.15, 0.35),
+    "NEGATIVE": (-0.95, -0.40)
+}
+

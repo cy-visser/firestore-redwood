@@ -1,45 +1,34 @@
 """
-Google Cloud Service Account & IAM Authentication helper for Firestore Enterprise (MongoDB API).
-Uses MONGODB-OIDC and Google Cloud Application Default Credentials (ADC) / OAuth2 access tokens.
+Google Cloud Service Account & IAM Authentication helper for Firestore Enterprise Native.
+Uses official Google Cloud Firestore Client SDK with Application Default Credentials (ADC).
 """
 
-import subprocess
-import google.auth
-import google.auth.transport.requests
-from pymongo import MongoClient
-from pymongo.auth_oidc import OIDCCallback, OIDCCallbackResult, OIDCCallbackContext
+import os
+try:
+    from dotenv import load_dotenv, find_dotenv
+    load_dotenv(find_dotenv(usecwd=True))
+except ImportError:
+    pass
+
+from google.cloud import firestore
+
+# Load environment configuration from .env if present
+DEFAULT_PROJECT = os.getenv("GCP_PROJECT_ID") or os.getenv("GCP_PROJECT")
+DEFAULT_DATABASE = os.getenv("FIRESTORE_DATABASE_ID") or os.getenv("FIRESTORE_DATABASE")
+DEFAULT_REGION = os.getenv("GCP_REGION")
 
 
-class GoogleOIDCCallback(OIDCCallback):
-    """Refreshes and supplies Google OAuth2 access tokens for PyMongo MONGODB-OIDC."""
-    def __init__(self):
-        self.credentials, self.project = google.auth.default(
-            scopes=["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/datastore"]
-        )
-        self.auth_req = google.auth.transport.requests.Request()
-
-    def fetch(self, context: OIDCCallbackContext) -> OIDCCallbackResult:
-        self.credentials.refresh(self.auth_req)
-        return OIDCCallbackResult(access_token=self.credentials.token)
-
-
-def get_firestore_mongo_client(project_id="elevate-cyvisser", database_id="redwood", region="europe-west4"):
+def get_firestore_native_client(project_id=None, database_id=None) -> firestore.Client:
     """
-    Returns an authenticated PyMongo MongoClient connected to Firestore Enterprise
-    via MONGODB-OIDC using the current Google Cloud IAM / Service Account context.
+    Returns an authenticated Google Cloud Firestore Native Client
+    using Application Default Credentials (ADC) / IAM Service Account.
     """
-    cmd = [
-        "gcloud", "firestore", "databases", "describe",
-        f"--database={database_id}",
-        f"--project={project_id}",
-        "--format=value(uid)"
-    ]
-    uid = subprocess.check_output(cmd, text=True).strip()
-    host = f"{uid}.{region}.firestore.goog"
-    uri = f"mongodb://{host}:443/{database_id}?loadBalanced=true&tls=true&retryWrites=false&authMechanism=MONGODB-OIDC"
+    project = project_id or DEFAULT_PROJECT
+    database = database_id or DEFAULT_DATABASE or "(default)"
+    return firestore.Client(project=project, database=database)
 
-    return MongoClient(
-        uri,
-        authMechanismProperties={"OIDC_CALLBACK": GoogleOIDCCallback()},
-        serverSelectionTimeoutMS=8000
-    )
+
+def get_firestore_client(project_id=None, database_id=None) -> firestore.Client:
+    """Backward-compatible alias for get_firestore_native_client."""
+    return get_firestore_native_client(project_id=project_id, database_id=database_id)
+

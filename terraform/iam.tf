@@ -9,7 +9,7 @@ resource "google_service_account" "pipeline_sa" {
   ]
 }
 
-# Service Account Firestore Owner Permission (for MongoDB API / OIDC / Change Stream Access)
+# Service Account Firestore Owner Permission (for Native Firestore & Datastore Access)
 resource "google_project_iam_member" "sa_firestore_owner" {
   project = var.project_id
   role    = "roles/datastore.owner"

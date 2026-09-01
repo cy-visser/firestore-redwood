@@ -34,6 +34,12 @@ variable "bigquery_dataset_id" {
   default     = "redwood_retail"
 }
 
+variable "bigquery_cdc_table_id" {
+  description = "The BigQuery table ID for real-time CDC events."
+  type        = string
+  default     = "retail_cdc"
+}
+
 variable "gcs_bucket_name_prefix" {
   description = "Prefix for the Cloud Storage bucket name."
   type        = string
@@ -52,32 +58,14 @@ variable "service_account_display_name" {
   default     = "Dataflow Redwood Retail Service Account"
 }
 
-variable "enable_change_stream" {
-  description = "Whether to provision and manage Firestore MongoDB Change Streams."
-  type        = bool
-  default     = true
-}
-
-variable "change_stream_name" {
-  description = "Identifier for the Firestore change stream."
+variable "firestore_collection" {
+  description = "The Firestore collection to stream to BigQuery."
   type        = string
-  default     = "orders-stream"
-}
-
-variable "change_stream_collection_group" {
-  description = "Target collection group for the Firestore change stream."
-  type        = string
-  default     = "orders"
-}
-
-variable "change_stream_retention" {
-  description = "Retention period for the change stream (between 1d and 7d)."
-  type        = string
-  default     = "7d"
+  default     = "retail"
 }
 
 variable "dataflow_job_name" {
   description = "Name for the Dataflow streaming CDC replication job."
   type        = string
-  default     = "firestore-orders-to-bigquery"
+  default     = "firestore-retail-to-bigquery"
 }

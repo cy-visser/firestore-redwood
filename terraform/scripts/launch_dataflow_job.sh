@@ -4,16 +4,34 @@
 # ==============================================================================
 set -euo pipefail
 
-PROJECT="$1"
-REGION="$2"
-DATABASE="$3"
-DATASET="$4"
-BUCKET="$5"
-SA_EMAIL="$6"
-JOB_NAME="$7"
+REDWOOD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Source .env if present
+if [[ -f "$REDWOOD_DIR/.env" ]]; then
+  set -a
+  source "$REDWOOD_DIR/.env"
+  set +a
+fi
+
+PROJECT="${1:-${GCP_PROJECT_ID}}"
+REGION="${2:-${GCP_REGION}}"
+DATABASE="${3:-${FIRESTORE_DATABASE_ID}}"
+DATASET="${4:-${BIGQUERY_DATASET}}"
+BUCKET="${5:-${GCS_BUCKET_NAME:-${GCS_BUCKET_PREFIX}-${PROJECT}}}"
+SA_EMAIL="${6:-${DATAFLOW_SERVICE_ACCOUNT_EMAIL:-${DATAFLOW_SERVICE_ACCOUNT}@${PROJECT}.iam.gserviceaccount.com}}"
+JOB_NAME="${7:-${DATAFLOW_JOB_NAME}}"
+COLLECTION="${8:-${FIRESTORE_COLLECTION}}"
+CDC_TABLE="${9:-${BIGQUERY_CDC_TABLE}}"
 
 PYTHON_EXEC="/usr/local/google/home/cyvisser/source/firestore/venv/bin/python3"
-REDWOOD_DIR="/usr/local/google/home/cyvisser/source/firestore/redwood"
+if [[ ! -x "$PYTHON_EXEC" ]]; then
+  PYTHON_EXEC="python3"
+fi
+
+if [[ -z "$PROJECT" ]]; then
+  echo "Error: GCP Project ID is required. Pass as argument or define GCP_PROJECT_ID in .env" >&2
+  exit 1
+fi
 
 echo "=========================================================="
 echo "Submitting Cloud Dataflow Streaming Pipeline to GCP"
@@ -23,6 +41,8 @@ echo "Job Name:       $JOB_NAME"
 echo "Service Account:$SA_EMAIL"
 echo "Temp Bucket:    gs://$BUCKET/temp"
 echo "VPC Subnet:     redwood-dataflow-subnet"
+echo "Collection:     $COLLECTION"
+echo "BQ Target:      ${PROJECT}:${DATASET}.${CDC_TABLE}"
 echo "=========================================================="
 
 # Check if job is already running
@@ -57,11 +77,12 @@ SUBNET_URI="https://www.googleapis.com/compute/v1/projects/${PROJECT}/regions/${
   --firestore_project="$PROJECT" \
   --firestore_database="$DATABASE" \
   --firestore_region="$REGION" \
-  --firestore_collection="orders" \
-  --output_table="${PROJECT}:${DATASET}.orders_cdc" \
+  --firestore_collection="$COLLECTION" \
+  --output_table="${PROJECT}:${DATASET}.${CDC_TABLE}" \
   --setup_file="$DATAFLOW_DIR/setup.py" \
   --streaming \
   --no_auth_cache \
   --experiments=use_runner_v2
 
 echo "Dataflow job '$JOB_NAME' successfully launched!"
+

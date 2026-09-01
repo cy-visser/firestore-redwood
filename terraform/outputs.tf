@@ -10,17 +10,22 @@ output "region" {
 
 output "firestore_database_id" {
   description = "The Firestore database ID."
-  value       = google_firestore_database.database.name
+  value       = var.firestore_database_id
 }
 
 output "firestore_edition" {
   description = "The edition of the Firestore database."
-  value       = google_firestore_database.database.database_edition
+  value       = var.firestore_edition
 }
 
 output "firestore_pitr_enabled" {
   description = "Whether PITR is enabled on the Firestore database."
-  value       = google_firestore_database.database.point_in_time_recovery_enablement
+  value       = var.enable_pitr ? "POINT_IN_TIME_RECOVERY_ENABLED" : "POINT_IN_TIME_RECOVERY_DISABLED"
+}
+
+output "firestore_collection" {
+  description = "The Firestore collection being replicated."
+  value       = var.firestore_collection
 }
 
 output "bigquery_dataset_id" {
@@ -53,22 +58,7 @@ output "service_account_email" {
   value       = google_service_account.pipeline_sa.email
 }
 
-output "sample_order_id" {
-  description = "The ID of the seeded sample order in Firestore."
-  value       = "ORD-2026-98471A-X9"
-}
-
-output "firestore_change_stream_name" {
-  description = "The Firestore Change Stream identifier."
-  value       = var.enable_change_stream ? var.change_stream_name : "DISABLED"
-}
-
-output "firestore_change_stream_collection_group" {
-  description = "The target collection group of the Firestore Change Stream."
-  value       = var.enable_change_stream ? var.change_stream_collection_group : "DISABLED"
-}
-
-output "firestore_change_stream_retention" {
-  description = "The retention duration of the Firestore Change Stream."
-  value       = var.enable_change_stream ? var.change_stream_retention : "DISABLED"
+output "dataflow_job_name" {
+  description = "The Dataflow CDC replication streaming job name."
+  value       = var.dataflow_job_name
 }

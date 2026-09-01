@@ -20,7 +20,7 @@ resource "google_bigquery_dataset" "redwood_retail" {
 resource "google_bigquery_table" "orders_cdc" {
   project             = var.project_id
   dataset_id          = google_bigquery_dataset.redwood_retail.dataset_id
-  table_id            = "orders_cdc"
+  table_id            = var.bigquery_cdc_table_id
   deletion_protection = false
 
   description = "Real-time Change Data Capture (CDC) table replicated from Firestore orders change stream"
