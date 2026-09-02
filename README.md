@@ -80,27 +80,77 @@ You can deploy the entire end-to-end architecture (APIs, Firestore Enterprise Na
 
 ### 1. Verify Firestore Enterprise Native Database
 ```bash
-gcloud alpha firestore databases describe --database=redwood --project=elevate-cyvisser \
+gcloud alpha firestore databases describe --database="$FIRESTORE_DATABASE_ID" --project="$GCP_PROJECT_ID" \
   --format="table(name,databaseEdition,type,firestoreDataAccessMode,realtimeUpdatesMode)"
 ```
 
 ### 2. Verify Cloud Dataflow Streaming Job
 ```bash
-gcloud dataflow jobs list --region=europe-west4 --project=elevate-cyvisser --status=active
+gcloud dataflow jobs list --region="$GCP_REGION" --project="$GCP_PROJECT_ID" --status=active
 ```
 *Console URL*: Open [https://console.cloud.google.com/dataflow/jobs](https://console.cloud.google.com/dataflow/jobs) to view the real-time execution graph, worker autoscaling, and throughput metrics.
 
 ### 3. Verify BigQuery CDC Table Schema
 ```bash
-bq show elevate-cyvisser:redwood_retail.retail_cdc
+bq show "$GCP_PROJECT_ID:$BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE"
 ```
+
+### 4. Verify BigQuery Scheduled Query (Automated Daily Churn Analysis)
+
+You can verify that the BigQuery Scheduled Query is created and active via the `bq` CLI or Cloud Console:
+
+#### A. List and Inspect Transfer Configurations
+```bash
+# List all active scheduled queries in the region
+bq ls --transfer_config --transfer_location="$GCP_REGION" --project_id="$GCP_PROJECT_ID"
+```
+Expected output:
+```
+                                 name                                  display_name   data_source_id       schedule       state
+ -------------------------------------------------------------------- -------------- ----------------- ----------------- -------
+ projects/12345/locations/.../transferConfigs/64c...                  Daily Redwood   scheduled_query   every 24 hours    SUCCEEDED
+```
+
+To view full details of the configuration:
+```bash
+CONFIG_ID=$(bq ls --transfer_config --transfer_location="$GCP_REGION" --project_id="$GCP_PROJECT_ID" --format=json | jq -r '.[0].name')
+bq show --transfer_config "$CONFIG_ID"
+```
+
+#### B. Trigger a Test Run On-Demand
+You can manually trigger an immediate execution of the scheduled query to verify without waiting 24 hours:
+```bash
+# Trigger an immediate run
+bq mk --transfer_run \
+  --start_time="$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+  --end_time="$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+  "$CONFIG_ID"
+
+# List run history and execution states
+bq ls --transfer_run --transfer_location="$GCP_REGION" "$CONFIG_ID"
+```
+
+#### C. Verify Persisted Predictions in BigQuery
+Confirm that the scheduled query successfully populated the `customer_churn_predictions` table:
+```bash
+# Check table metadata
+bq show "$GCP_PROJECT_ID:$BIGQUERY_DATASET.customer_churn_predictions"
+
+# Query top at-risk customers
+bq query --use_legacy_sql=false \
+  "SELECT customer_id, customer_name, churn_probability, automated_retention_action, prediction_timestamp \
+   FROM \`$GCP_PROJECT_ID.$BIGQUERY_DATASET.customer_churn_predictions\` \
+   ORDER BY churn_probability DESC LIMIT 5;"
+```
+
+*Console URL*: Open [https://console.cloud.google.com/bigquery/scheduled-queries](https://console.cloud.google.com/bigquery/scheduled-queries) to view interactive run logs, schedule health, and execution history.
 
 ---
 
 ## 5. Testing Real-Time Replication
 
 ### A. Generate Batch Retail Orders
-Execute [`generate_retail_dataset.py`](file:///usr/local/google/home/cyvisser/source/firestore/redwood/generate_retail_dataset.py) to write synthetic e-commerce orders into Firestore Native:
+Execute [`generate_retail_dataset.py`](file:///usr/local/google/home/jicong/work/firestore-redwood/generate_retail_dataset.py) to write synthetic e-commerce orders into Firestore Native:
 ```bash
 python3 generate_retail_dataset.py --count 100 --workers 4
 ```
@@ -118,7 +168,7 @@ SELECT
   currency, 
   change_timestamp,
   JSON_VALUE(document_data, "$.paymentMethod") AS payment_method
-FROM `elevate-cyvisser.redwood_retail.retail_cdc`
+FROM `driven-rig-474510-s8.redwood.orders_cdc`
 ORDER BY change_timestamp DESC
 LIMIT 10;
 ```
@@ -127,7 +177,11 @@ LIMIT 10;
 
 ## 6. BigQuery ML Customer Churn Prediction & Analytics
 
-The file [`bigquery_churn_sentiment_analysis.sql`](file:///usr/local/google/home/cyvisser/source/firestore/redwood/bigquery_churn_sentiment_analysis.sql) implements an end-to-end Machine Learning pipeline directly inside Google BigQuery using **BigQuery ML (`logistic_reg`)**.
+The file [`bigquery_churn_sentiment_analysis.sql`](file:///usr/local/google/home/jicong/work/firestore-redwood/bigquery_churn_sentiment_analysis.sql) implements an end-to-end Machine Learning pipeline directly inside Google BigQuery using **BigQuery ML (`logistic_reg`)**. It creates:
+1. **Feature Engineering View** (`customer_historical_data`): Aggregates orders, returns, support sentiment, and engagement metrics.
+2. **Churn Classification Model** (`customer_churn_model`): Logistic Regression with automated class weighting and L2 regularization.
+3. **Persisted Predictions Table** (`customer_churn_predictions`): Stores churn probabilities and action-oriented retention recommendations.
+4. **Automated Daily Scheduled Query**: Automatically updates predictions every 24 hours.
 
 ### Running BigQuery ML Pipeline with `.env`:
 ```bash
