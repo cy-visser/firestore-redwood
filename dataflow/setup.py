@@ -10,5 +10,5 @@ setuptools.setup(
         "python-dotenv>=1.0.0",
     ],
     packages=setuptools.find_packages(),
-    py_modules=["firestore_auth", "retail_catalog"],
+    py_modules=["firestore_auth"],
 )
