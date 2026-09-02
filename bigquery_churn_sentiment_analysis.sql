@@ -4,8 +4,8 @@
 -- Replicated in real-time from Firestore Enterprise via Cloud Dataflow CDC
 --
 -- Note: Placeholders (${GCP_PROJECT_ID}, ${BIGQUERY_DATASET}, ${BIGQUERY_CDC_TABLE},
--- ${BIGQUERY_HISTORICAL_VIEW}, ${BIGQUERY_CHURN_MODEL}) are populated dynamically
--- from your .env file via `run_bigquery_analysis.py`.
+-- ${BIGQUERY_HISTORICAL_VIEW}, ${BIGQUERY_CHURN_MODEL}, ${BIGQUERY_PREDICTIONS_TABLE})
+-- are populated dynamically from your .env file via `run_bigquery_analysis.py`.
 -- ==============================================================================
 
 -- ------------------------------------------------------------------------------
@@ -255,9 +255,10 @@ ORDER BY
 
 
 -- ------------------------------------------------------------------------------
--- 5. Batch Churn Inference & Autonomous Retention Action Feed
--- Predicts churn probability for active accounts and triggers personalized interventions
+-- 5. Batch Churn Inference & Autonomous Retention Action Feed Table
+-- Persists predicted churn probability and intervention recommendations to BigQuery
 -- ------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_PREDICTIONS_TABLE}` AS
 WITH customer_predictions AS (
   SELECT
     customer_id,
@@ -271,7 +272,8 @@ WITH customer_predictions AS (
     days_since_last_purchase,
     cart_abandonment_count,
     support_tickets_count,
-    sentiment_score
+    sentiment_score,
+    CURRENT_TIMESTAMP() AS prediction_timestamp
   FROM
     ML.PREDICT(
       MODEL `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_CHURN_MODEL}`,
@@ -293,6 +295,7 @@ SELECT
   cart_abandonment_count,
   support_tickets_count,
   sentiment_score,
+  prediction_timestamp,
   CASE
     WHEN churn_probability >= 0.75 THEN '🚨 CRITICAL: Trigger 25% Instant Retention Code + Priority AM Outreach'
     WHEN churn_probability >= 0.50 THEN '⚠️ HIGH RISK: Dispatch Free Express Shipping Voucher'
@@ -300,10 +303,32 @@ SELECT
     ELSE '🟢 HEALTHY: Standard Loyalty Nurturing'
   END AS automated_retention_action
 FROM
-  customer_predictions
+  customer_predictions;
+
+
+-- ------------------------------------------------------------------------------
+-- 6. Top At-Risk Customer Retention Action Feed (Preview)
+-- ------------------------------------------------------------------------------
+SELECT
+  customer_id,
+  customer_name,
+  customer_email,
+  customer_segment,
+  loyalty_tier,
+  churn_probability,
+  total_spend_90d,
+  days_since_last_purchase,
+  cart_abandonment_count,
+  support_tickets_count,
+  sentiment_score,
+  prediction_timestamp,
+  automated_retention_action
+FROM
+  `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_PREDICTIONS_TABLE}`
 ORDER BY
   churn_probability DESC,
   total_spend_90d DESC
 LIMIT 100;
+
 
 

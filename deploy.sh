@@ -97,6 +97,12 @@ set -a
 source "$REDWOOD_DIR/.env"
 set +a
 
+# Default optional variables if not set
+BIGQUERY_PREDICTIONS_TABLE="${BIGQUERY_PREDICTIONS_TABLE:-customer_churn_predictions}"
+ENABLE_SCHEDULED_QUERY="${ENABLE_SCHEDULED_QUERY:-true}"
+SCHEDULED_QUERY_SCHEDULE="${SCHEDULED_QUERY_SCHEDULE:-every 24 hours}"
+export BIGQUERY_PREDICTIONS_TABLE ENABLE_SCHEDULED_QUERY SCHEDULED_QUERY_SCHEDULE
+
 # Validate that all required environment variables are set
 REQUIRED_VARS=(
   GCP_PROJECT_ID
@@ -107,6 +113,7 @@ REQUIRED_VARS=(
   BIGQUERY_CDC_TABLE
   BIGQUERY_HISTORICAL_VIEW
   BIGQUERY_CHURN_MODEL
+  BIGQUERY_PREDICTIONS_TABLE
   GCS_BUCKET_PREFIX
   DATAFLOW_JOB_NAME
   DATAFLOW_SERVICE_ACCOUNT
@@ -134,6 +141,11 @@ export TF_VAR_firestore_database_id="$FIRESTORE_DATABASE_ID"
 export TF_VAR_firestore_collection="$FIRESTORE_COLLECTION"
 export TF_VAR_bigquery_dataset_id="$BIGQUERY_DATASET"
 export TF_VAR_bigquery_cdc_table_id="$BIGQUERY_CDC_TABLE"
+export TF_VAR_bigquery_historical_view_id="$BIGQUERY_HISTORICAL_VIEW"
+export TF_VAR_bigquery_churn_model_id="$BIGQUERY_CHURN_MODEL"
+export TF_VAR_bigquery_predictions_table_id="$BIGQUERY_PREDICTIONS_TABLE"
+export TF_VAR_enable_scheduled_query="$ENABLE_SCHEDULED_QUERY"
+export TF_VAR_scheduled_query_schedule="$SCHEDULED_QUERY_SCHEDULE"
 export TF_VAR_gcs_bucket_name_prefix="$GCS_BUCKET_PREFIX"
 export TF_VAR_service_account_id="$DATAFLOW_SERVICE_ACCOUNT"
 export TF_VAR_dataflow_job_name="$DATAFLOW_JOB_NAME"
@@ -142,6 +154,8 @@ echo "Project ID:          $GCP_PROJECT_ID"
 echo "Region:              $GCP_REGION"
 echo "Firestore Database:  $FIRESTORE_DATABASE_ID (Native Mode, collection: $FIRESTORE_COLLECTION)"
 echo "BigQuery Sink:       $BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE"
+echo "Predictions Table:   $BIGQUERY_DATASET.$BIGQUERY_PREDICTIONS_TABLE"
+echo "Scheduled Query:     $([[ "$ENABLE_SCHEDULED_QUERY" == true ]] && echo "Enabled ($SCHEDULED_QUERY_SCHEDULE)" || echo "Disabled")"
 echo "Dataflow Job:        $DATAFLOW_JOB_NAME"
 echo "Mode:                $([[ "$TEARDOWN_MODE" == true ]] && echo "TEARDOWN" || ([[ "$DRY_RUN" == true ]] && echo "DRY RUN / PLAN" || echo "FULL DEPLOYMENT"))"
 echo "================================================================="
@@ -303,13 +317,16 @@ echo "================================================================="
 echo " Target Project:     $GCP_PROJECT_ID"
 echo " Region:             $GCP_REGION"
 echo " Firestore DB:       $FIRESTORE_DATABASE_ID (Native Mode, Collection: $FIRESTORE_COLLECTION)"
-echo " BigQuery Table:     $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE"
-echo " BigQuery Model:     $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CHURN_MODEL"
-echo " Dataflow Streaming: $DATAFLOW_JOB_NAME"
+echo " BigQuery Table:       $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE"
+echo " BigQuery Model:       $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CHURN_MODEL"
+echo " BigQuery Predictions: $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_PREDICTIONS_TABLE"
+echo " Scheduled Query:      $([[ "$ENABLE_SCHEDULED_QUERY" == true ]] && echo "Enabled ($SCHEDULED_QUERY_SCHEDULE)" || echo "Disabled")"
+echo " Dataflow Streaming:   $DATAFLOW_JOB_NAME"
 echo "-----------------------------------------------------------------"
 echo " 🌐 Google Cloud Console Quick Links:"
 echo " • Dataflow Jobs: https://console.cloud.google.com/dataflow/jobs?project=$GCP_PROJECT_ID"
 echo " • BigQuery Studio: https://console.cloud.google.com/bigquery?project=$GCP_PROJECT_ID"
+echo " • BigQuery Scheduled Queries: https://console.cloud.google.com/bigquery/scheduled-queries?project=$GCP_PROJECT_ID"
 echo " • Firestore Databases: https://console.cloud.google.com/firestore/databases?project=$GCP_PROJECT_ID"
 echo "-----------------------------------------------------------------"
 echo " To clean up all resources later, run: ./teardown.sh"

@@ -30,6 +30,13 @@ resource "google_project_iam_member" "sa_bigquery_job_user" {
   member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
 }
 
+# Service Account BigQuery Admin (Required for BQML training, DDL views/tables, and Scheduled Queries)
+resource "google_project_iam_member" "sa_bigquery_admin" {
+  project = var.project_id
+  role    = "roles/bigquery.admin"
+  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
+}
+
 # Service Account Dataflow Worker Role
 resource "google_project_iam_member" "sa_dataflow_worker" {
   project = var.project_id

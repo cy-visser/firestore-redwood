@@ -5,6 +5,7 @@ locals {
     "compute.googleapis.com",
     "bigquery.googleapis.com",
     "bigquerystorage.googleapis.com",
+    "bigquerydatatransfer.googleapis.com",
     "storage.googleapis.com",
     "storage-component.googleapis.com",
     "iam.googleapis.com",
