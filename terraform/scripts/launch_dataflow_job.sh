@@ -23,9 +23,17 @@ JOB_NAME="${7:-${DATAFLOW_JOB_NAME}}"
 COLLECTION="${8:-${FIRESTORE_COLLECTION}}"
 CDC_TABLE="${9:-${BIGQUERY_CDC_TABLE}}"
 
-PYTHON_EXEC="/usr/local/google/home/cyvisser/source/firestore/venv/bin/python3"
-if [[ ! -x "$PYTHON_EXEC" ]]; then
-  PYTHON_EXEC="python3"
+if [[ -z "${PYTHON_EXEC:-}" || ! -x "$PYTHON_EXEC" ]]; then
+  if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python3" ]]; then
+    PYTHON_EXEC="${VIRTUAL_ENV}/bin/python3"
+  elif [[ -x "$REDWOOD_DIR/.venv/bin/python3" ]]; then
+    PYTHON_EXEC="$REDWOOD_DIR/.venv/bin/python3"
+  elif command -v python3 &>/dev/null; then
+    PYTHON_EXEC="python3"
+  else
+    echo "Error: Python 3 executable not found." >&2
+    exit 1
+  fi
 fi
 
 if [[ -z "$PROJECT" ]]; then
@@ -81,7 +89,6 @@ SUBNET_URI="https://www.googleapis.com/compute/v1/projects/${PROJECT}/regions/${
   --output_table="${PROJECT}:${DATASET}.${CDC_TABLE}" \
   --setup_file="$DATAFLOW_DIR/setup.py" \
   --streaming \
-  --no_auth_cache \
   --experiments=use_runner_v2
 
 echo "Dataflow job '$JOB_NAME' successfully launched!"

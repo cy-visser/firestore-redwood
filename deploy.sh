@@ -8,8 +8,7 @@ set -euo pipefail
 
 REDWOOD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TERRAFORM_DIR="$REDWOOD_DIR/terraform"
-VENV_DIR="/usr/local/google/home/cyvisser/source/firestore/venv"
-PYTHON_EXEC="$VENV_DIR/bin/python3"
+PYTHON_EXEC="${PYTHON_EXEC:-}"
 
 # Default configuration flags
 SEED_COUNT=250
@@ -160,19 +159,24 @@ if ! command -v terraform &>/dev/null; then
 fi
 
 # Check Python environment
-if [[ ! -x "$PYTHON_EXEC" ]]; then
-  if command -v python3 &>/dev/null; then
+if [[ -z "${PYTHON_EXEC:-}" || ! -x "$PYTHON_EXEC" ]]; then
+  if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python3" ]]; then
+    PYTHON_EXEC="${VIRTUAL_ENV}/bin/python3"
+  elif [[ -x "$REDWOOD_DIR/.venv/bin/python3" ]]; then
+    PYTHON_EXEC="$REDWOOD_DIR/.venv/bin/python3"
+  elif command -v python3 &>/dev/null; then
     PYTHON_EXEC="python3"
   else
     echo "❌ Error: Python 3 executable not found." >&2
     exit 1
   fi
 fi
+export PYTHON_EXEC
 
 # Ensure Python requirements are met
-"$PYTHON_EXEC" -c "import dotenv, google.cloud.firestore, google.auth" 2>/dev/null || {
+"$PYTHON_EXEC" -c "import dotenv, google.cloud.firestore, google.auth, setuptools, build" 2>/dev/null || {
   echo "📦 Installing required Python dependencies..."
-  "$PYTHON_EXEC" -m pip install -q "apache-beam[gcp]>=2.75.0" "google-cloud-firestore>=2.20.0" "google-cloud-bigquery>=3.25.0" "python-dotenv>=1.0.0"
+  "$PYTHON_EXEC" -m pip install -q "apache-beam[gcp]>=2.75.0" "google-cloud-firestore>=2.20.0" "google-cloud-bigquery>=3.25.0" "python-dotenv>=1.0.0" "setuptools" "build"
 }
 
 # ------------------------------------------------------------------------------
