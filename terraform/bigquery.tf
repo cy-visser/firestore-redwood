@@ -143,7 +143,6 @@ resource "google_bigquery_data_transfer_config" "daily_churn_analysis" {
   location               = var.region
   data_source_id         = "scheduled_query"
   schedule               = var.scheduled_query_schedule
-  destination_dataset_id = google_bigquery_dataset.redwood_retail.dataset_id
 
   params = {
     query = templatefile("${path.module}/../bigquery_churn_sentiment_analysis.sql", {
