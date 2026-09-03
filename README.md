@@ -2,6 +2,11 @@
 
 This project implements a production-ready Change Data Capture (CDC) streaming pipeline on Google Cloud. It synchronizes real-time change events from **Firestore Enterprise in Native Mode** into **BigQuery** using a managed **Google Cloud Dataflow** streaming pipeline.
 
+![Redwood Architecture](docs/images/redwood_bootstrap_architecture.jpg)
+
+> [!NOTE]
+> For a detailed technical architecture deep dive, two-phase bootstrap documentation, Dataflow IAM delegation model, and troubleshooting steps, see the **[Architecture, Security & Operational Deployment Guide](docs/architecture_and_deployment_guide.md)**.
+
 ---
 
 ## 1. System Overview
@@ -33,8 +38,8 @@ Ensure you have the following installed and authenticated:
 
 3. **Python 3.11+ Environment**:
    ```bash
-   python3 -m venv /usr/local/google/home/cyvisser/source/firestore/venv
-   source /usr/local/google/home/cyvisser/source/firestore/venv/bin/activate
+   python3 -m venv .venv
+   source .venv/bin/activate
    pip install "apache-beam[gcp]>=2.75.0" "google-cloud-firestore>=2.20.0" "google-cloud-bigquery>=3.25.0" "python-dotenv>=1.0.0"
    ```
 
@@ -57,6 +62,7 @@ You can deploy the entire end-to-end architecture (APIs, Firestore Enterprise Na
 
 ### Deployment CLI Options:
 * `./deploy.sh`: Runs full deployment, seeds 250 initial synthetic orders, and trains the BigQuery ML churn model.
+* `./deploy.sh --create-project`: Bootstraps a fresh Google Cloud project using `terraform/bootstrap` before deploying components.
 * `./deploy.sh --seed-count 1000`: Seeds 1,000 synthetic transaction documents into Firestore.
 * `./deploy.sh --dry-run`: Runs Terraform plan and config verification without altering GCP resources.
 * `./deploy.sh --skip-seed`: Deploys infrastructure without seeding sample orders.
@@ -64,15 +70,27 @@ You can deploy the entire end-to-end architecture (APIs, Firestore Enterprise Na
 * `./deploy.sh --teardown` (or `./teardown.sh`): Cleanly destroys all infrastructure and drains Dataflow jobs.
 
 #### Automated Provisioning Lifecycle:
-1. **Prerequisites & .env Loading**: Maps `.env` variables automatically to Terraform (`TF_VAR_*`).
-2. **API Enablement**: Enables `firestore`, `dataflow`, `compute`, `bigquery`, `storage`, `iam`.
-3. **Firestore Enterprise Native Database**: Creates database `redwood` with Point-in-Time Recovery (PITR) and Firestore API Data Access enabled.
-4. **VPC Networking**: Creates VPC `redwood-dataflow-net`, private subnet, Cloud Router, and Cloud NAT.
-5. **IAM Service Account**: Configures `dataflow-redwood-sa` with required Datastore, Dataflow, and BigQuery roles.
-6. **BigQuery Target**: Provisions dataset `redwood_retail` and CDC table `retail_cdc`.
-7. **Cloud Dataflow Pipeline**: Submits the streaming pipeline using `DataflowRunner`.
-8. **Data Seeding & CDC Replicate**: Seeds synthetic e-commerce orders into Firestore via native `WriteBatch`.
-9. **BigQuery ML Training**: Builds the feature view and trains the Logistic Regression churn prediction model.
+1. **(Optional) Project Bootstrap**: Provisions a new Google Cloud project via `terraform/bootstrap`, attaches billing, enables base APIs, and populates `.env`.
+2. **Prerequisites & .env Loading**: Maps `.env` variables automatically to Terraform (`TF_VAR_*`).
+3. **API Enablement**: Enables `firestore`, `dataflow`, `compute`, `bigquery`, `storage`, `iam`.
+4. **Firestore Enterprise Native Database**: Creates database `redwood` with Point-in-Time Recovery (PITR) and Firestore API Data Access enabled.
+5. **VPC Networking**: Creates VPC `redwood-dataflow-net`, private subnet, Cloud Router, and Cloud NAT.
+6. **IAM Service Account**: Configures `dataflow-redwood-sa` with required Datastore, Dataflow, and BigQuery roles.
+7. **BigQuery Target**: Provisions dataset `redwood_retail` and CDC table `retail_cdc`.
+8. **Cloud Dataflow Pipeline**: Submits the streaming pipeline using `DataflowRunner`.
+9. **Data Seeding & CDC Replicate**: Seeds synthetic e-commerce orders into Firestore via native `WriteBatch`.
+10. **BigQuery ML Training**: Builds the feature view and trains the Logistic Regression churn prediction model.
+
+### Creating a New Project (Altostrat / Sandbox):
+To provision a brand new project before deploying components:
+```bash
+# 1. Configure bootstrap variables with your billing account
+cp terraform/bootstrap/terraform.tfvars.example terraform/bootstrap/terraform.tfvars
+
+# 2. Run deploy with project bootstrap flag
+./deploy.sh --create-project
+```
+See [`terraform/bootstrap/README.md`](terraform/bootstrap/README.md) for full details on standalone bootstrap execution.
 
 ---
 

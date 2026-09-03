@@ -17,6 +17,7 @@ SKIP_BQML=false
 DRY_RUN=false
 TEARDOWN_MODE=false
 AUTO_APPROVE=false
+CREATE_PROJECT=false
 
 usage() {
   cat <<EOF
@@ -26,6 +27,7 @@ Single-command full deployment and lifecycle management for Redwood Retail.
 
 Options:
   -h, --help               Show this help message and exit.
+  -p, --create-project     Provision a new GCP project using terraform/bootstrap before deploying components.
   -s, --seed-count <N>     Number of initial synthetic orders to generate into Firestore (default: 250).
   --skip-seed              Skip generating synthetic transactions into Firestore.
   --skip-bqml              Skip training and evaluating BigQuery ML churn models.
@@ -35,6 +37,7 @@ Options:
 
 Examples:
   ./deploy.sh                         # Deploy entire infrastructure, seed 250 orders, and train BQML
+  ./deploy.sh --create-project        # Bootstrap a new GCP project first, then deploy components
   ./deploy.sh --seed-count 1000       # Deploy and seed 1,000 transactions
   ./deploy.sh --dry-run               # Preview Terraform execution plan
   ./deploy.sh --teardown              # Destroy all cloud resources cleanly
@@ -47,6 +50,10 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       usage
       exit 0
+      ;;
+    -p|--create-project)
+      CREATE_PROJECT=true
+      shift
       ;;
     -s|--seed-count)
       SEED_COUNT="$2"
@@ -83,6 +90,49 @@ done
 echo "================================================================="
 echo " 🌲 REDWOOD RETAIL: End-to-End Automated Deployment Manager"
 echo "================================================================="
+
+# ------------------------------------------------------------------------------
+# 0. Optional: Project Bootstrap Lifecycle
+# ------------------------------------------------------------------------------
+if [[ "$CREATE_PROJECT" == true ]]; then
+  echo "🚀 Bootstrapping new Google Cloud Project via Terraform..."
+  if [[ ! -f "$TERRAFORM_DIR/bootstrap/terraform.tfvars" ]]; then
+    echo "❌ Error: $TERRAFORM_DIR/bootstrap/terraform.tfvars not found." >&2
+    echo "Please copy $TERRAFORM_DIR/bootstrap/terraform.tfvars.example to $TERRAFORM_DIR/bootstrap/terraform.tfvars and set billing_account_id." >&2
+    exit 1
+  fi
+
+  echo "📦 Initializing Terraform Bootstrap module..."
+  terraform -chdir="$TERRAFORM_DIR/bootstrap" init -upgrade
+
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "🔍 Planning project creation..."
+    terraform -chdir="$TERRAFORM_DIR/bootstrap" plan
+    if [[ ! -f "$REDWOOD_DIR/.env" ]]; then
+      echo -e "\nℹ️  Dry-run plan for project bootstrap completed successfully."
+      echo "To preview application components, run ./deploy.sh --create-project without --dry-run or provide an existing GCP_PROJECT_ID in .env."
+      exit 0
+    fi
+  else
+    APPROVE_FLAG=""
+    [[ "$AUTO_APPROVE" == true ]] && APPROVE_FLAG="-auto-approve"
+    echo "🏗️  Applying project creation..."
+    terraform -chdir="$TERRAFORM_DIR/bootstrap" apply $APPROVE_FLAG
+
+    BOOTSTRAP_PROJECT_ID=$(terraform -chdir="$TERRAFORM_DIR/bootstrap" output -raw project_id 2>/dev/null || true)
+    if [[ -n "$BOOTSTRAP_PROJECT_ID" ]]; then
+      echo "✅ Successfully provisioned project: $BOOTSTRAP_PROJECT_ID"
+      if [[ ! -f "$REDWOOD_DIR/.env" && -f "$REDWOOD_DIR/.env.example" ]]; then
+        cp "$REDWOOD_DIR/.env.example" "$REDWOOD_DIR/.env"
+        echo "📄 Created .env from .env.example"
+      fi
+      if [[ -f "$REDWOOD_DIR/.env" ]]; then
+        sed -i.bak -E "s|^GCP_PROJECT_ID=.*|GCP_PROJECT_ID=$BOOTSTRAP_PROJECT_ID|" "$REDWOOD_DIR/.env" && rm -f "$REDWOOD_DIR/.env.bak"
+        echo "📝 Updated GCP_PROJECT_ID in $REDWOOD_DIR/.env to: $BOOTSTRAP_PROJECT_ID"
+      fi
+    fi
+  fi
+fi
 
 # ------------------------------------------------------------------------------
 # 1. Environment & Prerequisites Verification
@@ -158,24 +208,28 @@ if ! command -v terraform &>/dev/null; then
   exit 1
 fi
 
-# Check Python environment
+# Check Python environment (Strict virtual environment enforcement)
 if [[ -z "${PYTHON_EXEC:-}" || ! -x "$PYTHON_EXEC" ]]; then
   if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python3" ]]; then
     PYTHON_EXEC="${VIRTUAL_ENV}/bin/python3"
   elif [[ -x "$REDWOOD_DIR/.venv/bin/python3" ]]; then
     PYTHON_EXEC="$REDWOOD_DIR/.venv/bin/python3"
-  elif command -v python3 &>/dev/null; then
-    PYTHON_EXEC="python3"
   else
-    echo "❌ Error: Python 3 executable not found." >&2
-    exit 1
+    echo "📦 Creating required Python virtual environment at $REDWOOD_DIR/.venv..."
+    if ! python3 -m venv "$REDWOOD_DIR/.venv" 2>/dev/null; then
+      python3 -m venv --without-pip "$REDWOOD_DIR/.venv"
+      curl -sSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+      "$REDWOOD_DIR/.venv/bin/python3" /tmp/get-pip.py
+      rm -f /tmp/get-pip.py
+    fi
+    PYTHON_EXEC="$REDWOOD_DIR/.venv/bin/python3"
   fi
 fi
 export PYTHON_EXEC
 
-# Ensure Python requirements are met
+# Ensure Python requirements are met in virtual environment
 "$PYTHON_EXEC" -c "import dotenv, google.cloud.firestore, google.auth, setuptools, build" 2>/dev/null || {
-  echo "📦 Installing required Python dependencies..."
+  echo "📦 Installing required Python dependencies inside virtual environment..."
   "$PYTHON_EXEC" -m pip install -q "apache-beam[gcp]>=2.75.0" "google-cloud-firestore>=2.20.0" "google-cloud-bigquery>=3.25.0" "python-dotenv>=1.0.0" "setuptools" "build"
 }
 
@@ -250,8 +304,9 @@ if [[ "$SKIP_SEED" != true ]]; then
   echo "✅ Successfully seeded $SEED_COUNT orders into Firestore."
   echo "⏳ Waiting for Cloud Dataflow to replicate events into BigQuery ($BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE)..."
   
-  MAX_WAIT=180
+  MAX_WAIT=300
   START_WAIT=$(date +%s)
+  ROW_COUNT=0
   while true; do
     ROW_COUNT=$("$PYTHON_EXEC" -c "
 from google.cloud import bigquery
@@ -287,9 +342,17 @@ fi
 # 6. BIGQUERY ML MODEL TRAINING & PREDICTION
 # ------------------------------------------------------------------------------
 if [[ "$SKIP_BQML" != true ]]; then
-  echo -e "\n🧠 Step 3/4: Building BigQuery Feature Views & Training Churn ML Model..."
-  "$PYTHON_EXEC" "$REDWOOD_DIR/run_bigquery_analysis.py" --execute
-  echo "✅ BigQuery ML pipeline execution completed."
+  if [[ "${ROW_COUNT:-0}" -eq 0 && "$SKIP_SEED" != true ]]; then
+    echo -e "\n⚠️ Warning: No records found in BigQuery CDC table yet ($BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE)."
+    echo "Cloud Dataflow workers are still initializing in the background."
+    echo "Skipping immediate BQML training to prevent 'Input data doesn't contain any rows' error."
+    echo "Once Dataflow workers finish streaming records, train the model by running:"
+    echo "   $PYTHON_EXEC $REDWOOD_DIR/run_bigquery_analysis.py --execute"
+  else
+    echo -e "\n🧠 Step 3/4: Building BigQuery Feature Views & Training Churn ML Model..."
+    "$PYTHON_EXEC" "$REDWOOD_DIR/run_bigquery_analysis.py" --execute
+    echo "✅ BigQuery ML pipeline execution completed."
+  fi
 else
   echo -e "\n⏭️  Step 3/4: Skipping BigQuery ML training (--skip-bqml requested)."
 fi

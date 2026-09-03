@@ -50,3 +50,16 @@ resource "google_project_iam_member" "sa_storage_admin" {
   role    = "roles/storage.objectAdmin"
   member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
 }
+
+# Allow Dataflow Service Agent to access and act as the custom worker service account
+resource "google_service_account_iam_member" "dataflow_sa_actas" {
+  service_account_id = google_service_account.pipeline_sa.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:service-${data.google_project.project.number}@dataflow-service-producer-prod.iam.gserviceaccount.com"
+}
+
+resource "google_service_account_iam_member" "dataflow_sa_service_agent" {
+  service_account_id = google_service_account.pipeline_sa.name
+  role               = "roles/dataflow.serviceAgent"
+  member             = "serviceAccount:service-${data.google_project.project.number}@dataflow-service-producer-prod.iam.gserviceaccount.com"
+}

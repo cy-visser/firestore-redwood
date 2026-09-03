@@ -8,7 +8,10 @@ locals {
     "storage.googleapis.com",
     "storage-component.googleapis.com",
     "iam.googleapis.com",
-    "serviceusage.googleapis.com"
+    "serviceusage.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "monitoring.googleapis.com",
+    "logging.googleapis.com"
   ]
 }
 

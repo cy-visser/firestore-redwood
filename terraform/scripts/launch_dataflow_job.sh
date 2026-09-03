@@ -28,10 +28,8 @@ if [[ -z "${PYTHON_EXEC:-}" || ! -x "$PYTHON_EXEC" ]]; then
     PYTHON_EXEC="${VIRTUAL_ENV}/bin/python3"
   elif [[ -x "$REDWOOD_DIR/.venv/bin/python3" ]]; then
     PYTHON_EXEC="$REDWOOD_DIR/.venv/bin/python3"
-  elif command -v python3 &>/dev/null; then
-    PYTHON_EXEC="python3"
   else
-    echo "Error: Python 3 executable not found." >&2
+    echo "Error: Python virtual environment (.venv) not found. Please initialize .venv first." >&2
     exit 1
   fi
 fi
