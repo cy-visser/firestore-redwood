@@ -1,0 +1,27 @@
+# ==============================================================================
+# Redwood Retail Bootstrap: Variables Example
+# Copy to terraform.tfvars and fill in your Altostrat / Google Cloud details.
+# ==============================================================================
+
+# Required: Your Google Cloud Billing Account ID (e.g. 012345-6789AB-CDEF01)
+billing_account_id = "012345-6789AB-CDEF01"
+
+# Optional: Specific project ID to request. If blank, uses prefix + random suffix.
+# project_id = "my-redwood-retail-demo"
+project_prefix = "redwood-retail"
+
+# Optional: Display name in Cloud Console
+project_name = "Redwood Retail CDC"
+
+# Optional: Organization ID (numeric) or Folder ID (folders/1234567890)
+# org_id    = "123456789012"
+# folder_id = "folders/123456789012"
+
+# Primary single deployment region
+region = "europe-west4"
+
+# Optional: Grant roles/owner to this account upon creation (e.g. admin@ganeshraja.altostrat.com)
+primary_owner_user_email = "admin@ganeshraja.altostrat.com"
+
+# Deletion policy: PREVENT or DELETE
+deletion_policy = "DELETE"

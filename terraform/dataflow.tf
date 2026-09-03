@@ -38,6 +38,8 @@ resource "terraform_data" "dataflow_pipeline" {
     google_project_iam_member.sa_bigquery_editor,
     google_project_iam_member.sa_bigquery_job_user,
     google_project_iam_member.sa_storage_admin,
+    google_service_account_iam_member.dataflow_sa_actas,
+    google_service_account_iam_member.dataflow_sa_service_agent,
     google_compute_network.dataflow_network,
     google_compute_subnetwork.dataflow_subnet,
     google_compute_router_nat.nat,
