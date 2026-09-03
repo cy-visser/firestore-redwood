@@ -20,6 +20,7 @@ DEFAULT_DATASET = os.getenv("BIGQUERY_DATASET")
 DEFAULT_CDC_TABLE = os.getenv("BIGQUERY_CDC_TABLE")
 DEFAULT_HISTORICAL_VIEW = os.getenv("BIGQUERY_HISTORICAL_VIEW")
 DEFAULT_CHURN_MODEL = os.getenv("BIGQUERY_CHURN_MODEL")
+DEFAULT_PREDICTIONS_TABLE = os.getenv("BIGQUERY_PREDICTIONS_TABLE") or "customer_churn_predictions"
 
 
 def get_rendered_sql(sql_template: str, context: dict) -> str:
@@ -38,6 +39,7 @@ def main():
     parser.add_argument("--cdc-table", default=DEFAULT_CDC_TABLE, help="BigQuery CDC table name")
     parser.add_argument("--historical-view", default=DEFAULT_HISTORICAL_VIEW, help="BigQuery feature view name")
     parser.add_argument("--churn-model", default=DEFAULT_CHURN_MODEL, help="BigQuery ML model name")
+    parser.add_argument("--predictions-table", default=DEFAULT_PREDICTIONS_TABLE, help="BigQuery predictions table name")
     parser.add_argument("--output-sql", help="Path to write rendered SQL file (e.g. bigquery_churn_sentiment_analysis.rendered.sql)")
     parser.add_argument("--dry-run", action="store_true", help="Print rendered SQL statements without executing")
     parser.add_argument("--execute", action="store_true", help="Execute the SQL script queries against BigQuery")
@@ -57,6 +59,7 @@ def main():
         "BIGQUERY_CDC_TABLE": args.cdc_table,
         "BIGQUERY_HISTORICAL_VIEW": args.historical_view,
         "BIGQUERY_CHURN_MODEL": args.churn_model,
+        "BIGQUERY_PREDICTIONS_TABLE": args.predictions_table,
     }
 
     rendered_sql = get_rendered_sql(template_content, context)
@@ -70,11 +73,12 @@ def main():
         print("=================================================================")
         print(" Redwood Retail: BigQuery Rendered SQL Script (Dry-Run)")
         print("=================================================================")
-        print(f"Target Project:   {args.project}")
-        print(f"Target Dataset:   {args.dataset}")
-        print(f"Target CDC Table: {args.cdc_table}")
-        print(f"Historical View:  {args.historical_view}")
-        print(f"Churn Model:      {args.churn_model}")
+        print(f"Target Project:     {args.project}")
+        print(f"Target Dataset:     {args.dataset}")
+        print(f"Target CDC Table:   {args.cdc_table}")
+        print(f"Historical View:    {args.historical_view}")
+        print(f"Churn Model:        {args.churn_model}")
+        print(f"Predictions Table:  {args.predictions_table}")
         print("=================================================================\n")
         print(rendered_sql)
 

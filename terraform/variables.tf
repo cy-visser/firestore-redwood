@@ -40,6 +40,36 @@ variable "bigquery_cdc_table_id" {
   default     = "retail_cdc"
 }
 
+variable "bigquery_predictions_table_id" {
+  description = "The BigQuery table ID for persisted BQML churn predictions and retention actions."
+  type        = string
+  default     = "customer_churn_predictions"
+}
+
+variable "bigquery_historical_view_id" {
+  description = "The BigQuery feature engineering view ID."
+  type        = string
+  default     = "customer_historical_data"
+}
+
+variable "bigquery_churn_model_id" {
+  description = "The BigQuery ML customer churn model ID."
+  type        = string
+  default     = "customer_churn_model"
+}
+
+variable "enable_scheduled_query" {
+  description = "Whether to create a BigQuery Scheduled Query for automated daily churn analysis."
+  type        = bool
+  default     = true
+}
+
+variable "scheduled_query_schedule" {
+  description = "Cron or frequency expression for the daily BigQuery scheduled query (e.g. 'every 24 hours' or '0 2 * * *')."
+  type        = string
+  default     = "every 24 hours"
+}
+
 variable "gcs_bucket_name_prefix" {
   description = "Prefix for the Cloud Storage bucket name."
   type        = string
