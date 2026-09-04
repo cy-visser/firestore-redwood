@@ -30,6 +30,13 @@ resource "google_project_iam_member" "sa_bigquery_job_user" {
   member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
 }
 
+# Service Account BigQuery Admin (Required for BQML training, DDL views/tables, and Scheduled Queries)
+resource "google_project_iam_member" "sa_bigquery_admin" {
+  project = var.project_id
+  role    = "roles/bigquery.admin"
+  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
+}
+
 # Service Account Dataflow Worker Role
 resource "google_project_iam_member" "sa_dataflow_worker" {
   project = var.project_id
@@ -69,4 +76,29 @@ resource "google_project_iam_member" "demo_principals_firestore" {
   project  = var.project_id
   role     = "roles/datastore.user"
   member   = "serviceAccount:${google_service_account.demo_principals[each.key].email}"
+# Allow Dataflow Service Agent to access and act as the custom worker service account
+resource "google_service_account_iam_member" "dataflow_sa_actas" {
+  service_account_id = google_service_account.pipeline_sa.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:service-${data.google_project.project.number}@dataflow-service-producer-prod.iam.gserviceaccount.com"
+}
+
+resource "google_service_account_iam_member" "dataflow_sa_service_agent" {
+  service_account_id = google_service_account.pipeline_sa.name
+  role               = "roles/dataflow.serviceAgent"
+  member             = "serviceAccount:service-${data.google_project.project.number}@dataflow-service-producer-prod.iam.gserviceaccount.com"
+}
+
+# Service Account Cloud Run Invoker Role (for Cloud Scheduler triggering Cloud Run Job)
+resource "google_project_iam_member" "sa_run_invoker" {
+  project = var.project_id
+  role    = "roles/run.invoker"
+  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
+}
+
+# Service Account Cloud Run Developer Role
+resource "google_project_iam_member" "sa_run_developer" {
+  project = var.project_id
+  role    = "roles/run.developer"
+  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
 }

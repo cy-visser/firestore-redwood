@@ -135,3 +135,31 @@ resource "google_bigquery_table" "orders_cdc" {
     google_bigquery_dataset.redwood_retail
   ]
 }
+
+resource "google_bigquery_data_transfer_config" "daily_churn_analysis" {
+  count                  = var.enable_scheduled_query ? 1 : 0
+  project                = var.project_id
+  display_name           = "Daily Redwood Customer Churn Prediction & Retention Actions"
+  location               = var.region
+  data_source_id         = "scheduled_query"
+  schedule               = var.scheduled_query_schedule
+
+  params = {
+    query = templatefile("${path.module}/../bigquery_churn_sentiment_analysis.sql", {
+      GCP_PROJECT_ID             = var.project_id
+      BIGQUERY_DATASET           = var.bigquery_dataset_id
+      BIGQUERY_CDC_TABLE         = var.bigquery_cdc_table_id
+      BIGQUERY_HISTORICAL_VIEW   = var.bigquery_historical_view_id
+      BIGQUERY_CHURN_MODEL       = var.bigquery_churn_model_id
+      BIGQUERY_PREDICTIONS_TABLE = var.bigquery_predictions_table_id
+    })
+  }
+
+  service_account_name = google_service_account.pipeline_sa.email
+
+  depends_on = [
+    google_project_service.services["bigquerydatatransfer.googleapis.com"],
+    google_project_iam_member.sa_bigquery_admin,
+    google_bigquery_table.orders_cdc
+  ]
+}

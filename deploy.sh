@@ -17,6 +17,11 @@ SKIP_BQML=false
 DRY_RUN=false
 TEARDOWN_MODE=false
 AUTO_APPROVE=false
+CREATE_PROJECT=false
+SYNC_CHURN=false
+SYNC_CHURN_DRY_RUN=false
+BUILD_SYNC_IMAGE=false
+RUN_SYNC_JOB=false
 
 usage() {
   cat <<EOF
@@ -26,15 +31,24 @@ Single-command full deployment and lifecycle management for Redwood Retail.
 
 Options:
   -h, --help               Show this help message and exit.
+  -p, --create-project     Provision a new GCP project using terraform/bootstrap before deploying components.
   -s, --seed-count <N>     Number of initial synthetic orders to generate into Firestore (default: 250).
   --skip-seed              Skip generating synthetic transactions into Firestore.
   --skip-bqml              Skip training and evaluating BigQuery ML churn models.
   --dry-run                Validate configuration and run Terraform plan without modifying GCP resources.
   -t, --teardown, --destroy Cleanly tear down all provisioned GCP infrastructure and stop jobs.
   -y, --auto-approve       Skip confirmation prompts during deployment or teardown.
+  --sync-churn             Run Reverse-ETL sync from BigQuery predictions table to Firestore.
+  --sync-churn-dry-run     Preview Reverse-ETL sync without modifying Firestore documents.
+  --build-sync-image       Build and push the Reverse-ETL sync container image to Artifact Registry.
+  --run-sync-job           Execute the Cloud Run Reverse-ETL sync job on demand via gcloud.
 
 Examples:
   ./deploy.sh                         # Deploy entire infrastructure, seed 250 orders, and train BQML
+  ./deploy.sh --sync-churn            # Sync BigQuery predictions to Firestore customer profiles
+  ./deploy.sh --build-sync-image      # Build and push sync container image to Artifact Registry
+  ./deploy.sh --run-sync-job          # Trigger Cloud Run sync job execution immediately
+  ./deploy.sh --create-project        # Bootstrap a new GCP project first, then deploy components
   ./deploy.sh --seed-count 1000       # Deploy and seed 1,000 transactions
   ./deploy.sh --dry-run               # Preview Terraform execution plan
   ./deploy.sh --teardown              # Destroy all cloud resources cleanly
@@ -47,6 +61,10 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       usage
       exit 0
+      ;;
+    -p|--create-project)
+      CREATE_PROJECT=true
+      shift
       ;;
     -s|--seed-count)
       SEED_COUNT="$2"
@@ -72,6 +90,23 @@ while [[ $# -gt 0 ]]; do
       AUTO_APPROVE=true
       shift
       ;;
+    --sync-churn)
+      SYNC_CHURN=true
+      shift
+      ;;
+    --sync-churn-dry-run)
+      SYNC_CHURN=true
+      SYNC_CHURN_DRY_RUN=true
+      shift
+      ;;
+    --build-sync-image)
+      BUILD_SYNC_IMAGE=true
+      shift
+      ;;
+    --run-sync-job)
+      RUN_SYNC_JOB=true
+      shift
+      ;;
     *)
       echo "Unknown option: $1" >&2
       usage
@@ -83,6 +118,49 @@ done
 echo "================================================================="
 echo " 🌲 REDWOOD RETAIL: End-to-End Automated Deployment Manager"
 echo "================================================================="
+
+# ------------------------------------------------------------------------------
+# 0. Optional: Project Bootstrap Lifecycle
+# ------------------------------------------------------------------------------
+if [[ "$CREATE_PROJECT" == true ]]; then
+  echo "🚀 Bootstrapping new Google Cloud Project via Terraform..."
+  if [[ ! -f "$TERRAFORM_DIR/bootstrap/terraform.tfvars" ]]; then
+    echo "❌ Error: $TERRAFORM_DIR/bootstrap/terraform.tfvars not found." >&2
+    echo "Please copy $TERRAFORM_DIR/bootstrap/terraform.tfvars.example to $TERRAFORM_DIR/bootstrap/terraform.tfvars and set billing_account_id." >&2
+    exit 1
+  fi
+
+  echo "📦 Initializing Terraform Bootstrap module..."
+  terraform -chdir="$TERRAFORM_DIR/bootstrap" init -upgrade
+
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "🔍 Planning project creation..."
+    terraform -chdir="$TERRAFORM_DIR/bootstrap" plan
+    if [[ ! -f "$REDWOOD_DIR/.env" ]]; then
+      echo -e "\nℹ️  Dry-run plan for project bootstrap completed successfully."
+      echo "To preview application components, run ./deploy.sh --create-project without --dry-run or provide an existing GCP_PROJECT_ID in .env."
+      exit 0
+    fi
+  else
+    APPROVE_FLAG=""
+    [[ "$AUTO_APPROVE" == true ]] && APPROVE_FLAG="-auto-approve"
+    echo "🏗️  Applying project creation..."
+    terraform -chdir="$TERRAFORM_DIR/bootstrap" apply $APPROVE_FLAG
+
+    BOOTSTRAP_PROJECT_ID=$(terraform -chdir="$TERRAFORM_DIR/bootstrap" output -raw project_id 2>/dev/null || true)
+    if [[ -n "$BOOTSTRAP_PROJECT_ID" ]]; then
+      echo "✅ Successfully provisioned project: $BOOTSTRAP_PROJECT_ID"
+      if [[ ! -f "$REDWOOD_DIR/.env" && -f "$REDWOOD_DIR/.env.example" ]]; then
+        cp "$REDWOOD_DIR/.env.example" "$REDWOOD_DIR/.env"
+        echo "📄 Created .env from .env.example"
+      fi
+      if [[ -f "$REDWOOD_DIR/.env" ]]; then
+        sed -i.bak -E "s|^GCP_PROJECT_ID=.*|GCP_PROJECT_ID=$BOOTSTRAP_PROJECT_ID|" "$REDWOOD_DIR/.env" && rm -f "$REDWOOD_DIR/.env.bak"
+        echo "📝 Updated GCP_PROJECT_ID in $REDWOOD_DIR/.env to: $BOOTSTRAP_PROJECT_ID"
+      fi
+    fi
+  fi
+fi
 
 # ------------------------------------------------------------------------------
 # 1. Environment & Prerequisites Verification
@@ -97,6 +175,12 @@ set -a
 source "$REDWOOD_DIR/.env"
 set +a
 
+# Default optional variables if not set
+BIGQUERY_PREDICTIONS_TABLE="${BIGQUERY_PREDICTIONS_TABLE:-customer_churn_predictions}"
+ENABLE_SCHEDULED_QUERY="${ENABLE_SCHEDULED_QUERY:-true}"
+SCHEDULED_QUERY_SCHEDULE="${SCHEDULED_QUERY_SCHEDULE:-every 24 hours}"
+export BIGQUERY_PREDICTIONS_TABLE ENABLE_SCHEDULED_QUERY SCHEDULED_QUERY_SCHEDULE
+
 # Validate that all required environment variables are set
 REQUIRED_VARS=(
   GCP_PROJECT_ID
@@ -107,6 +191,7 @@ REQUIRED_VARS=(
   BIGQUERY_CDC_TABLE
   BIGQUERY_HISTORICAL_VIEW
   BIGQUERY_CHURN_MODEL
+  BIGQUERY_PREDICTIONS_TABLE
   GCS_BUCKET_PREFIX
   DATAFLOW_JOB_NAME
   DATAFLOW_SERVICE_ACCOUNT
@@ -134,6 +219,11 @@ export TF_VAR_firestore_database_id="$FIRESTORE_DATABASE_ID"
 export TF_VAR_firestore_collection="$FIRESTORE_COLLECTION"
 export TF_VAR_bigquery_dataset_id="$BIGQUERY_DATASET"
 export TF_VAR_bigquery_cdc_table_id="$BIGQUERY_CDC_TABLE"
+export TF_VAR_bigquery_historical_view_id="$BIGQUERY_HISTORICAL_VIEW"
+export TF_VAR_bigquery_churn_model_id="$BIGQUERY_CHURN_MODEL"
+export TF_VAR_bigquery_predictions_table_id="$BIGQUERY_PREDICTIONS_TABLE"
+export TF_VAR_enable_scheduled_query="$ENABLE_SCHEDULED_QUERY"
+export TF_VAR_scheduled_query_schedule="$SCHEDULED_QUERY_SCHEDULE"
 export TF_VAR_gcs_bucket_name_prefix="$GCS_BUCKET_PREFIX"
 export TF_VAR_service_account_id="$DATAFLOW_SERVICE_ACCOUNT"
 export TF_VAR_dataflow_job_name="$DATAFLOW_JOB_NAME"
@@ -142,6 +232,8 @@ echo "Project ID:          $GCP_PROJECT_ID"
 echo "Region:              $GCP_REGION"
 echo "Firestore Database:  $FIRESTORE_DATABASE_ID (Native Mode, collection: $FIRESTORE_COLLECTION)"
 echo "BigQuery Sink:       $BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE"
+echo "Predictions Table:   $BIGQUERY_DATASET.$BIGQUERY_PREDICTIONS_TABLE"
+echo "Scheduled Query:     $([[ "$ENABLE_SCHEDULED_QUERY" == true ]] && echo "Enabled ($SCHEDULED_QUERY_SCHEDULE)" || echo "Disabled")"
 echo "Dataflow Job:        $DATAFLOW_JOB_NAME"
 echo "Mode:                $([[ "$TEARDOWN_MODE" == true ]] && echo "TEARDOWN" || ([[ "$DRY_RUN" == true ]] && echo "DRY RUN / PLAN" || echo "FULL DEPLOYMENT"))"
 echo "================================================================="
@@ -158,26 +250,68 @@ if ! command -v terraform &>/dev/null; then
   exit 1
 fi
 
-# Check Python environment
+# Check Python environment (Strict virtual environment enforcement)
 if [[ -z "${PYTHON_EXEC:-}" || ! -x "$PYTHON_EXEC" ]]; then
   if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python3" ]]; then
     PYTHON_EXEC="${VIRTUAL_ENV}/bin/python3"
   elif [[ -x "$REDWOOD_DIR/.venv/bin/python3" ]]; then
     PYTHON_EXEC="$REDWOOD_DIR/.venv/bin/python3"
-  elif command -v python3 &>/dev/null; then
-    PYTHON_EXEC="python3"
   else
-    echo "❌ Error: Python 3 executable not found." >&2
-    exit 1
+    echo "📦 Creating required Python virtual environment at $REDWOOD_DIR/.venv..."
+    if ! python3 -m venv "$REDWOOD_DIR/.venv" 2>/dev/null; then
+      python3 -m venv --without-pip "$REDWOOD_DIR/.venv"
+      curl -sSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+      "$REDWOOD_DIR/.venv/bin/python3" /tmp/get-pip.py
+      rm -f /tmp/get-pip.py
+    fi
+    PYTHON_EXEC="$REDWOOD_DIR/.venv/bin/python3"
   fi
 fi
 export PYTHON_EXEC
 
-# Ensure Python requirements are met
+# Ensure Python requirements are met in virtual environment
 "$PYTHON_EXEC" -c "import dotenv, google.cloud.firestore, google.auth, setuptools, build" 2>/dev/null || {
-  echo "📦 Installing required Python dependencies..."
+  echo "📦 Installing required Python dependencies inside virtual environment..."
   "$PYTHON_EXEC" -m pip install -q "apache-beam[gcp]>=2.75.0" "google-cloud-firestore>=2.20.0" "google-cloud-bigquery>=3.25.0" "python-dotenv>=1.0.0" "setuptools" "build"
 }
+
+# ------------------------------------------------------------------------------
+# 1.1 Optional: Reverse-ETL BigQuery to Firestore Churn Sync
+# ------------------------------------------------------------------------------
+if [[ "$SYNC_CHURN" == true ]]; then
+  EXTRA_SYNC_ARGS=()
+  if [[ "$SYNC_CHURN_DRY_RUN" == true ]]; then
+    EXTRA_SYNC_ARGS+=("--dry-run")
+  fi
+  echo -e "\n🔄 Running BigQuery to Firestore Reverse-ETL Churn Sync..."
+  "$PYTHON_EXEC" "$REDWOOD_DIR/sync_churn_to_firestore.py" "${EXTRA_SYNC_ARGS[@]}" || {
+    echo "❌ Error: Reverse-ETL churn sync failed!" >&2
+    exit 1
+  }
+  echo "✅ BigQuery churn predictions successfully synced to Firestore customer profiles!"
+  exit 0
+fi
+
+if [[ "$BUILD_SYNC_IMAGE" == true ]]; then
+  echo -e "\n📦 Building and pushing Reverse-ETL sync container image via Cloud Build..."
+  REPO_URI="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/pipeline-images/churn-sync:latest"
+  gcloud builds submit --tag "$REPO_URI" "$REDWOOD_DIR" || {
+    echo "❌ Error: Container image build failed!" >&2
+    exit 1
+  }
+  echo "✅ Container image successfully pushed to $REPO_URI"
+  exit 0
+fi
+
+if [[ "$RUN_SYNC_JOB" == true ]]; then
+  echo -e "\n⚡ Triggering Cloud Run Reverse-ETL Sync Job (churn-sync-job)..."
+  gcloud run jobs execute churn-sync-job --region "$GCP_REGION" --project "$GCP_PROJECT_ID" --wait || {
+    echo "❌ Error: Cloud Run job execution failed!" >&2
+    exit 1
+  }
+  echo "✅ Cloud Run Reverse-ETL sync job completed successfully!"
+  exit 0
+fi
 
 # ------------------------------------------------------------------------------
 # 2. TEARDOWN LIFECYCLE
@@ -250,8 +384,9 @@ if [[ "$SKIP_SEED" != true ]]; then
   echo "✅ Successfully seeded $SEED_COUNT orders into Firestore."
   echo "⏳ Waiting for Cloud Dataflow to replicate events into BigQuery ($BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE)..."
   
-  MAX_WAIT=180
+  MAX_WAIT=300
   START_WAIT=$(date +%s)
+  ROW_COUNT=0
   while true; do
     ROW_COUNT=$("$PYTHON_EXEC" -c "
 from google.cloud import bigquery
@@ -287,9 +422,17 @@ fi
 # 6. BIGQUERY ML MODEL TRAINING & PREDICTION
 # ------------------------------------------------------------------------------
 if [[ "$SKIP_BQML" != true ]]; then
-  echo -e "\n🧠 Step 3/4: Building BigQuery Feature Views & Training Churn ML Model..."
-  "$PYTHON_EXEC" "$REDWOOD_DIR/run_bigquery_analysis.py" --execute
-  echo "✅ BigQuery ML pipeline execution completed."
+  if [[ "${ROW_COUNT:-0}" -eq 0 && "$SKIP_SEED" != true ]]; then
+    echo -e "\n⚠️ Warning: No records found in BigQuery CDC table yet ($BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE)."
+    echo "Cloud Dataflow workers are still initializing in the background."
+    echo "Skipping immediate BQML training to prevent 'Input data doesn't contain any rows' error."
+    echo "Once Dataflow workers finish streaming records, train the model by running:"
+    echo "   $PYTHON_EXEC $REDWOOD_DIR/run_bigquery_analysis.py --execute"
+  else
+    echo -e "\n🧠 Step 3/4: Building BigQuery Feature Views & Training Churn ML Model..."
+    "$PYTHON_EXEC" "$REDWOOD_DIR/run_bigquery_analysis.py" --execute
+    echo "✅ BigQuery ML pipeline execution completed."
+  fi
 else
   echo -e "\n⏭️  Step 3/4: Skipping BigQuery ML training (--skip-bqml requested)."
 fi
@@ -303,13 +446,16 @@ echo "================================================================="
 echo " Target Project:     $GCP_PROJECT_ID"
 echo " Region:             $GCP_REGION"
 echo " Firestore DB:       $FIRESTORE_DATABASE_ID (Native Mode, Collection: $FIRESTORE_COLLECTION)"
-echo " BigQuery Table:     $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE"
-echo " BigQuery Model:     $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CHURN_MODEL"
-echo " Dataflow Streaming: $DATAFLOW_JOB_NAME"
+echo " BigQuery Table:       $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE"
+echo " BigQuery Model:       $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CHURN_MODEL"
+echo " BigQuery Predictions: $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_PREDICTIONS_TABLE"
+echo " Scheduled Query:      $([[ "$ENABLE_SCHEDULED_QUERY" == true ]] && echo "Enabled ($SCHEDULED_QUERY_SCHEDULE)" || echo "Disabled")"
+echo " Dataflow Streaming:   $DATAFLOW_JOB_NAME"
 echo "-----------------------------------------------------------------"
 echo " 🌐 Google Cloud Console Quick Links:"
 echo " • Dataflow Jobs: https://console.cloud.google.com/dataflow/jobs?project=$GCP_PROJECT_ID"
 echo " • BigQuery Studio: https://console.cloud.google.com/bigquery?project=$GCP_PROJECT_ID"
+echo " • BigQuery Scheduled Queries: https://console.cloud.google.com/bigquery/scheduled-queries?project=$GCP_PROJECT_ID"
 echo " • Firestore Databases: https://console.cloud.google.com/firestore/databases?project=$GCP_PROJECT_ID"
 echo "-----------------------------------------------------------------"
 echo " To clean up all resources later, run: ./teardown.sh"
