@@ -72,3 +72,18 @@ output "bigquery_scheduled_query_name" {
   description = "The name/ID of the BigQuery Data Transfer scheduled query for daily churn analysis."
   value       = var.enable_scheduled_query ? google_bigquery_data_transfer_config.daily_churn_analysis[0].name : "disabled"
 }
+
+output "cloud_run_job_name" {
+  description = "The name of the Cloud Run Job for Reverse-ETL churn sync."
+  value       = var.enable_churn_sync_job ? google_cloud_run_v2_job.churn_sync_job[0].name : "disabled"
+}
+
+output "cloud_scheduler_sync_job_name" {
+  description = "The name of the Cloud Scheduler job for Reverse-ETL churn sync."
+  value       = var.enable_churn_sync_job ? google_cloud_scheduler_job.churn_sync_scheduler[0].name : "disabled"
+}
+
+output "artifact_registry_pipeline_repo" {
+  description = "The Artifact Registry Docker repository for pipeline images."
+  value       = var.enable_churn_sync_job ? google_artifact_registry_repository.pipeline_repo[0].name : "disabled"
+}

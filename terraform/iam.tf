@@ -70,3 +70,17 @@ resource "google_service_account_iam_member" "dataflow_sa_service_agent" {
   role               = "roles/dataflow.serviceAgent"
   member             = "serviceAccount:service-${data.google_project.project.number}@dataflow-service-producer-prod.iam.gserviceaccount.com"
 }
+
+# Service Account Cloud Run Invoker Role (for Cloud Scheduler triggering Cloud Run Job)
+resource "google_project_iam_member" "sa_run_invoker" {
+  project = var.project_id
+  role    = "roles/run.invoker"
+  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
+}
+
+# Service Account Cloud Run Developer Role
+resource "google_project_iam_member" "sa_run_developer" {
+  project = var.project_id
+  role    = "roles/run.developer"
+  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
+}
