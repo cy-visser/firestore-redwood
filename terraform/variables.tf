@@ -99,3 +99,21 @@ variable "dataflow_job_name" {
   type        = string
   default     = "firestore-retail-to-bigquery"
 }
+
+variable "enable_churn_sync_job" {
+  description = "Whether to create the Cloud Run Job and Cloud Scheduler for daily Reverse-ETL churn sync."
+  type        = bool
+  default     = true
+}
+
+variable "churn_sync_schedule" {
+  description = "Cron or frequency expression for the daily Cloud Run sync job (e.g. 'every 24 hours' or '0 3 * * *')."
+  type        = string
+  default     = "every 24 hours"
+}
+
+variable "churn_sync_image" {
+  description = "Container image URI for Cloud Run churn sync job. If empty, defaults to Artifact Registry repository image."
+  type        = string
+  default     = ""
+}

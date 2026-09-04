@@ -20,6 +20,8 @@ AUTO_APPROVE=false
 CREATE_PROJECT=false
 SYNC_CHURN=false
 SYNC_CHURN_DRY_RUN=false
+BUILD_SYNC_IMAGE=false
+RUN_SYNC_JOB=false
 
 usage() {
   cat <<EOF
@@ -38,10 +40,14 @@ Options:
   -y, --auto-approve       Skip confirmation prompts during deployment or teardown.
   --sync-churn             Run Reverse-ETL sync from BigQuery predictions table to Firestore.
   --sync-churn-dry-run     Preview Reverse-ETL sync without modifying Firestore documents.
+  --build-sync-image       Build and push the Reverse-ETL sync container image to Artifact Registry.
+  --run-sync-job           Execute the Cloud Run Reverse-ETL sync job on demand via gcloud.
 
 Examples:
   ./deploy.sh                         # Deploy entire infrastructure, seed 250 orders, and train BQML
   ./deploy.sh --sync-churn            # Sync BigQuery predictions to Firestore customer profiles
+  ./deploy.sh --build-sync-image      # Build and push sync container image to Artifact Registry
+  ./deploy.sh --run-sync-job          # Trigger Cloud Run sync job execution immediately
   ./deploy.sh --create-project        # Bootstrap a new GCP project first, then deploy components
   ./deploy.sh --seed-count 1000       # Deploy and seed 1,000 transactions
   ./deploy.sh --dry-run               # Preview Terraform execution plan
@@ -91,6 +97,14 @@ while [[ $# -gt 0 ]]; do
     --sync-churn-dry-run)
       SYNC_CHURN=true
       SYNC_CHURN_DRY_RUN=true
+      shift
+      ;;
+    --build-sync-image)
+      BUILD_SYNC_IMAGE=true
+      shift
+      ;;
+    --run-sync-job)
+      RUN_SYNC_JOB=true
       shift
       ;;
     *)
@@ -275,6 +289,27 @@ if [[ "$SYNC_CHURN" == true ]]; then
     exit 1
   }
   echo "✅ BigQuery churn predictions successfully synced to Firestore customer profiles!"
+  exit 0
+fi
+
+if [[ "$BUILD_SYNC_IMAGE" == true ]]; then
+  echo -e "\n📦 Building and pushing Reverse-ETL sync container image via Cloud Build..."
+  REPO_URI="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/pipeline-images/churn-sync:latest"
+  gcloud builds submit --tag "$REPO_URI" "$REDWOOD_DIR" || {
+    echo "❌ Error: Container image build failed!" >&2
+    exit 1
+  }
+  echo "✅ Container image successfully pushed to $REPO_URI"
+  exit 0
+fi
+
+if [[ "$RUN_SYNC_JOB" == true ]]; then
+  echo -e "\n⚡ Triggering Cloud Run Reverse-ETL Sync Job (churn-sync-job)..."
+  gcloud run jobs execute churn-sync-job --region "$GCP_REGION" --project "$GCP_PROJECT_ID" --wait || {
+    echo "❌ Error: Cloud Run job execution failed!" >&2
+    exit 1
+  }
+  echo "✅ Cloud Run Reverse-ETL sync job completed successfully!"
   exit 0
 fi
 

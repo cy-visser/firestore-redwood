@@ -12,7 +12,10 @@ locals {
     "serviceusage.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "monitoring.googleapis.com",
-    "logging.googleapis.com"
+    "logging.googleapis.com",
+    "run.googleapis.com",
+    "cloudscheduler.googleapis.com",
+    "artifactregistry.googleapis.com"
   ]
 }
 
