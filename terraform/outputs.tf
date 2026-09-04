@@ -68,6 +68,12 @@ output "dataflow_job_name" {
   value       = var.dataflow_job_name
 }
 
+output "demo_principals" {
+  description = "The email addresses of the demo IAM service accounts."
+  value = {
+    demo1 = google_service_account.demo_principals["demo1-user"].email
+    demo2 = google_service_account.demo_principals["demo2-user"].email
+  }
 output "bigquery_scheduled_query_name" {
   description = "The name/ID of the BigQuery Data Transfer scheduled query for daily churn analysis."
   value       = var.enable_scheduled_query ? google_bigquery_data_transfer_config.daily_churn_analysis[0].name : "disabled"
