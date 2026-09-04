@@ -18,6 +18,8 @@ DRY_RUN=false
 TEARDOWN_MODE=false
 AUTO_APPROVE=false
 CREATE_PROJECT=false
+SYNC_CHURN=false
+SYNC_CHURN_DRY_RUN=false
 
 usage() {
   cat <<EOF
@@ -34,9 +36,12 @@ Options:
   --dry-run                Validate configuration and run Terraform plan without modifying GCP resources.
   -t, --teardown, --destroy Cleanly tear down all provisioned GCP infrastructure and stop jobs.
   -y, --auto-approve       Skip confirmation prompts during deployment or teardown.
+  --sync-churn             Run Reverse-ETL sync from BigQuery predictions table to Firestore.
+  --sync-churn-dry-run     Preview Reverse-ETL sync without modifying Firestore documents.
 
 Examples:
   ./deploy.sh                         # Deploy entire infrastructure, seed 250 orders, and train BQML
+  ./deploy.sh --sync-churn            # Sync BigQuery predictions to Firestore customer profiles
   ./deploy.sh --create-project        # Bootstrap a new GCP project first, then deploy components
   ./deploy.sh --seed-count 1000       # Deploy and seed 1,000 transactions
   ./deploy.sh --dry-run               # Preview Terraform execution plan
@@ -77,6 +82,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     -y|--auto-approve)
       AUTO_APPROVE=true
+      shift
+      ;;
+    --sync-churn)
+      SYNC_CHURN=true
+      shift
+      ;;
+    --sync-churn-dry-run)
+      SYNC_CHURN=true
+      SYNC_CHURN_DRY_RUN=true
       shift
       ;;
     *)
@@ -246,6 +260,23 @@ export PYTHON_EXEC
   echo "📦 Installing required Python dependencies inside virtual environment..."
   "$PYTHON_EXEC" -m pip install -q "apache-beam[gcp]>=2.75.0" "google-cloud-firestore>=2.20.0" "google-cloud-bigquery>=3.25.0" "python-dotenv>=1.0.0" "setuptools" "build"
 }
+
+# ------------------------------------------------------------------------------
+# 1.1 Optional: Reverse-ETL BigQuery to Firestore Churn Sync
+# ------------------------------------------------------------------------------
+if [[ "$SYNC_CHURN" == true ]]; then
+  EXTRA_SYNC_ARGS=()
+  if [[ "$SYNC_CHURN_DRY_RUN" == true ]]; then
+    EXTRA_SYNC_ARGS+=("--dry-run")
+  fi
+  echo -e "\n🔄 Running BigQuery to Firestore Reverse-ETL Churn Sync..."
+  "$PYTHON_EXEC" "$REDWOOD_DIR/sync_churn_to_firestore.py" "${EXTRA_SYNC_ARGS[@]}" || {
+    echo "❌ Error: Reverse-ETL churn sync failed!" >&2
+    exit 1
+  }
+  echo "✅ BigQuery churn predictions successfully synced to Firestore customer profiles!"
+  exit 0
+fi
 
 # ------------------------------------------------------------------------------
 # 2. TEARDOWN LIFECYCLE
