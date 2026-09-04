@@ -62,3 +62,11 @@ output "dataflow_job_name" {
   description = "The Dataflow CDC replication streaming job name."
   value       = var.dataflow_job_name
 }
+
+output "demo_principals" {
+  description = "The email addresses of the demo IAM service accounts."
+  value = {
+    demo1 = google_service_account.demo_principals["demo1-user"].email
+    demo2 = google_service_account.demo_principals["demo2-user"].email
+  }
+}
