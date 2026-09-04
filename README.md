@@ -67,6 +67,10 @@ You can deploy the entire end-to-end architecture (APIs, Firestore Enterprise Na
 * `./deploy.sh --dry-run`: Runs Terraform plan and config verification without altering GCP resources.
 * `./deploy.sh --skip-seed`: Deploys infrastructure without seeding sample orders.
 * `./deploy.sh --skip-bqml`: Deploys infrastructure without training BigQuery ML models.
+* `./deploy.sh --sync-churn`: Executes the Reverse-ETL sync pipeline locally, materializing BigQuery churn predictions into Firestore `/customers/{customerId}`.
+* `./deploy.sh --sync-churn-dry-run`: Previews the Reverse-ETL sync execution without modifying Firestore documents.
+* `./deploy.sh --build-sync-image`: Builds and pushes the Reverse-ETL sync container image to Artifact Registry via Cloud Build.
+* `./deploy.sh --run-sync-job`: Triggers the Cloud Run Reverse-ETL sync job on demand via `gcloud`.
 * `./deploy.sh --teardown` (or `./teardown.sh`): Cleanly destroys all infrastructure and drains Dataflow jobs.
 
 #### Automated Provisioning Lifecycle:
@@ -299,6 +303,42 @@ bq query --use_legacy_sql=false \
 ```
 
 *Console Direct Query*: You can also run these queries directly in [BigQuery Studio](https://console.cloud.google.com/bigquery).
+
+---
+
+## 5. Automated 24-Hour Reverse-ETL: BigQuery to Firestore Churn Sync
+
+To close the loop between daily BigQuery batch ML analytics and real-time operational applications, Redwood Retail includes an automated, serverless **Reverse-ETL pipeline**. 
+
+![Automated 24-Hour Reverse-ETL Pipeline Architecture](docs/images/reverse_etl_cloud_run_architecture.jpg)
+
+> [!NOTE]
+> For the complete technical specification, containerization guide, and operational runbook, see the **[Automated 24-Hour Reverse-ETL Cloud Run Guide](docs/reverse_etl_cloud_run_guide.md)**.
+
+### Architecture Highlights:
+1. **Containerized Cloud Run Job (`churn-sync-job`)**:
+   * Packaged via `Dockerfile` and executes `sync_churn_to_firestore.py` to completion without web server overhead.
+   * Chunks writes into 500-document batches (Firestore atomic batch ceiling) and commits concurrently via a bounded thread pool.
+   * Enforces `merge=True` to preserve real-time customer state without field loss.
+2. **Cloud Scheduler (`daily-churn-sync-scheduler`)**:
+   * Triggers the Cloud Run Job via OAuth 2.0 on a recurring 24-hour schedule (`0 3 * * *` UTC), 1 hour after daily BigQuery churn modeling completes.
+3. **Dedicated Artifact Registry Repository (`pipeline-images`)**:
+   * Stores versioned Docker images built via Cloud Build.
+
+### Reverse-ETL CLI Commands:
+```bash
+# 1. Preview sync execution plan without writing to Firestore
+./deploy.sh --sync-churn-dry-run
+
+# 2. Run Reverse-ETL sync locally with active ADC
+./deploy.sh --sync-churn
+
+# 3. Build & push container image to Artifact Registry
+./deploy.sh --build-sync-image
+
+# 4. Trigger Cloud Run Job on-demand in Google Cloud
+./deploy.sh --run-sync-job
+```
 
 ---
 
