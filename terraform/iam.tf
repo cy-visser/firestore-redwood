@@ -30,13 +30,6 @@ resource "google_project_iam_member" "sa_bigquery_job_user" {
   member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
 }
 
-# Service Account BigQuery Admin (Required for BQML training, DDL views/tables, and Scheduled Queries)
-resource "google_project_iam_member" "sa_bigquery_admin" {
-  project = var.project_id
-  role    = "roles/bigquery.admin"
-  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
-}
-
 # Service Account Dataflow Worker Role
 resource "google_project_iam_member" "sa_dataflow_worker" {
   project = var.project_id
@@ -58,24 +51,6 @@ resource "google_project_iam_member" "sa_storage_admin" {
   member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
 }
 
-# Dedicated Demo Service Accounts for Mobile Client Users
-resource "google_service_account" "demo_principals" {
-  for_each     = toset(["demo1-user", "demo2-user"])
-  project      = var.project_id
-  account_id   = each.key
-  display_name = "Redwood Retail Demo Principal ${each.key}"
-
-  depends_on = [
-    google_project_service.services["iam.googleapis.com"]
-  ]
-}
-
-# Service Account Firestore User Role for Demo Principals
-resource "google_project_iam_member" "demo_principals_firestore" {
-  for_each = toset(["demo1-user", "demo2-user"])
-  project  = var.project_id
-  role     = "roles/datastore.user"
-  member   = "serviceAccount:${google_service_account.demo_principals[each.key].email}"
 # Allow Dataflow Service Agent to access and act as the custom worker service account
 resource "google_service_account_iam_member" "dataflow_sa_actas" {
   service_account_id = google_service_account.pipeline_sa.name
@@ -89,14 +64,27 @@ resource "google_service_account_iam_member" "dataflow_sa_service_agent" {
   member             = "serviceAccount:service-${data.google_project.project.number}@dataflow-service-producer-prod.iam.gserviceaccount.com"
 }
 
-# Service Account Cloud Run Invoker Role (for Cloud Scheduler triggering Cloud Run Job)
+# Service Account Vertex AI User Role (for Gemini reasoning in Loyalty Agent)
+resource "google_project_iam_member" "sa_aiplatform_user" {
+  project = var.project_id
+  role    = "roles/aiplatform.user"
+  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
+}
+
+# Service Account Artifact Registry Reader
+resource "google_project_iam_member" "sa_artifactregistry_reader" {
+  project = var.project_id
+  role    = "roles/artifactregistry.reader"
+  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
+}
+
+# Service Account Cloud Run Invoker & Developer
 resource "google_project_iam_member" "sa_run_invoker" {
   project = var.project_id
   role    = "roles/run.invoker"
   member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
 }
 
-# Service Account Cloud Run Developer Role
 resource "google_project_iam_member" "sa_run_developer" {
   project = var.project_id
   role    = "roles/run.developer"

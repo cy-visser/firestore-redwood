@@ -1,7 +1,7 @@
 variable "project_id" {
   description = "The Google Cloud Project ID to deploy resources in."
   type        = string
-  default     = "elevate-cyvisser"
+  default     = "redwood-retail-949ec9"
 }
 
 variable "region" {
@@ -40,36 +40,6 @@ variable "bigquery_cdc_table_id" {
   default     = "retail_cdc"
 }
 
-variable "bigquery_predictions_table_id" {
-  description = "The BigQuery table ID for persisted BQML churn predictions and retention actions."
-  type        = string
-  default     = "customer_churn_predictions"
-}
-
-variable "bigquery_historical_view_id" {
-  description = "The BigQuery feature engineering view ID."
-  type        = string
-  default     = "customer_historical_data"
-}
-
-variable "bigquery_churn_model_id" {
-  description = "The BigQuery ML customer churn model ID."
-  type        = string
-  default     = "customer_churn_model"
-}
-
-variable "enable_scheduled_query" {
-  description = "Whether to create a BigQuery Scheduled Query for automated daily churn analysis."
-  type        = bool
-  default     = true
-}
-
-variable "scheduled_query_schedule" {
-  description = "Cron or frequency expression for the daily BigQuery scheduled query (e.g. 'every 24 hours' or '0 2 * * *')."
-  type        = string
-  default     = "every 24 hours"
-}
-
 variable "gcs_bucket_name_prefix" {
   description = "Prefix for the Cloud Storage bucket name."
   type        = string
@@ -100,20 +70,32 @@ variable "dataflow_job_name" {
   default     = "firestore-retail-to-bigquery"
 }
 
-variable "enable_churn_sync_job" {
-  description = "Whether to create the Cloud Run Job and Cloud Scheduler for daily Reverse-ETL churn sync."
+variable "bigquery_predictions_table_id" {
+  description = "The BigQuery table for customer churn predictions."
+  type        = string
+  default     = "customer_churn_risk"
+}
+
+variable "enable_loyalty_agent_daemon" {
+  description = "Whether to deploy the Autonomous Loyalty Agent Daemon on Cloud Run."
   type        = bool
   default     = true
 }
 
-variable "churn_sync_schedule" {
-  description = "Cron or frequency expression for the daily Cloud Run sync job (e.g. 'every 24 hours' or '0 3 * * *')."
-  type        = string
-  default     = "every 24 hours"
-}
-
-variable "churn_sync_image" {
-  description = "Container image URI for Cloud Run churn sync job. If empty, defaults to Artifact Registry repository image."
+variable "loyalty_agent_image" {
+  description = "Container image URL for the Loyalty Agent Daemon."
   type        = string
   default     = ""
+}
+
+variable "reasoning_model" {
+  description = "The Gemini model for the autonomous agent reasoning engine."
+  type        = string
+  default     = "gemini-3.8-flash"
+}
+
+variable "enable_artifact_registry" {
+  description = "Whether to deploy the Artifact Registry repository."
+  type        = bool
+  default     = true
 }

@@ -136,30 +136,121 @@ resource "google_bigquery_table" "orders_cdc" {
   ]
 }
 
-resource "google_bigquery_data_transfer_config" "daily_churn_analysis" {
-  count                  = var.enable_scheduled_query ? 1 : 0
-  project                = var.project_id
-  display_name           = "Daily Redwood Customer Churn Prediction & Retention Actions"
-  location               = var.region
-  data_source_id         = "scheduled_query"
-  schedule               = var.scheduled_query_schedule
+resource "google_bigquery_table" "customer_churn_risk" {
+  project             = var.project_id
+  dataset_id          = google_bigquery_dataset.redwood_retail.dataset_id
+  table_id            = "customer_churn_risk"
+  deletion_protection = false
 
-  params = {
-    query = templatefile("${path.module}/../bigquery_churn_sentiment_analysis.sql", {
-      GCP_PROJECT_ID             = var.project_id
-      BIGQUERY_DATASET           = var.bigquery_dataset_id
-      BIGQUERY_CDC_TABLE         = var.bigquery_cdc_table_id
-      BIGQUERY_HISTORICAL_VIEW   = var.bigquery_historical_view_id
-      BIGQUERY_CHURN_MODEL       = var.bigquery_churn_model_id
-      BIGQUERY_PREDICTIONS_TABLE = var.bigquery_predictions_table_id
-    })
+  description = "Materialized daily batch churn risk scores computed by BigQuery ML to eliminate OLTP login latency (SDD Section 1.2)"
+
+  clustering = ["customer_id", "churn_risk_tier"]
+
+  time_partitioning {
+    type  = "DAY"
+    field = "calculation_timestamp"
   }
 
-  service_account_name = google_service_account.pipeline_sa.email
+  schema = jsonencode([
+    {
+      name        = "customer_id"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "Unique Customer Identifier"
+    },
+    {
+      name        = "customer_name"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Customer Full Name"
+    },
+    {
+      name        = "customer_email"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Customer Contact Email"
+    },
+    {
+      name        = "customer_segment"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Customer Segment Classification"
+    },
+    {
+      name        = "loyalty_tier"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Customer Loyalty Program Tier"
+    },
+    {
+      name        = "predicted_is_churned"
+      type        = "INTEGER"
+      mode        = "NULLABLE"
+      description = "Binary churn classification from BQML"
+    },
+    {
+      name        = "churn_probability"
+      type        = "FLOAT"
+      mode        = "NULLABLE"
+      description = "Model calculated churn probability between 0.0 and 1.0"
+    },
+    {
+      name        = "churn_risk_tier"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Calibrated risk tier (LOW, MODERATE, HIGH, CRITICAL)"
+    },
+    {
+      name        = "total_spend_90d"
+      type        = "FLOAT"
+      mode        = "NULLABLE"
+      description = "Total purchase spend in preceding 90 days"
+    },
+    {
+      name        = "days_since_last_purchase"
+      type        = "INTEGER"
+      mode        = "NULLABLE"
+      description = "Inactivity days since most recent purchase"
+    },
+    {
+      name        = "cart_abandonment_count"
+      type        = "INTEGER"
+      mode        = "NULLABLE"
+      description = "Number of abandoned shopping carts in last 90 days"
+    },
+    {
+      name        = "support_tickets_count"
+      type        = "INTEGER"
+      mode        = "NULLABLE"
+      description = "Customer service tickets submitted"
+    },
+    {
+      name        = "sentiment_score"
+      type        = "FLOAT"
+      mode        = "NULLABLE"
+      description = "Customer sentiment score (-1.0 to +1.0)"
+    },
+    {
+      name        = "automated_retention_action"
+      type        = "STRING"
+      mode        = "NULLABLE"
+      description = "Prescribed retention intervention recommendation"
+    },
+    {
+      name        = "calculation_timestamp"
+      type        = "TIMESTAMP"
+      mode        = "REQUIRED"
+      description = "Timestamp when batch inference completed"
+    }
+  ])
+
+  labels = {
+    env       = "demo"
+    use_case  = "churn_shield"
+    component = "loyalty_agent"
+  }
 
   depends_on = [
-    google_project_service.services["bigquerydatatransfer.googleapis.com"],
-    google_project_iam_member.sa_bigquery_admin,
-    google_bigquery_table.orders_cdc
+    google_bigquery_dataset.redwood_retail
   ]
 }
