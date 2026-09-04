@@ -5,7 +5,6 @@ locals {
     "compute.googleapis.com",
     "bigquery.googleapis.com",
     "bigquerystorage.googleapis.com",
-    "bigquerydatatransfer.googleapis.com",
     "storage.googleapis.com",
     "storage-component.googleapis.com",
     "iam.googleapis.com",
@@ -13,9 +12,10 @@ locals {
     "cloudresourcemanager.googleapis.com",
     "monitoring.googleapis.com",
     "logging.googleapis.com",
+    "aiplatform.googleapis.com",
     "run.googleapis.com",
-    "cloudscheduler.googleapis.com",
-    "artifactregistry.googleapis.com"
+    "artifactregistry.googleapis.com",
+    "cloudbuild.googleapis.com"
   ]
 }
 

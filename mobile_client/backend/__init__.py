@@ -1,1 +1,0 @@
-# Mobile Client Backend Package

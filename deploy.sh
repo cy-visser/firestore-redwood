@@ -18,10 +18,11 @@ DRY_RUN=false
 TEARDOWN_MODE=false
 AUTO_APPROVE=false
 CREATE_PROJECT=false
-SYNC_CHURN=false
-SYNC_CHURN_DRY_RUN=false
-BUILD_SYNC_IMAGE=false
-RUN_SYNC_JOB=false
+RUN_TESTS=false
+RUN_AGENT=false
+BUILD_AGENT_IMAGE=false
+DEPLOY_AGENT=false
+TEST_AGENT_DAEMON=false
 
 usage() {
   cat <<EOF
@@ -38,16 +39,19 @@ Options:
   --dry-run                Validate configuration and run Terraform plan without modifying GCP resources.
   -t, --teardown, --destroy Cleanly tear down all provisioned GCP infrastructure and stop jobs.
   -y, --auto-approve       Skip confirmation prompts during deployment or teardown.
-  --sync-churn             Run Reverse-ETL sync from BigQuery predictions table to Firestore.
-  --sync-churn-dry-run     Preview Reverse-ETL sync without modifying Firestore documents.
-  --build-sync-image       Build and push the Reverse-ETL sync container image to Artifact Registry.
-  --run-sync-job           Execute the Cloud Run Reverse-ETL sync job on demand via gcloud.
+  --run-tests              Execute Pytest test suite (tests/) inside .venv and exit.
+  --run-agent              Run the autonomous Loyalty Offer Agent daemon locally (Firestore real-time listener).
+  --build-agent-image      Build and push Loyalty Agent Daemon Docker container to Artifact Registry.
+  --deploy-agent           Deploy or update the Loyalty Agent Daemon service on Cloud Run via Terraform.
+  --test-agent-daemon      Validate Cloud Run Daemon: health check + live Firestore session injection.
 
 Examples:
   ./deploy.sh                         # Deploy entire infrastructure, seed 250 orders, and train BQML
-  ./deploy.sh --sync-churn            # Sync BigQuery predictions to Firestore customer profiles
-  ./deploy.sh --build-sync-image      # Build and push sync container image to Artifact Registry
-  ./deploy.sh --run-sync-job          # Trigger Cloud Run sync job execution immediately
+  ./deploy.sh --run-tests             # Execute full automated test suite (13/13 tests)
+  ./deploy.sh --run-agent             # Start the autonomous ADK agent listener locally
+  ./deploy.sh --build-agent-image     # Build and push Loyalty Agent Daemon image to Artifact Registry
+  ./deploy.sh --deploy-agent          # Deploy Loyalty Agent Daemon to Cloud Run via Terraform
+  ./deploy.sh --test-agent-daemon     # Test live Cloud Run daemon with synthetic mobile session
   ./deploy.sh --create-project        # Bootstrap a new GCP project first, then deploy components
   ./deploy.sh --seed-count 1000       # Deploy and seed 1,000 transactions
   ./deploy.sh --dry-run               # Preview Terraform execution plan
@@ -90,21 +94,24 @@ while [[ $# -gt 0 ]]; do
       AUTO_APPROVE=true
       shift
       ;;
-    --sync-churn)
-      SYNC_CHURN=true
+    --run-tests)
+      RUN_TESTS=true
       shift
       ;;
-    --sync-churn-dry-run)
-      SYNC_CHURN=true
-      SYNC_CHURN_DRY_RUN=true
+    --run-agent)
+      RUN_AGENT=true
       shift
       ;;
-    --build-sync-image)
-      BUILD_SYNC_IMAGE=true
+    --build-agent-image)
+      BUILD_AGENT_IMAGE=true
       shift
       ;;
-    --run-sync-job)
-      RUN_SYNC_JOB=true
+    --deploy-agent)
+      DEPLOY_AGENT=true
+      shift
+      ;;
+    --test-agent-daemon)
+      TEST_AGENT_DAEMON=true
       shift
       ;;
     *)
@@ -175,12 +182,6 @@ set -a
 source "$REDWOOD_DIR/.env"
 set +a
 
-# Default optional variables if not set
-BIGQUERY_PREDICTIONS_TABLE="${BIGQUERY_PREDICTIONS_TABLE:-customer_churn_predictions}"
-ENABLE_SCHEDULED_QUERY="${ENABLE_SCHEDULED_QUERY:-true}"
-SCHEDULED_QUERY_SCHEDULE="${SCHEDULED_QUERY_SCHEDULE:-every 24 hours}"
-export BIGQUERY_PREDICTIONS_TABLE ENABLE_SCHEDULED_QUERY SCHEDULED_QUERY_SCHEDULE
-
 # Validate that all required environment variables are set
 REQUIRED_VARS=(
   GCP_PROJECT_ID
@@ -191,7 +192,6 @@ REQUIRED_VARS=(
   BIGQUERY_CDC_TABLE
   BIGQUERY_HISTORICAL_VIEW
   BIGQUERY_CHURN_MODEL
-  BIGQUERY_PREDICTIONS_TABLE
   GCS_BUCKET_PREFIX
   DATAFLOW_JOB_NAME
   DATAFLOW_SERVICE_ACCOUNT
@@ -219,11 +219,6 @@ export TF_VAR_firestore_database_id="$FIRESTORE_DATABASE_ID"
 export TF_VAR_firestore_collection="$FIRESTORE_COLLECTION"
 export TF_VAR_bigquery_dataset_id="$BIGQUERY_DATASET"
 export TF_VAR_bigquery_cdc_table_id="$BIGQUERY_CDC_TABLE"
-export TF_VAR_bigquery_historical_view_id="$BIGQUERY_HISTORICAL_VIEW"
-export TF_VAR_bigquery_churn_model_id="$BIGQUERY_CHURN_MODEL"
-export TF_VAR_bigquery_predictions_table_id="$BIGQUERY_PREDICTIONS_TABLE"
-export TF_VAR_enable_scheduled_query="$ENABLE_SCHEDULED_QUERY"
-export TF_VAR_scheduled_query_schedule="$SCHEDULED_QUERY_SCHEDULE"
 export TF_VAR_gcs_bucket_name_prefix="$GCS_BUCKET_PREFIX"
 export TF_VAR_service_account_id="$DATAFLOW_SERVICE_ACCOUNT"
 export TF_VAR_dataflow_job_name="$DATAFLOW_JOB_NAME"
@@ -232,8 +227,6 @@ echo "Project ID:          $GCP_PROJECT_ID"
 echo "Region:              $GCP_REGION"
 echo "Firestore Database:  $FIRESTORE_DATABASE_ID (Native Mode, collection: $FIRESTORE_COLLECTION)"
 echo "BigQuery Sink:       $BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE"
-echo "Predictions Table:   $BIGQUERY_DATASET.$BIGQUERY_PREDICTIONS_TABLE"
-echo "Scheduled Query:     $([[ "$ENABLE_SCHEDULED_QUERY" == true ]] && echo "Enabled ($SCHEDULED_QUERY_SCHEDULE)" || echo "Disabled")"
 echo "Dataflow Job:        $DATAFLOW_JOB_NAME"
 echo "Mode:                $([[ "$TEARDOWN_MODE" == true ]] && echo "TEARDOWN" || ([[ "$DRY_RUN" == true ]] && echo "DRY RUN / PLAN" || echo "FULL DEPLOYMENT"))"
 echo "================================================================="
@@ -270,46 +263,86 @@ fi
 export PYTHON_EXEC
 
 # Ensure Python requirements are met in virtual environment
-"$PYTHON_EXEC" -c "import dotenv, google.cloud.firestore, google.auth, setuptools, build" 2>/dev/null || {
+"$PYTHON_EXEC" -c "import dotenv, google.cloud.firestore, google.auth, setuptools, build, pytest" 2>/dev/null || {
   echo "📦 Installing required Python dependencies inside virtual environment..."
-  "$PYTHON_EXEC" -m pip install -q "apache-beam[gcp]>=2.75.0" "google-cloud-firestore>=2.20.0" "google-cloud-bigquery>=3.25.0" "python-dotenv>=1.0.0" "setuptools" "build"
+  "$PYTHON_EXEC" -m pip install -q "apache-beam[gcp]>=2.75.0" "google-cloud-firestore>=2.20.0" "google-cloud-bigquery>=3.25.0" "python-dotenv>=1.0.0" "setuptools" "build" "pytest>=8.0.0"
 }
 
 # ------------------------------------------------------------------------------
-# 1.1 Optional: Reverse-ETL BigQuery to Firestore Churn Sync
+# 1.1 Optional: Automated Test Runner & Agent Run Modes
 # ------------------------------------------------------------------------------
-if [[ "$SYNC_CHURN" == true ]]; then
-  EXTRA_SYNC_ARGS=()
-  if [[ "$SYNC_CHURN_DRY_RUN" == true ]]; then
-    EXTRA_SYNC_ARGS+=("--dry-run")
+if [[ "$RUN_TESTS" == true ]]; then
+  echo -e "\n🧪 Running Redwood Retail Loyalty Offer Agent Test Suite..."
+  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" -m pytest "$REDWOOD_DIR/tests/" -v --tb=short || {
+    echo "❌ Error: Loyalty Offer Agent test suite failed!" >&2
+    exit 1
+  }
+  echo "🎉 All Loyalty Offer Agent tests passed successfully!"
+  exit 0
+fi
+
+if [[ "$RUN_AGENT" == true ]]; then
+  echo -e "\n⚡ Starting Autonomous Loyalty Offer Agent (Firestore Real-time Listener)..."
+  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" -m loyalty_agent.main --daemon
+  exit 0
+fi
+
+if [[ "$BUILD_AGENT_IMAGE" == true ]]; then
+  echo -e "\n🔨 Building Autonomous Loyalty Offer Agent Container Image..."
+  IMAGE_TAG="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/pipeline-images/loyalty-agent-daemon:latest"
+  echo "Target Image: $IMAGE_TAG"
+
+  # Ensure Artifact Registry repository exists
+  if ! gcloud artifacts repositories describe pipeline-images --location="$GCP_REGION" --project="$GCP_PROJECT_ID" &>/dev/null; then
+    echo "Creating Artifact Registry repository 'pipeline-images' in $GCP_REGION..."
+    gcloud artifacts repositories create pipeline-images \
+      --repository-format=docker \
+      --location="$GCP_REGION" \
+      --project="$GCP_PROJECT_ID" \
+      --description="Docker repository for Redwood Retail pipeline and agent images"
   fi
-  echo -e "\n🔄 Running BigQuery to Firestore Reverse-ETL Churn Sync..."
-  "$PYTHON_EXEC" "$REDWOOD_DIR/sync_churn_to_firestore.py" "${EXTRA_SYNC_ARGS[@]}" || {
-    echo "❌ Error: Reverse-ETL churn sync failed!" >&2
-    exit 1
-  }
-  echo "✅ BigQuery churn predictions successfully synced to Firestore customer profiles!"
+
+  echo "Submitting build to Cloud Build..."
+  gcloud builds submit "$REDWOOD_DIR" --tag "$IMAGE_TAG" --project="$GCP_PROJECT_ID"
+  echo "✅ Loyalty Offer Agent container successfully built and published to Artifact Registry:"
+  echo "   $IMAGE_TAG"
   exit 0
 fi
 
-if [[ "$BUILD_SYNC_IMAGE" == true ]]; then
-  echo -e "\n📦 Building and pushing Reverse-ETL sync container image via Cloud Build..."
-  REPO_URI="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/pipeline-images/churn-sync:latest"
-  gcloud builds submit --tag "$REPO_URI" "$REDWOOD_DIR" || {
-    echo "❌ Error: Container image build failed!" >&2
-    exit 1
-  }
-  echo "✅ Container image successfully pushed to $REPO_URI"
+if [[ "$DEPLOY_AGENT" == true ]]; then
+  echo -e "\n🚀 Deploying Autonomous Loyalty Agent Daemon to Cloud Run via Terraform..."
+  terraform -chdir="$TERRAFORM_DIR" init
+  terraform -chdir="$TERRAFORM_DIR" apply -auto-approve \
+    -target=google_service_account.pipeline_sa \
+    -target=google_project_iam_member.sa_aiplatform_user \
+    -target=google_project_iam_member.sa_firestore_owner \
+    -target=google_project_iam_member.sa_run_developer \
+    -target=google_project_iam_member.sa_run_invoker \
+    -target=google_project_iam_member.sa_artifactregistry_reader \
+    -target=google_artifact_registry_repository.pipeline_repo \
+    -target=google_cloud_run_v2_service.loyalty_agent_daemon \
+    -target=google_cloud_run_v2_service_iam_member.loyalty_agent_invoker
+  DAEMON_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw loyalty_agent_daemon_uri 2>/dev/null || true)
+  echo "✅ Loyalty Agent Daemon deployed successfully!"
+  echo "Service URL: $DAEMON_URL"
   exit 0
 fi
 
-if [[ "$RUN_SYNC_JOB" == true ]]; then
-  echo -e "\n⚡ Triggering Cloud Run Reverse-ETL Sync Job (churn-sync-job)..."
-  gcloud run jobs execute churn-sync-job --region "$GCP_REGION" --project "$GCP_PROJECT_ID" --wait || {
-    echo "❌ Error: Cloud Run job execution failed!" >&2
+if [[ "$TEST_AGENT_DAEMON" == true ]]; then
+  echo -e "\n🧪 Testing Loyalty Agent Daemon End-to-End..."
+  DAEMON_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw loyalty_agent_daemon_uri 2>/dev/null || true)
+  EXTRA_ARGS=()
+  if [[ -n "$DAEMON_URL" && "$DAEMON_URL" != "null" ]]; then
+    EXTRA_ARGS+=("--healthcheck-url" "$DAEMON_URL")
+  fi
+  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" "$REDWOOD_DIR/scripts/test_agent_daemon.py" \
+    --project "$GCP_PROJECT_ID" \
+    --database "$FIRESTORE_DATABASE_ID" \
+    "${EXTRA_ARGS[@]}" || {
+    echo "❌ Error: Loyalty Agent Daemon verification failed!" >&2
     exit 1
   }
-  echo "✅ Cloud Run Reverse-ETL sync job completed successfully!"
+  echo "🎉 Loyalty Agent Daemon test passed successfully!"
   exit 0
 fi
 
@@ -446,16 +479,13 @@ echo "================================================================="
 echo " Target Project:     $GCP_PROJECT_ID"
 echo " Region:             $GCP_REGION"
 echo " Firestore DB:       $FIRESTORE_DATABASE_ID (Native Mode, Collection: $FIRESTORE_COLLECTION)"
-echo " BigQuery Table:       $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE"
-echo " BigQuery Model:       $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CHURN_MODEL"
-echo " BigQuery Predictions: $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_PREDICTIONS_TABLE"
-echo " Scheduled Query:      $([[ "$ENABLE_SCHEDULED_QUERY" == true ]] && echo "Enabled ($SCHEDULED_QUERY_SCHEDULE)" || echo "Disabled")"
-echo " Dataflow Streaming:   $DATAFLOW_JOB_NAME"
+echo " BigQuery Table:     $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE"
+echo " BigQuery Model:     $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CHURN_MODEL"
+echo " Dataflow Streaming: $DATAFLOW_JOB_NAME"
 echo "-----------------------------------------------------------------"
 echo " 🌐 Google Cloud Console Quick Links:"
 echo " • Dataflow Jobs: https://console.cloud.google.com/dataflow/jobs?project=$GCP_PROJECT_ID"
 echo " • BigQuery Studio: https://console.cloud.google.com/bigquery?project=$GCP_PROJECT_ID"
-echo " • BigQuery Scheduled Queries: https://console.cloud.google.com/bigquery/scheduled-queries?project=$GCP_PROJECT_ID"
 echo " • Firestore Databases: https://console.cloud.google.com/firestore/databases?project=$GCP_PROJECT_ID"
 echo "-----------------------------------------------------------------"
 echo " To clean up all resources later, run: ./teardown.sh"

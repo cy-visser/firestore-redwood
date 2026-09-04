@@ -4,8 +4,8 @@
 -- Replicated in real-time from Firestore Enterprise via Cloud Dataflow CDC
 --
 -- Note: Placeholders (${GCP_PROJECT_ID}, ${BIGQUERY_DATASET}, ${BIGQUERY_CDC_TABLE},
--- ${BIGQUERY_HISTORICAL_VIEW}, ${BIGQUERY_CHURN_MODEL}, ${BIGQUERY_PREDICTIONS_TABLE})
--- are populated dynamically from your .env file via `run_bigquery_analysis.py`.
+-- ${BIGQUERY_HISTORICAL_VIEW}, ${BIGQUERY_CHURN_MODEL}) are populated dynamically
+-- from your .env file via `run_bigquery_analysis.py`.
 -- ==============================================================================
 
 -- ------------------------------------------------------------------------------
@@ -255,10 +255,13 @@ ORDER BY
 
 
 -- ------------------------------------------------------------------------------
--- 5. Batch Churn Inference & Autonomous Retention Action Feed Table
--- Persists predicted churn probability and intervention recommendations to BigQuery
+-- 5. Batch Churn Inference Table Materialization (`customer_churn_risk`)
+-- Materializes daily baseline predictions to eliminate OLTP login latency (SDD Section 1.2)
 -- ------------------------------------------------------------------------------
-CREATE OR REPLACE TABLE `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_PREDICTIONS_TABLE}` AS
+CREATE OR REPLACE TABLE `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.customer_churn_risk`
+PARTITION BY DATE(calculation_timestamp)
+CLUSTER BY customer_id, churn_risk_tier
+AS
 WITH customer_predictions AS (
   SELECT
     customer_id,
@@ -272,8 +275,7 @@ WITH customer_predictions AS (
     days_since_last_purchase,
     cart_abandonment_count,
     support_tickets_count,
-    sentiment_score,
-    CURRENT_TIMESTAMP() AS prediction_timestamp
+    sentiment_score
   FROM
     ML.PREDICT(
       MODEL `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_CHURN_MODEL}`,
@@ -289,46 +291,42 @@ SELECT
   customer_email,
   customer_segment,
   loyalty_tier,
+  predicted_is_churned,
   ROUND(churn_probability, 4) AS churn_probability,
+  CASE
+    WHEN churn_probability >= 0.75 THEN 'CRITICAL'
+    WHEN churn_probability >= 0.50 THEN 'HIGH'
+    WHEN churn_probability >= 0.25 THEN 'MODERATE'
+    ELSE 'LOW'
+  END AS churn_risk_tier,
   total_spend_90d,
   days_since_last_purchase,
   cart_abandonment_count,
   support_tickets_count,
   sentiment_score,
-  prediction_timestamp,
   CASE
     WHEN churn_probability >= 0.75 THEN '🚨 CRITICAL: Trigger 25% Instant Retention Code + Priority AM Outreach'
     WHEN churn_probability >= 0.50 THEN '⚠️ HIGH RISK: Dispatch Free Express Shipping Voucher'
     WHEN churn_probability >= 0.25 THEN '🟡 MODERATE: Send Personalized Re-engagement Newsletter'
     ELSE '🟢 HEALTHY: Standard Loyalty Nurturing'
-  END AS automated_retention_action
+  END AS automated_retention_action,
+  CURRENT_TIMESTAMP() AS calculation_timestamp
 FROM
   customer_predictions;
 
-
--- ------------------------------------------------------------------------------
--- 6. Top At-Risk Customer Retention Action Feed (Preview)
--- ------------------------------------------------------------------------------
+-- Verification query: Inspect high-priority retention targets
 SELECT
   customer_id,
   customer_name,
-  customer_email,
-  customer_segment,
   loyalty_tier,
   churn_probability,
-  total_spend_90d,
-  days_since_last_purchase,
-  cart_abandonment_count,
-  support_tickets_count,
-  sentiment_score,
-  prediction_timestamp,
-  automated_retention_action
+  churn_risk_tier,
+  automated_retention_action,
+  calculation_timestamp
 FROM
-  `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_PREDICTIONS_TABLE}`
+  `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.customer_churn_risk`
 ORDER BY
-  churn_probability DESC,
-  total_spend_90d DESC
+  churn_probability DESC
 LIMIT 100;
-
 
 
