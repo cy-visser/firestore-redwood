@@ -62,11 +62,10 @@ You can deploy the entire end-to-end architecture (APIs, Firestore Enterprise Na
 
 ### Deployment CLI Options:
 * `./deploy.sh`: Runs full deployment, seeds 250 initial synthetic orders, and trains the BigQuery ML churn model.
-* `./deploy.sh --run-tests`: Executes the automated test suite (13/13 tests) verifying the agent, tools, and schemas.
-* `./deploy.sh --build-agent-image`: Builds and publishes the Loyalty Agent Daemon container to Google Artifact Registry.
-* `./deploy.sh --deploy-agent`: Provisions and deploys the persistent Cloud Run Loyalty Agent Daemon via Terraform.
-* `./deploy.sh --test-agent-daemon`: Executes end-to-end validation: probes `/healthz` and verifies live Firestore session offer generation.
-* `./deploy.sh --run-agent`: Runs the Loyalty Agent daemon locally on your workstation with real-time Firestore listeners.
+* `./deploy.sh --run-tests`: Executes the automated test suite (23/23 tests) verifying the multi-agent A2A architecture, contracts, and orchestrator.
+* `./deploy.sh --build-agent-image`: Builds and publishes the A2A Multi-Agent platform container to Google Artifact Registry for Agent Runtime.
+* `./deploy.sh --test-agent-runtime`: Executes end-to-end validation: probes A2A discovery (`/.well-known/agent-card.json`) and verifies live Firestore session offer generation.
+* `./deploy.sh --run-agent`: Runs the A2A Multi-Agent platform locally on Agent Runtime with real-time Firestore listeners.
 * `./deploy.sh --create-project`: Bootstraps a fresh Google Cloud project using `terraform/bootstrap` before deploying components.
 * `./deploy.sh --seed-count 1000`: Seeds 1,000 synthetic transaction documents into Firestore.
 * `./deploy.sh --dry-run`: Runs Terraform plan and config verification without altering GCP resources.
@@ -75,7 +74,7 @@ You can deploy the entire end-to-end architecture (APIs, Firestore Enterprise Na
 * `./deploy.sh --teardown` (or `./teardown.sh`): Cleanly destroys all infrastructure and drains Dataflow jobs.
 
 > [!TIP]
-> **Mobile Frontend & Cloud Run Daemon Guide**: For step-by-step instructions on deploying the Autonomous Loyalty Agent daemon on Cloud Run for Cyrus's mobile app, see the **[Mobile Frontend & Cloud Run Loyalty Agent Deployment Guide](docs/mobile_deployment_guide.md)**.
+> **Mobile Frontend & Agent Runtime Guide**: For step-by-step instructions on deploying the Autonomous A2A Loyalty Agent on Agent Runtime for Cyrus's mobile app, see the **[Mobile Frontend & Agent Runtime Deployment Guide](docs/mobile_deployment_guide.md)**.
 
 #### Automated Provisioning Lifecycle:
 1. **(Optional) Project Bootstrap**: Provisions a new Google Cloud project via `terraform/bootstrap`, attaches billing, enables base APIs, and populates `.env`.

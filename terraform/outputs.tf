@@ -63,12 +63,7 @@ output "dataflow_job_name" {
   value       = var.dataflow_job_name
 }
 
-output "loyalty_agent_daemon_uri" {
-  description = "The Cloud Run Service URI for the Loyalty Agent Daemon healthcheck."
-  value       = var.enable_loyalty_agent_daemon ? google_cloud_run_v2_service.loyalty_agent_daemon[0].uri : "DISABLED"
-}
-
-output "loyalty_agent_daemon_name" {
-  description = "The Cloud Run Service name for the Loyalty Agent Daemon."
-  value       = var.enable_loyalty_agent_daemon ? google_cloud_run_v2_service.loyalty_agent_daemon[0].name : "DISABLED"
+output "artifact_registry_repo" {
+  description = "The Artifact Registry repository name for pipeline and agent container images."
+  value       = var.enable_artifact_registry ? google_artifact_registry_repository.pipeline_repo[0].name : "DISABLED"
 }

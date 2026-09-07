@@ -76,17 +76,6 @@ variable "bigquery_predictions_table_id" {
   default     = "customer_churn_risk"
 }
 
-variable "enable_loyalty_agent_daemon" {
-  description = "Whether to deploy the Autonomous Loyalty Agent Daemon on Cloud Run."
-  type        = bool
-  default     = true
-}
-
-variable "loyalty_agent_image" {
-  description = "Container image URL for the Loyalty Agent Daemon."
-  type        = string
-  default     = ""
-}
 
 variable "reasoning_model" {
   description = "The Gemini model for the autonomous agent reasoning engine."

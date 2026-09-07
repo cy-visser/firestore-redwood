@@ -1,6 +1,6 @@
 """
 Entrypoint CLI runner for Redwood Retail Multi-Agent Retention System.
-Deployed on Google Cloud Agent Runtime and Cloud Run with standard A2A discovery endpoints.
+Deployed on Google Cloud Agent Runtime with standard A2A discovery endpoints.
 """
 
 import sys
@@ -261,11 +261,11 @@ def run_daemon():
         session_processor=orchestrator.process_session
     )
 
+    shutdown_event = threading.Event()
+
     def shutdown_handler(signum, frame):
-        logger.info("Shutdown signal received. Exiting gracefully...")
-        listener.stop()
-        runtime_server.shutdown()
-        sys.exit(0)
+        logger.info("Shutdown signal (%s) received. Exiting gracefully...", signum)
+        shutdown_event.set()
 
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
@@ -274,10 +274,14 @@ def run_daemon():
     logger.info("⚡ Multi-Agent A2A Platform is live on Agent Runtime and listening for customer sessions.")
 
     try:
-        while True:
-            time.sleep(1)
+        shutdown_event.wait()
     except KeyboardInterrupt:
-        shutdown_handler(None, None)
+        logger.info("Keyboard interrupt received.")
+    finally:
+        logger.info("Stopping Firestore listener and A2A runtime server...")
+        listener.stop()
+        runtime_server.shutdown()
+        logger.info("Agent Runtime shutdown complete.")
 
 
 if __name__ == "__main__":

@@ -78,15 +78,3 @@ resource "google_project_iam_member" "sa_artifactregistry_reader" {
   member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
 }
 
-# Service Account Cloud Run Invoker & Developer
-resource "google_project_iam_member" "sa_run_invoker" {
-  project = var.project_id
-  role    = "roles/run.invoker"
-  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
-}
-
-resource "google_project_iam_member" "sa_run_developer" {
-  project = var.project_id
-  role    = "roles/run.developer"
-  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
-}

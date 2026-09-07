@@ -17,5 +17,5 @@ COPY loyalty_agent/ ./loyalty_agent/
 # Expose container health check and A2A discovery port
 EXPOSE 8080
 
-# Run Loyalty Agent persistent event listener daemon
+# Run Redwood Retail A2A Multi-Agent platform on Agent Runtime
 ENTRYPOINT ["python", "-m", "loyalty_agent.main", "--daemon"]

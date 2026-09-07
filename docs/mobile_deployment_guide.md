@@ -1,32 +1,34 @@
-# Redwood Retail: Mobile Frontend & Cloud Run Loyalty Agent Deployment Guide
+# Redwood Retail: Mobile Frontend & Google Cloud Agent Runtime Integration Guide
 
-This guide provides end-to-end instructions for deploying the **Autonomous Loyalty Offer Agent Daemon** on **Google Cloud Run** and integrating it with the mobile frontend developed by Cyrus (Cyrille Visser).
+This guide provides end-to-end instructions for deploying the **Autonomous A2A Multi-Agent Retention Platform** on **Google Cloud Agent Runtime** and integrating it with the mobile frontend developed by Cyrus (Cyrille Visser).
 
-This deployment packages the agent as a dedicated background daemon, enabling the mobile application to interact directly and natively with **Cloud Firestore** through real-time document listeners (`onSnapshot`) with sub-500ms event propagation.
+This deployment packages the agents into Google Cloud Agent Runtime with standard Agent2Agent (A2A) discovery (`/.well-known/agent-card.json`), enabling the mobile application to interact directly and natively with **Cloud Firestore** through real-time document listeners (`onSnapshot`) with sub-500ms event propagation.
 
 ---
 
 ## 1. Architectural Overview
 
-The Autonomous Loyalty Offer Agent runs as a persistent background daemon in Google Cloud Run. It maintains an active bidirectional gRPC watch stream (`on_snapshot`) on the Firestore `/customer_sessions` collection, evaluates churn probability using BigQuery ML / cached customer profiles, personalizes retention offers using **Vertex AI Gemini 3.8 Flash**, validates schemas via Pydantic (`loyalty_agent/schemas.py`), and writes vouchers directly to Firestore `/loyalty_offers`.
+The Redwood Retail Retention Platform operates as an autonomous multi-agent system on Google Cloud Agent Runtime. The **Retention Orchestrator Agent** dynamically coordinates 5 specialized domain agents via the standard A2A protocol:
+1. **Cooldown Policy Agent**: Enforces 7-day offer cooldown rules.
+2. **Customer Friction Agent**: Analyzes session grievances (crashes, delivery friction, return rates).
+3. **Churn Intelligence Agent**: Evaluates churn risk via BigQuery ML and Firestore cache.
+4. **Offer Synthesis Agent**: Synthesizes calibrated retention copy and discounts using Vertex AI Gemini 3.8 Flash with deterministic fallback.
+5. **Offer Fulfillment Agent**: Atomically persists vouchers to Firestore `/loyalty_offers` and marks sessions processed.
 
-![Cloud Run Agent Daemon & Mobile App Integration Architecture](images/cloud_run_agent_daemon_arch.jpg)
+A persistent bidirectional gRPC watch stream (`on_snapshot`) on Firestore `/customer_sessions` detects login events in real-time.
 
 ### Execution Flow
 1. **Customer Login**: The mobile application writes a login session document into Firestore collection `customer_sessions`.
-2. **Real-Time Detection**: The Cloud Run daemon's persistent gRPC watch stream detects the `PENDING` session document with 0ms polling delay.
-3. **Multi-Pillar Churn Assessment**:
-   - Checks active offer cooldown (7-day window) via `loyalty_agent/tools/cooldown_tool.py`.
-   - Resolves churn risk from the high-throughput Firestore cache (`/customers/{customerId}.baselineChurnRisk`) populated by the 24-hour BigQuery Reverse-ETL sync, falling back to BigQuery ML on-demand if cache is absent.
-   - Synthesizes session grievances (app crashes, delivery friction, return rates).
-4. **Vertex AI Generative Personalization**:
-   - Generates personalized marketing copy and calibrated discount percentages (up to 25% for VIP/Critical churn, 15% for High churn).
-   - Deterministic rule engine fallback guarantees zero downtime even if Vertex AI encounters quota limits.
-5. **Pydantic Schema Validation**:
+2. **Real-Time Detection**: The Agent Runtime persistent gRPC watch stream detects the `PENDING` session document with 0ms polling delay.
+3. **Multi-Agent A2A Coordination**:
+   - The Orchestrator issues concurrent `TaskRequest` calls to `cooldown`, `friction`, and `churn` agents.
+   - Upon assessing elevated risk, it tasks the `synthesis` agent to generate personalized copy and discounts.
+   - The `fulfillment` agent commits the voucher to `loyalty_offers`.
+4. **Pydantic Schema Validation**:
    - Validates the generated offer payload strictly against `LoyaltyOffer` in `loyalty_agent/schemas.py`.
-6. **Atomic Firestore Persistence**:
+5. **Atomic Firestore Persistence**:
    - Atomically commits the voucher into `loyalty_offers` and updates `customer_sessions/{sessionId}.agentProcessingStatus = 'PROCESSED'`.
-7. **Mobile Client Reactive Display**:
+6. **Mobile Client Reactive Display**:
    - The mobile application's real-time snapshot listener on `loyalty_offers` triggers immediately (< 500ms) to display the personalized retention card.
 
 ---
@@ -60,9 +62,9 @@ DATAFLOW_SERVICE_ACCOUNT=dataflow-worker-sa
 
 ---
 
-## 3. End-to-End Deployment in 3 Commands
+## 3. End-to-End Deployment & Verification
 
-### Step 1: Build & Publish Container Image
+### Step 1: Build & Publish Agent Runtime Container Image
 Build the container using Google Cloud Build and publish to Google Artifact Registry:
 
 ```bash
@@ -72,39 +74,21 @@ Build the container using Google Cloud Build and publish to Google Artifact Regi
 *What this does:*
 - Creates the Artifact Registry Docker repository `pipeline-images` in `europe-west4` if it does not already exist.
 - Executes `gcloud builds submit` using the root [Dockerfile](file:///usr/local/google/home/ganeshraja/projects/firestore-redwood/Dockerfile).
-- Publishes image `europe-west4-docker.pkg.dev/redwood-retail-949ec9/pipeline-images/loyalty-agent-daemon:latest`.
+- Publishes image `europe-west4-docker.pkg.dev/redwood-retail-949ec9/pipeline-images/loyalty-agent-runtime:latest`.
 
 ---
 
-### Step 2: Deploy Cloud Run Daemon via Terraform
-Deploy the persistent daemon service to Google Cloud Run:
+### Step 2: Verify & Test Agent Runtime End-to-End
+Validate the A2A discovery endpoint and verify real-time Firestore event handling:
 
 ```bash
-./deploy.sh --deploy-agent
+./deploy.sh --test-agent-runtime
 ```
 
 *What this does:*
-- Initializes and targets `terraform/loyalty_agent.tf`.
-- Provisions `google_cloud_run_v2_service.loyalty_agent_daemon`:
-  - **Machine Specs**: 1 vCPU, 1 GiB RAM, Gen2 execution environment.
-  - **Always-Allocated CPU (`cpu_idle = false`)**: Disables CPU throttling so the daemon's background gRPC watch stream remains active 24/7.
-  - **Minimum Instances**: `min_instance_count = 1` ensures no cold starts or sleep timeouts.
-  - **Healthcheck Probes**: Embedded HTTP server on port 8080 responding to `/healthz`.
-  - **IAM Privileges**: Grants `roles/aiplatform.user` (Vertex AI Gemini) and `roles/datastore.user` (Firestore).
-
----
-
-### Step 3: Verify & Test Cloud Run Daemon End-to-End
-Validate the deployed Cloud Run service and verify real-time Firestore event handling:
-
-```bash
-./deploy.sh --test-agent-daemon
-```
-
-*What this does:*
-- Probes the Cloud Run service's `/healthz` HTTP endpoint.
+- Probes the Agent Runtime discovery endpoint `/.well-known/agent-card.json`.
 - Injects a synthetic mobile login session for customer `cust_retail_32822` (High Churn Probability) into Firestore collection `customer_sessions`.
-- Awaits the Cloud Run daemon's real-time snapshot processing.
+- Awaits the multi-agent orchestrator's real-time snapshot processing.
 - Asserts that `agentProcessingStatus` transitions to `PROCESSED` and validates the newly created voucher in `loyalty_offers`.
 
 ---
@@ -228,14 +212,14 @@ Every document written to `/loyalty_offers` complies strictly with `LoyaltyOffer
 
 ## 6. Local Development & Testing
 
-If you want to run the daemon locally on your Cloudtop or workstation instead of Cloud Run:
+If you want to run the platform locally on your Cloudtop or workstation:
 
 ```bash
 # Run tests
 ./deploy.sh --run-tests
 
-# Run daemon locally with real-time listener
+# Run multi-agent platform locally with real-time listener
 ./deploy.sh --run-agent
 ```
 
-When running locally, the daemon will bind port 8080 for `/healthz` and immediately begin streaming events from Firestore database `redwood`.
+When running locally, the platform will bind port 8080 for standard A2A discovery (`/.well-known/agent-card.json`) and task execution (`/a2a/v1/tasks`), and immediately begin streaming events from Firestore database `redwood`.
