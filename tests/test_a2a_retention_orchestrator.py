@@ -11,7 +11,7 @@ from google.api_core.exceptions import ServiceUnavailable, ResourceExhausted
 import pytest
 
 
-from loyalty_agent.agents.orchestrator_agent import RetentionOrchestratorAgent as LoyaltyOfferAgent
+from loyalty_agent.agents.orchestrator_agent import RetentionOrchestratorAgent
 
 
 
@@ -33,7 +33,7 @@ def test_tc01_high_churn_trigger(mock_firestore, mock_bigquery, mock_gemini):
         "agentProcessingStatus": "PENDING"
     })
 
-    agent = LoyaltyOfferAgent(mock_firestore, mock_bigquery, mock_gemini)
+    agent = RetentionOrchestratorAgent(mock_firestore, mock_bigquery, mock_gemini)
     offer = agent.process_session(session_id)
 
     assert offer is not None
@@ -60,7 +60,7 @@ def test_tc02_healthy_customer(mock_firestore, mock_bigquery, mock_gemini):
         "agentProcessingStatus": "PENDING"
     })
 
-    agent = LoyaltyOfferAgent(mock_firestore, mock_bigquery, mock_gemini)
+    agent = RetentionOrchestratorAgent(mock_firestore, mock_bigquery, mock_gemini)
     offer = agent.process_session(session_id)
 
     assert offer is None
@@ -87,7 +87,7 @@ def test_tc03_critical_churn_with_complaint(mock_firestore, mock_bigquery, mock_
         "agentProcessingStatus": "PENDING"
     })
 
-    agent = LoyaltyOfferAgent(mock_firestore, mock_bigquery, mock_gemini)
+    agent = RetentionOrchestratorAgent(mock_firestore, mock_bigquery, mock_gemini)
     offer = agent.process_session(session_id)
 
     assert offer is not None
@@ -115,7 +115,7 @@ def test_tc04_new_customer_cold_start(mock_firestore, mock_bigquery, mock_gemini
         "agentProcessingStatus": "PENDING"
     })
 
-    agent = LoyaltyOfferAgent(mock_firestore, mock_bigquery, mock_gemini)
+    agent = RetentionOrchestratorAgent(mock_firestore, mock_bigquery, mock_gemini)
     offer = agent.process_session(session_id)
 
     assert offer is None
@@ -140,7 +140,7 @@ def test_tc05_rapid_login_spurt_idempotency(mock_firestore, mock_bigquery, mock_
             "agentProcessingStatus": "PENDING"
         })
 
-    agent = LoyaltyOfferAgent(mock_firestore, mock_bigquery, mock_gemini)
+    agent = RetentionOrchestratorAgent(mock_firestore, mock_bigquery, mock_gemini)
     results = [agent.process_session(sid) for sid in session_ids]
 
     offers = list(mock_firestore.collection("loyalty_offers").where("customerId", "==", customer_id).stream())
@@ -176,7 +176,7 @@ def test_tc06_active_offer_cooldown(mock_firestore, mock_bigquery, mock_gemini):
         "agentProcessingStatus": "PENDING"
     })
 
-    agent = LoyaltyOfferAgent(mock_firestore, mock_bigquery, mock_gemini)
+    agent = RetentionOrchestratorAgent(mock_firestore, mock_bigquery, mock_gemini)
     offer = agent.process_session(session_id)
 
     assert offer["offerId"] == existing_offer_id
@@ -202,7 +202,7 @@ def test_tc07_bigquery_service_failure_fallback(mock_firestore, mock_bigquery, m
         "agentProcessingStatus": "PENDING"
     })
 
-    agent = LoyaltyOfferAgent(mock_firestore, mock_bigquery, mock_gemini)
+    agent = RetentionOrchestratorAgent(mock_firestore, mock_bigquery, mock_gemini)
     offer = agent.process_session(session_id)
 
     assert offer is not None
@@ -226,7 +226,7 @@ def test_tc08_vertex_gemini_quota_fallback(mock_firestore, mock_bigquery, mock_g
         "agentProcessingStatus": "PENDING"
     })
 
-    agent = LoyaltyOfferAgent(mock_firestore, mock_bigquery, mock_gemini)
+    agent = RetentionOrchestratorAgent(mock_firestore, mock_bigquery, mock_gemini)
     offer = agent.process_session(session_id)
 
     assert offer is not None
@@ -259,7 +259,7 @@ def test_tc09_realtime_sync_simulation_sla(mock_firestore, mock_bigquery, mock_g
     unsubscribe = mock_firestore.collection("loyalty_offers").on_snapshot(on_snapshot_callback)
 
     start_time = time.perf_counter()
-    agent = LoyaltyOfferAgent(mock_firestore, mock_bigquery, mock_gemini)
+    agent = RetentionOrchestratorAgent(mock_firestore, mock_bigquery, mock_gemini)
     agent.process_session(session_id)
 
     assert len(received_events) > 0
@@ -296,7 +296,7 @@ def test_tc10_offer_redemption_lifecycle(mock_firestore, mock_bigquery, mock_gem
         "agentProcessingStatus": "PENDING"
     })
 
-    agent = LoyaltyOfferAgent(mock_firestore, mock_bigquery, mock_gemini)
+    agent = RetentionOrchestratorAgent(mock_firestore, mock_bigquery, mock_gemini)
     offer = agent.process_session(session_id)
 
     assert offer is None
@@ -308,7 +308,7 @@ def test_tc10_offer_redemption_lifecycle(mock_firestore, mock_bigquery, mock_gem
 
 def test_tc11_concurrency_multi_customer_isolation(mock_firestore, mock_bigquery, mock_gemini):
     """TC-11: 10 concurrent customer logins processed in parallel without cross-talk."""
-    agent = LoyaltyOfferAgent(mock_firestore, mock_bigquery, mock_gemini)
+    agent = RetentionOrchestratorAgent(mock_firestore, mock_bigquery, mock_gemini)
     customers = [f"cust_retail_conc_{i:02d}" for i in range(10)]
 
     for idx, cid in enumerate(customers):
@@ -370,7 +370,7 @@ def test_tc12_event_augmented_hybrid_escalation(mock_firestore, mock_bigquery, m
         "agentProcessingStatus": "PENDING"
     })
 
-    agent = LoyaltyOfferAgent(mock_firestore, mock_bigquery, mock_gemini)
+    agent = RetentionOrchestratorAgent(mock_firestore, mock_bigquery, mock_gemini)
     offer = agent.process_session(session_id)
 
     # Offer MUST be created because acute friction boosted risk to 0.65 (HIGH)
@@ -410,7 +410,7 @@ def test_tc13_cached_firestore_churn_risk_fastpath(mock_firestore, mock_bigquery
         "agentProcessingStatus": "PENDING"
     })
 
-    agent = LoyaltyOfferAgent(mock_firestore, mock_bigquery, mock_gemini)
+    agent = RetentionOrchestratorAgent(mock_firestore, mock_bigquery, mock_gemini)
     offer = agent.process_session(session_id)
 
     assert offer is not None

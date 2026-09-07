@@ -48,7 +48,7 @@ Options:
 Examples:
   ./deploy.sh                         # Deploy entire infrastructure, seed 250 orders, and train BQML
   ./deploy.sh --run-tests             # Execute full automated test suite (13/13 tests)
-  ./deploy.sh --run-agent             # Start the autonomous ADK agent listener locally
+  ./deploy.sh --run-agent             # Start the autonomous A2A Multi-Agent platform locally
   ./deploy.sh --build-agent-image     # Build and push Loyalty Agent Daemon image to Artifact Registry
   ./deploy.sh --deploy-agent          # Deploy Loyalty Agent Daemon to Cloud Run via Terraform
   ./deploy.sh --test-agent-daemon     # Test live Cloud Run daemon with synthetic mobile session

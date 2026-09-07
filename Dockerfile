@@ -11,12 +11,10 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
-COPY firestore_auth.py ./
-COPY retail_catalog.py ./
+# Copy A2A Multi-Agent platform application files
 COPY loyalty_agent/ ./loyalty_agent/
 
-# Expose container health check port
+# Expose container health check and A2A discovery port
 EXPOSE 8080
 
 # Run Loyalty Agent persistent event listener daemon
