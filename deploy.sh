@@ -275,8 +275,8 @@ if [[ "$RUN_TESTS" == true ]]; then
 fi
 
 if [[ "$RUN_AGENT" == true ]]; then
-  echo -e "\n⚡ Starting Autonomous Loyalty Offer Agent (Firestore Real-time Listener)..."
-  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" -m loyalty_agent.main --daemon
+  echo -e "\n⚡ Starting Autonomous A2A Multi-Agent Platform on Agent Runtime..."
+  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" -m loyalty_agent.main --serve
   exit 0
 fi
 

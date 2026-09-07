@@ -26,7 +26,6 @@ from loyalty_agent.agents import (
     OfferFulfillmentAgent,
     BaseA2AAgent
 )
-from loyalty_agent.listener import SessionEventListener
 
 logging.basicConfig(
     level=logging.INFO,
@@ -170,120 +169,185 @@ def start_multi_agent_server(
     return server
 
 
-def build_clients():
-    """Initializes Google Cloud clients for Firestore, BigQuery, and Vertex AI."""
-    from google.cloud import firestore
-    from google.cloud import bigquery
-    from google import genai
+class RetentionAgentEngine:
+    """
+    Google Cloud Agent Runtime / Vertex AI Agent Engine.
+    Coordinates the Redwood Retail multi-agent retention platform
+    via standard A2A protocol.
+    """
 
-    logger.info("Connecting to Firestore database '%s' in '%s'...", config.firestore_database, config.region)
-    fs_client = firestore.Client(project=config.project_id, database=config.firestore_database)
+    def __init__(
+        self,
+        project_id: Optional[str] = None,
+        region: Optional[str] = None,
+        firestore_database: Optional[str] = None,
+        bigquery_dataset: Optional[str] = None,
+        reasoning_model: Optional[str] = None,
+        cooldown_days: Optional[int] = None,
+    ):
+        self.project_id = project_id or config.project_id
+        self.region = region or config.region
+        self.firestore_database = firestore_database or config.firestore_database
+        self.bigquery_dataset = bigquery_dataset or config.bigquery_dataset
+        self.reasoning_model = reasoning_model or config.reasoning_model
+        self.cooldown_days = cooldown_days if cooldown_days is not None else config.cooldown_days
 
-    logger.info("Connecting to BigQuery dataset '%s'...", config.bigquery_dataset)
-    bq_client = bigquery.Client(project=config.project_id, location=config.region)
+        self.fs_client = None
+        self.bq_client = None
+        self.genai_client = None
+        self.orchestrator: Optional[RetentionOrchestratorAgent] = None
+        self.domain_agents: Dict[str, BaseA2AAgent] = {}
 
-    logger.info("Initializing Gemini Client with model '%s'...", config.reasoning_model)
-    try:
-        genai_client = genai.Client()
-    except Exception as e:
-        logger.warning("Vertex AI Client init warning (will use deterministic fallback): %s", e)
-        genai_client = None
+    def set_up(self):
+        """Lifecycle hook invoked by Agent Runtime upon deployment/initialization."""
+        from google.cloud import firestore
+        from google.cloud import bigquery
+        from google import genai
 
-    return fs_client, bq_client, genai_client
+        logger.info("Initializing RetentionAgentEngine on Google Cloud Agent Runtime...")
+        self.fs_client = firestore.Client(project=self.project_id, database=self.firestore_database)
+        self.bq_client = bigquery.Client(project=self.project_id, location=self.region)
+
+        try:
+            self.genai_client = genai.Client()
+        except Exception as e:
+            logger.warning("Vertex AI Client init warning (will use deterministic fallback): %s", e)
+            self.genai_client = None
+
+        cooldown_agent = CooldownPolicyAgent(
+            firestore_client=self.fs_client,
+            default_cooldown_days=self.cooldown_days
+        )
+        friction_agent = CustomerFrictionAgent(
+            firestore_client=self.fs_client
+        )
+        churn_agent = ChurnIntelligenceAgent(
+            bigquery_client=self.bq_client,
+            firestore_client=self.fs_client
+        )
+        synthesis_agent = OfferSynthesisAgent(
+            gemini_model=self.genai_client
+        )
+        fulfillment_agent = OfferFulfillmentAgent(
+            firestore_client=self.fs_client,
+            default_cooldown_days=self.cooldown_days
+        )
+
+        self.domain_agents = {
+            "cooldown": cooldown_agent,
+            "friction": friction_agent,
+            "churn": churn_agent,
+            "synthesis": synthesis_agent,
+            "fulfillment": fulfillment_agent
+        }
+
+        self.orchestrator = RetentionOrchestratorAgent(
+            firestore_client=self.fs_client,
+            bigquery_client=self.bq_client,
+            gemini_model=self.genai_client,
+            auto_register_local_domain_agents=False
+        )
+        for agent in self.domain_agents.values():
+            self.orchestrator.register_domain_agent(agent)
+
+        logger.info("✅ RetentionAgentEngine initialized with 5 domain agents.")
+
+    def query(self, session_id: str, **kwargs) -> Dict[str, Any]:
+        """
+        Primary query entrypoint called statelessly by Google Cloud Agent Runtime.
+        Evaluates session, coordinates agents via A2A, and issues loyalty offer.
+        """
+        if self.orchestrator is None:
+            self.set_up()
+
+        offer = self.orchestrator.process_session(session_id)
+        return {
+            "sessionId": session_id,
+            "action": "OFFER_ISSUED" if offer else "NO_OFFER_ISSUED",
+            "offer": offer
+        }
+
+    async def handle_task(self, task_request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """A2A task execution handler invoked by Agent Runtime."""
+        if self.orchestrator is None:
+            self.set_up()
+
+        task_request = TaskRequest.model_validate(task_request_data)
+        task_response = await self.orchestrator.handle_task(task_request)
+        return task_response.model_dump()
+
+    def get_agent_card(self) -> Dict[str, Any]:
+        """Returns canonical A2A AgentCard manifest for Agent Registry."""
+        if self.orchestrator is None:
+            self.set_up()
+        return self.orchestrator.get_agent_card().model_dump()
 
 
-def run_daemon():
-    """Runs the multi-agent loyalty system as a persistent background daemon on Agent Runtime."""
-    logger.info("🌲 Redwood Retail Multi-Agent Retention Platform Starting...")
-    logger.info("Target GCP Project: %s", config.project_id)
-    logger.info("Reasoning Model:    %s", config.reasoning_model)
+def deploy_to_agent_runtime(
+    display_name: str = "redwood-retention-orchestrator",
+    requirements: Optional[list] = None,
+    staging_bucket: Optional[str] = None
+):
+    """
+    Deploys the RetentionAgentEngine to Google Cloud Agent Runtime / Vertex AI.
+    """
+    import vertexai
+    from vertexai.preview import reasoning_engines
 
-    port = int(os.getenv("PORT", "8080"))
-    base_host = os.getenv("AGENT_RUNTIME_HOST", f"http://localhost:{port}")
-
-    fs_client, bq_client, genai_client = build_clients()
-
-    # 1. Instantiate Domain Agents with scoped URLs
-    cooldown_agent = CooldownPolicyAgent(
-        firestore_client=fs_client,
-        base_url=f"{base_host}/cooldown",
-        default_cooldown_days=config.cooldown_days
+    staging_bucket = staging_bucket or f"gs://{config.project_id}-{config.region}-agent-runtime"
+    vertexai.init(
+        project=config.project_id,
+        location=config.region,
+        staging_bucket=staging_bucket
     )
-    friction_agent = CustomerFrictionAgent(
-        firestore_client=fs_client,
-        base_url=f"{base_host}/friction"
+
+    engine = RetentionAgentEngine()
+    reqs = requirements or [
+        "google-cloud-firestore>=2.14.0",
+        "google-cloud-bigquery>=3.14.0",
+        "google-genai>=1.0.0",
+        "pydantic>=2.0.0",
+        "httpx>=0.25.0"
+    ]
+
+    remote_agent = reasoning_engines.ReasoningEngine.create(
+        reasoning_engine=engine,
+        requirements=reqs,
+        display_name=display_name,
+        description="Redwood Retail Multi-Agent Retention Platform on Agent Runtime",
     )
-    churn_agent = ChurnIntelligenceAgent(
-        bigquery_client=bq_client,
-        firestore_client=fs_client,
-        base_url=f"{base_host}/churn"
-    )
-    synthesis_agent = OfferSynthesisAgent(
-        gemini_model=genai_client,
-        base_url=f"{base_host}/synthesis"
-    )
-    fulfillment_agent = OfferFulfillmentAgent(
-        firestore_client=fs_client,
-        base_url=f"{base_host}/fulfillment",
-        default_cooldown_days=config.cooldown_days
-    )
+    logger.info("🎉 Deployed to Google Cloud Agent Runtime: %s", remote_agent.resource_name)
+    return remote_agent
 
-    domain_agents = {
-        "cooldown": cooldown_agent,
-        "friction": friction_agent,
-        "churn": churn_agent,
-        "synthesis": synthesis_agent,
-        "fulfillment": fulfillment_agent
-    }
 
-    # 2. Instantiate Retention Orchestrator Agent and Register Domain Agents
-    orchestrator = RetentionOrchestratorAgent(
-        firestore_client=fs_client,
-        bigquery_client=bq_client,
-        gemini_model=genai_client,
-        base_url=base_host,
-        cooldown_agent_url=f"{base_host}/cooldown",
-        churn_agent_url=f"{base_host}/churn",
-        friction_agent_url=f"{base_host}/friction",
-        synthesis_agent_url=f"{base_host}/synthesis",
-        fulfillment_agent_url=f"{base_host}/fulfillment",
-        auto_register_local_domain_agents=False
-    )
-    for agent in domain_agents.values():
-        orchestrator.register_domain_agent(agent)
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Redwood Retail Retention Agent Engine on Agent Runtime")
+    parser.add_argument("--session-id", help="Execute retention evaluation for a customer session and print result")
+    parser.add_argument("--deploy", action="store_true", help="Deploy RetentionAgentEngine to Google Cloud Agent Runtime")
+    parser.add_argument("--serve", action="store_true", help="Start local A2A test server for development/testing")
+    parser.add_argument("--port", type=int, default=8080, help="Port for local A2A test server")
+    args = parser.parse_args()
 
-    # 3. Start A2A Multi-Agent Server
-    runtime_server = start_multi_agent_server(orchestrator, domain_agents, port=port)
+    engine = RetentionAgentEngine()
+    engine.set_up()
 
-    # 4. Attach Real-Time Firestore Session Listener
-    listener = SessionEventListener(
-        firestore_client=fs_client,
-        session_processor=orchestrator.process_session
-    )
-
-    shutdown_event = threading.Event()
-
-    def shutdown_handler(signum, frame):
-        logger.info("Shutdown signal (%s) received. Exiting gracefully...", signum)
-        shutdown_event.set()
-
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-
-    listener.start()
-    logger.info("⚡ Multi-Agent A2A Platform is live on Agent Runtime and listening for customer sessions.")
-
-    try:
-        shutdown_event.wait()
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received.")
-    finally:
-        logger.info("Stopping Firestore listener and A2A runtime server...")
-        listener.stop()
-        runtime_server.shutdown()
-        logger.info("Agent Runtime shutdown complete.")
+    if args.deploy:
+        deploy_to_agent_runtime()
+    elif args.session_id:
+        result = engine.query(args.session_id)
+        print(json.dumps(result, indent=2))
+    elif args.serve:
+        server = start_multi_agent_server(engine.orchestrator, engine.domain_agents, port=args.port)
+        logger.info("Local Agent Runtime test server running on port %d. Press Ctrl+C to stop.", args.port)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            logger.info("Server stopped.")
+    else:
+        card = engine.get_agent_card()
+        print(json.dumps(card, indent=2))
 
 
 if __name__ == "__main__":
-    if "--daemon" in sys.argv or len(sys.argv) == 1:
-        run_daemon()
+    main()

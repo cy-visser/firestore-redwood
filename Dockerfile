@@ -18,4 +18,4 @@ COPY loyalty_agent/ ./loyalty_agent/
 EXPOSE 8080
 
 # Run Redwood Retail A2A Multi-Agent platform on Agent Runtime
-ENTRYPOINT ["python", "-m", "loyalty_agent.main", "--daemon"]
+ENTRYPOINT ["python", "-m", "loyalty_agent.main", "--serve"]

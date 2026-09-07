@@ -422,3 +422,68 @@ def test_runtime_http_discovery_and_tasks(mock_firestore, mock_bigquery, mock_ge
 
     finally:
         server.shutdown()
+
+
+@pytest.mark.anyio
+async def test_retention_agent_engine_native(mock_firestore, mock_bigquery, mock_gemini):
+    """Verifies that RetentionAgentEngine adheres to Google Cloud Agent Runtime interface."""
+    from loyalty_agent.main import RetentionAgentEngine
+
+    engine = RetentionAgentEngine()
+    engine.fs_client = mock_firestore
+    engine.bq_client = mock_bigquery
+    engine.genai_client = mock_gemini
+
+    cooldown = CooldownPolicyAgent(mock_firestore)
+    churn = ChurnIntelligenceAgent(mock_bigquery, mock_firestore)
+    friction = CustomerFrictionAgent(mock_firestore)
+    synthesis = OfferSynthesisAgent(mock_gemini)
+    fulfillment = OfferFulfillmentAgent(mock_firestore)
+
+    engine.domain_agents = {
+        "cooldown": cooldown,
+        "churn": churn,
+        "friction": friction,
+        "synthesis": synthesis,
+        "fulfillment": fulfillment
+    }
+
+    engine.orchestrator = RetentionOrchestratorAgent(
+        firestore_client=mock_firestore,
+        bigquery_client=mock_bigquery,
+        gemini_model=mock_gemini,
+        auto_register_local_domain_agents=False
+    )
+    for agent in engine.domain_agents.values():
+        engine.orchestrator.register_domain_agent(agent)
+
+    # 1. Test get_agent_card()
+    card = engine.get_agent_card()
+    assert card["name"] == "Retention Orchestrator Agent"
+    assert len(card["skills"]) >= 1
+
+    # 2. Test query()
+    mock_bigquery.set_predictions("cust_eng_test", 0.88)
+    mock_firestore.collection("customers").document("cust_eng_test").set({
+        "customerId": "cust_eng_test",
+        "primaryComplaintReason": "LATE_DELIVERY"
+    })
+    mock_firestore.collection("customer_sessions").document("sess_eng_01").set({
+        "sessionId": "sess_eng_01",
+        "customerId": "cust_eng_test",
+        "status": "ACTIVE",
+        "agentProcessingStatus": "PENDING"
+    })
+
+    query_res = engine.query("sess_eng_01")
+    assert query_res["sessionId"] == "sess_eng_01"
+    assert query_res["action"] == "OFFER_ISSUED"
+    assert query_res["offer"]["discountPercent"] == 25
+
+    # 3. Test handle_task()
+    task_res = await engine.handle_task({
+        "skillId": "orchestrate_retention_flow",
+        "sessionId": "sess_eng_01",
+        "parameters": {"sessionId": "sess_eng_01"}
+    })
+    assert task_res["status"] == "COMPLETED"
