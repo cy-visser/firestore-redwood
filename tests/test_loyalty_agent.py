@@ -11,7 +11,7 @@ from google.api_core.exceptions import ServiceUnavailable, ResourceExhausted
 import pytest
 
 
-from loyalty_agent.agent import AutonomousLoyaltyAgent as LoyaltyOfferAgent
+from loyalty_agent.agents.orchestrator_agent import RetentionOrchestratorAgent as LoyaltyOfferAgent
 
 
 
