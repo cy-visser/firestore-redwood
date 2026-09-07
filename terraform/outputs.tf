@@ -67,3 +67,28 @@ output "artifact_registry_repo" {
   description = "The Artifact Registry repository name for pipeline and agent container images."
   value       = var.enable_artifact_registry ? google_artifact_registry_repository.pipeline_repo[0].name : "DISABLED"
 }
+
+output "agent_engine_id" {
+  description = "The resource ID of the deployed Vertex AI Agent Engine (Reasoning Engine)."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_agent_engine[0].id : "DISABLED"
+}
+
+output "agent_engine_name" {
+  description = "The full resource name of the deployed Vertex AI Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_agent_engine[0].name : "DISABLED"
+}
+
+output "agent_engine_display_name" {
+  description = "Display name of the Vertex AI Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_agent_engine[0].display_name : "DISABLED"
+}
+
+output "agent_engine_image" {
+  description = "Artifact Registry container image URI for the Agent Runtime container."
+  value       = var.enable_agent_engine ? "${var.region}-docker.pkg.dev/${var.project_id}/${var.enable_artifact_registry ? google_artifact_registry_repository.pipeline_repo[0].repository_id : "pipeline-images"}/loyalty-agent-runtime:${var.agent_image_tag}" : "DISABLED"
+}
+
+output "agent_engine_card" {
+  description = "The A2A Agent Card registered with the Agent Engine."
+  value       = var.enable_agent_engine ? local.agent_card : "DISABLED"
+}
