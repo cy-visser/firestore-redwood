@@ -100,10 +100,6 @@ resource "google_vertex_ai_reasoning_engine" "retention_agent_engine" {
         value = var.reasoning_model
       }
       env {
-        name  = "PORT"
-        value = "8080"
-      }
-      env {
         name  = "PYTHONUNBUFFERED"
         value = "1"
       }
@@ -114,6 +110,8 @@ resource "google_vertex_ai_reasoning_engine" "retention_agent_engine" {
     google_project_service.services["aiplatform.googleapis.com"],
     google_project_iam_member.sa_aiplatform_user,
     google_project_iam_member.re_service_agent_ar_reader,
-    google_service_account_iam_member.agent_engine_sa_user
+    google_project_iam_member.re_dedicated_service_agent_ar_reader,
+    google_service_account_iam_member.agent_engine_sa_user,
+    google_service_account_iam_member.re_dedicated_agent_engine_sa_user
   ]
 }

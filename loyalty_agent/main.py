@@ -42,12 +42,19 @@ class MultiAgentA2ARuntimeHandler(BaseHTTPRequestHandler):
 
     agent_registry: Dict[str, BaseA2AAgent] = {}
     orchestrator: Optional[RetentionOrchestratorAgent] = None
+    engine: Optional[Any] = None
 
     @classmethod
-    def set_agents(cls, orchestrator: RetentionOrchestratorAgent, domain_agents: Dict[str, BaseA2AAgent]):
+    def set_agents(
+        cls,
+        orchestrator: RetentionOrchestratorAgent,
+        domain_agents: Dict[str, BaseA2AAgent],
+        engine: Optional[Any] = None
+    ):
         cls.orchestrator = orchestrator
-        cls.agent_registry = domain_agents
+        cls.agent_registry = dict(domain_agents)
         cls.agent_registry["orchestrator"] = orchestrator
+        cls.engine = engine
 
     def _send_json(self, status_code: int, data: Any):
         body = json.dumps(data, indent=2).encode("utf-8")
@@ -61,7 +68,12 @@ class MultiAgentA2ARuntimeHandler(BaseHTTPRequestHandler):
         url_path = self.path.split("?")[0]
 
         # 1. Health and Liveness Probes
-        if url_path in ("/", "/healthz", "/health"):
+        # Root probe for Agent Runtime BYOC health check
+        if url_path == "/":
+            self._send_json(200, {"status": "ok"})
+            return
+
+        if url_path in ("/healthz", "/health"):
             agent_roster = {
                 prefix: {
                     "name": agent.get_agent_card().name,
@@ -104,6 +116,71 @@ class MultiAgentA2ARuntimeHandler(BaseHTTPRequestHandler):
             body_json = json.loads(raw_body)
         except json.JSONDecodeError:
             self._send_json(400, {"error": "Invalid JSON payload in request body"})
+            return
+
+        # 0. Native Vertex AI Agent Engine BYOC Contract: /api/reasoning_engine
+        if url_path in ("/api/reasoning_engine", "/reasoning_engine"):
+            class_method = body_json.get("class_method") or "query"
+            payload = body_json.get("input")
+            if payload is None:
+                payload = {k: v for k, v in body_json.items() if k != "class_method"}
+
+            target_obj = self.engine or self.orchestrator
+            logger.info("⚡ [Agent Runtime] Invoking class_method='%s', payload=%s", class_method, payload)
+
+            try:
+                if class_method == "set_up":
+                    if hasattr(target_obj, "set_up"):
+                        target_obj.set_up()
+                    self._send_json(200, {"output": "ok"})
+                elif class_method == "get_agent_card":
+                    card = target_obj.get_agent_card()
+                    card_dict = card.model_dump() if hasattr(card, "model_dump") else card
+                    self._send_json(200, {"output": card_dict})
+                elif class_method == "query":
+                    session_id = payload.get("session_id") if isinstance(payload, dict) else payload
+                    if not session_id and isinstance(payload, dict):
+                        session_id = payload.get("sessionId")
+                    result = target_obj.query(str(session_id)) if hasattr(target_obj, "query") else target_obj.process_session(str(session_id))
+                    self._send_json(200, {"output": result})
+                elif class_method == "handle_task":
+                    task_req = TaskRequest.model_validate(payload)
+                    task_res = asyncio.run(target_obj.handle_task(task_req))
+                    self._send_json(200, {"output": task_res.model_dump()})
+                elif hasattr(target_obj, class_method):
+                    method = getattr(target_obj, class_method)
+                    if isinstance(payload, dict):
+                        res = method(**payload)
+                    elif payload is not None:
+                        res = method(payload)
+                    else:
+                        res = method()
+                    self._send_json(200, {"output": res})
+                else:
+                    self._send_json(400, {"error": f"Unknown class_method: {class_method}"})
+            except Exception as exc:
+                logger.exception("Error executing Agent Runtime class_method %s: %s", class_method, exc)
+                self._send_json(500, {"error": str(exc), "output": None})
+            return
+
+        # 0.1 Native Streaming Reasoning Engine: /api/stream_reasoning_engine
+        if url_path in ("/api/stream_reasoning_engine", "/stream_reasoning_engine"):
+            class_method = body_json.get("class_method") or "query"
+            payload = body_json.get("input")
+            if payload is None:
+                payload = {k: v for k, v in body_json.items() if k != "class_method"}
+
+            target_obj = self.engine or self.orchestrator
+            session_id = payload.get("session_id") if isinstance(payload, dict) else payload
+            if not session_id and isinstance(payload, dict):
+                session_id = payload.get("sessionId")
+            result = target_obj.query(str(session_id)) if hasattr(target_obj, "query") else target_obj.process_session(str(session_id))
+            chunk = (json.dumps({"output": result}, default=str) + "\n").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(chunk)))
+            self.end_headers()
+            self.wfile.write(chunk)
             return
 
         # 1. Standard A2A Task Execution Endpoints
@@ -156,16 +233,20 @@ class MultiAgentA2ARuntimeHandler(BaseHTTPRequestHandler):
 def start_multi_agent_server(
     orchestrator: RetentionOrchestratorAgent,
     domain_agents: Dict[str, BaseA2AAgent],
-    port: int = 8080
+    engine: Optional[Any] = None,
+    port: int = 8080,
+    run_in_thread: bool = True
 ) -> ThreadingHTTPServer:
-    """Starts background ThreadingHTTPServer for Agent Runtime discovery and execution."""
-    MultiAgentA2ARuntimeHandler.set_agents(orchestrator, domain_agents)
+    """Starts ThreadingHTTPServer for Agent Runtime discovery and execution."""
+    MultiAgentA2ARuntimeHandler.set_agents(orchestrator, domain_agents, engine=engine)
     server = ThreadingHTTPServer(("0.0.0.0", port), MultiAgentA2ARuntimeHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    if run_in_thread:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
     logger.info("📡 A2A Multi-Agent Runtime server listening on 0.0.0.0:%d", port)
     logger.info("   Discovery:   http://0.0.0.0:%d/.well-known/agent-card.json", port)
     logger.info("   Tasks:       http://0.0.0.0:%d/a2a/v1/tasks", port)
+    logger.info("   Reasoning:   http://0.0.0.0:%d/api/reasoning_engine", port)
     return server
 
 
@@ -338,7 +419,13 @@ def main():
         result = engine.query(args.session_id)
         print(json.dumps(result, indent=2))
     elif args.serve:
-        server = start_multi_agent_server(engine.orchestrator, engine.domain_agents, port=args.port)
+        server = start_multi_agent_server(
+            engine.orchestrator,
+            engine.domain_agents,
+            engine=engine,
+            port=args.port,
+            run_in_thread=False
+        )
         logger.info("Local Agent Runtime test server running on port %d. Press Ctrl+C to stop.", args.port)
         try:
             server.serve_forever()
