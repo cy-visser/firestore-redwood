@@ -63,12 +63,74 @@ output "dataflow_job_name" {
   value       = var.dataflow_job_name
 }
 
-output "loyalty_agent_daemon_uri" {
-  description = "The Cloud Run Service URI for the Loyalty Agent Daemon healthcheck."
-  value       = var.enable_loyalty_agent_daemon ? google_cloud_run_v2_service.loyalty_agent_daemon[0].uri : "DISABLED"
+output "artifact_registry_repo" {
+  description = "The Artifact Registry repository name for pipeline and agent container images."
+  value       = var.enable_artifact_registry ? google_artifact_registry_repository.pipeline_repo[0].name : "DISABLED"
 }
 
-output "loyalty_agent_daemon_name" {
-  description = "The Cloud Run Service name for the Loyalty Agent Daemon."
-  value       = var.enable_loyalty_agent_daemon ? google_cloud_run_v2_service.loyalty_agent_daemon[0].name : "DISABLED"
+# Discrete A2A Reasoning Engines
+output "cooldown_agent_name" {
+  description = "The full resource name of the Standalone Cooldown Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.cooldown_agent[0].name : "DISABLED"
 }
+
+output "churn_agent_name" {
+  description = "The full resource name of the Standalone Churn Intelligence Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.churn_agent[0].name : "DISABLED"
+}
+
+output "friction_agent_name" {
+  description = "The full resource name of the Standalone Customer Friction Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.friction_agent[0].name : "DISABLED"
+}
+
+output "synthesis_agent_name" {
+  description = "The full resource name of the Standalone Offer Synthesis Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.synthesis_agent[0].name : "DISABLED"
+}
+
+output "fulfillment_agent_name" {
+  description = "The full resource name of the Standalone Offer Fulfillment Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.fulfillment_agent[0].name : "DISABLED"
+}
+
+output "orchestrator_agent_name" {
+  description = "The full resource name of the Standalone Retention Orchestrator Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_orchestrator[0].name : "DISABLED"
+}
+
+output "agent_engine_id" {
+  description = "The resource ID of the deployed Retention Orchestrator Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_orchestrator[0].id : "DISABLED"
+}
+
+output "agent_engine_name" {
+  description = "The full resource name of the deployed Retention Orchestrator Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_orchestrator[0].name : "DISABLED"
+}
+
+output "agent_engine_display_name" {
+  description = "Display name of the Retention Orchestrator Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_orchestrator[0].display_name : "DISABLED"
+}
+
+output "agent_engine_image" {
+  description = "Artifact Registry container image URI for the Agent Runtime container."
+  value       = var.enable_agent_engine ? "${var.region}-docker.pkg.dev/${var.project_id}/${var.enable_artifact_registry ? google_artifact_registry_repository.pipeline_repo[0].repository_id : "pipeline-images"}/loyalty-agent-runtime:${var.agent_image_tag}" : "DISABLED"
+}
+
+output "agent_engine_card" {
+  description = "The A2A Agent Card registered with the Retention Orchestrator Agent Engine."
+  value       = var.enable_agent_engine ? local.agent_card : "DISABLED"
+}
+
+output "event_bridge_name" {
+  description = "The Cloud Run service name of the Event Bridge."
+  value       = var.enable_event_bridge ? google_cloud_run_v2_service.event_bridge[0].name : "DISABLED"
+}
+
+output "event_bridge_url" {
+  description = "The service URL of the Event Bridge."
+  value       = var.enable_event_bridge ? google_cloud_run_v2_service.event_bridge[0].uri : "DISABLED"
+}
+

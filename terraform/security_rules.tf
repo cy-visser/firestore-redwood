@@ -3,6 +3,7 @@
 # ==============================================================================
 
 resource "google_firebaserules_ruleset" "firestore" {
+  count   = var.enable_security_rules ? 1 : 0
   project = var.project_id
 
   source {
@@ -18,13 +19,14 @@ resource "google_firebaserules_ruleset" "firestore" {
 }
 
 resource "google_firebaserules_release" "firestore" {
+  count        = var.enable_security_rules ? 1 : 0
   project      = var.project_id
   name         = "cloud.firestore/${var.firestore_database_id}"
-  ruleset_name = "projects/${var.project_id}/rulesets/${google_firebaserules_ruleset.firestore.name}"
+  ruleset_name = "projects/${var.project_id}/rulesets/${google_firebaserules_ruleset.firestore[0].name}"
 
   lifecycle {
     replace_triggered_by = [
-      google_firebaserules_ruleset.firestore
+      google_firebaserules_ruleset.firestore[0]
     ]
   }
 

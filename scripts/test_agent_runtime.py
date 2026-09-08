@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Test script for Redwood Retail Autonomous Loyalty Agent Daemon.
-Validates healthcheck probe, creates a test customer session in Firestore,
-and verifies that the daemon processes the session and issues or surfaces a loyalty offer.
+Test script for Redwood Retail A2A Multi-Agent Retention Platform on Agent Runtime.
+Validates A2A discovery endpoint (/.well-known/agent-card.json), creates a test
+customer session in Firestore, and verifies that the multi-agent orchestrator
+processes the session and issues or surfaces a loyalty offer.
 """
 
 import sys
@@ -20,10 +21,10 @@ DEFAULT_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "redwood-retail-949ec9")
 DEFAULT_DATABASE_ID = os.getenv("FIRESTORE_DATABASE_ID", "redwood")
 
 
-def check_health(url: str, timeout: int = 10) -> bool:
-    """Probes the Cloud Run or local daemon HTTP health endpoint."""
-    print(f"🩺 Probing daemon healthcheck endpoint at {url} ...")
-    headers = {"User-Agent": "Redwood-Test/1.0"}
+def check_agent_runtime(url: str, timeout: int = 10) -> bool:
+    """Probes the Agent Runtime A2A discovery and health endpoints."""
+    print(f"🩺 Probing Agent Runtime discovery endpoint at {url} ...")
+    headers = {"User-Agent": "Redwood-Agent-Runtime-Test/1.0"}
     try:
         import subprocess
         token = subprocess.check_output(
@@ -35,40 +36,46 @@ def check_health(url: str, timeout: int = 10) -> bool:
     except Exception:
         pass
 
-    probe_urls = [url.rstrip("/") + "/", url.rstrip("/") + "/healthz"]
+    probe_urls = [
+        url.rstrip("/") + "/.well-known/agent-card.json",
+        url.rstrip("/") + "/healthz",
+        url.rstrip("/") + "/"
+    ]
     for p_url in probe_urls:
         try:
             req = urllib.request.Request(p_url, headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 if response.status == 200:
                     body = response.read().decode("utf-8")
-                    print(f"✅ Healthcheck passed on {p_url}! Response (200 OK): {body.strip()}")
+                    data = json.loads(body)
+                    name = data.get("name") or data.get("platform", "Agent Runtime")
+                    print(f"✅ Agent Runtime discovery verified on {p_url}! Agent: {name}")
                     return True
         except Exception:
             continue
 
-    print("⚠️ Warning: Healthcheck probe was unsuccessful (service might require internal network or IAM invoker).")
+    print("⚠️ Warning: Agent Runtime probe did not respond (service might require internal network or IAM invoker).")
     return False
 
 
-def test_daemon(project_id: str, database_id: str, customer_id: str, health_url: str = None, timeout_seconds: int = 30):
+def test_agent_runtime(project_id: str, database_id: str, customer_id: str, runtime_url: str = None, timeout_seconds: int = 30):
     print("=" * 65)
-    print(" 🌲 REDWOOD RETAIL: Loyalty Offer Agent Daemon Verification")
+    print(" 🌲 REDWOOD RETAIL: A2A Multi-Agent Platform Verification")
     print("=" * 65)
     print(f"Target GCP Project:     {project_id}")
     print(f"Firestore Database:     {database_id}")
     print(f"Test Customer ID:       {customer_id}")
-    if health_url:
-        print(f"Cloud Run Service URL:  {health_url}")
+    if runtime_url:
+        print(f"Agent Runtime URL:      {runtime_url}")
     print("-" * 65)
 
-    if health_url:
-        check_health(health_url)
+    if runtime_url:
+        check_agent_runtime(runtime_url)
 
     print(f"\n📡 Connecting to Firestore database '{database_id}' in project '{project_id}'...")
     db = firestore.Client(project=project_id, database=database_id)
 
-    session_id = f"sess_daemon_test_{int(time.time())}"
+    session_id = f"sess_agent_test_{int(time.time())}"
     now_iso = datetime.now(timezone.utc).isoformat()
 
     session_data = {
@@ -89,7 +96,7 @@ def test_daemon(project_id: str, database_id: str, customer_id: str, health_url:
     db.collection("customer_sessions").document(session_id).set(session_data)
     print("✅ Session document successfully created in Firestore.")
 
-    print(f"\n⏳ Waiting for Loyalty Agent Daemon to process session (timeout: {timeout_seconds}s)...")
+    print(f"\n⏳ Waiting for A2A Retention Orchestrator to process session (timeout: {timeout_seconds}s)...")
     start_time = time.time()
     processed = False
     session_result = None
@@ -101,7 +108,7 @@ def test_daemon(project_id: str, database_id: str, customer_id: str, health_url:
             status = data.get("agentProcessingStatus")
             if status in ("PROCESSED", "SKIPPED"):
                 elapsed = time.time() - start_time
-                print(f"🎯 Session processed by Cloud Run daemon in {elapsed:.2f}s! Status: {status}")
+                print(f"🎯 Session processed by A2A Orchestrator in {elapsed:.2f}s! Status: {status}")
                 processed = True
                 session_result = data
                 break
@@ -110,8 +117,8 @@ def test_daemon(project_id: str, database_id: str, customer_id: str, health_url:
         print(f"   Polling Firestore... (elapsed: {int(time.time() - start_time)}s)")
 
     if not processed:
-        print(f"❌ Error: Daemon did not process session within {timeout_seconds} seconds.")
-        print("Please check that the Cloud Run service is running and has permissions on Firestore.")
+        print(f"❌ Error: Agent Runtime did not process session within {timeout_seconds} seconds.")
+        print("Please check that the Agent Runtime process is running and has permissions on Firestore.")
         return False
 
     # Check for newly generated offer
@@ -124,7 +131,7 @@ def test_daemon(project_id: str, database_id: str, customer_id: str, health_url:
 
     if offers:
         offer_found = offers[0].to_dict()
-        print("\n🎉 SUCCESS! Real-time Loyalty Offer Generated by Cloud Run Daemon:")
+        print("\n🎉 SUCCESS! Real-time Loyalty Offer Generated by A2A Platform:")
         print(f" • Offer ID:              {offer_found.get('offerId')}")
         print(f" • Promo Code:             {offer_found.get('promoCode')}")
         print(f" • Discount:               {offer_found.get('discountPercent')}%")
@@ -137,7 +144,7 @@ def test_daemon(project_id: str, database_id: str, customer_id: str, health_url:
         return True
     elif session_result and session_result.get("activeOfferId"):
         existing_offer_id = session_result.get("activeOfferId")
-        print(f"\n🎉 SUCCESS! Daemon recognized active offer within cooldown window:")
+        print(f"\n🎉 SUCCESS! Agent recognized active offer within cooldown window:")
         print(f" • Active Offer Linked:    {existing_offer_id}")
         print(f" • Skip Reason:            {session_result.get('skipReason')}")
         return True
@@ -148,19 +155,19 @@ def test_daemon(project_id: str, database_id: str, customer_id: str, health_url:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test Redwood Retail Loyalty Agent Daemon")
+    parser = argparse.ArgumentParser(description="Test Redwood Retail A2A Multi-Agent Platform on Agent Runtime")
     parser.add_argument("--project", default=DEFAULT_PROJECT_ID, help="GCP Project ID")
     parser.add_argument("--database", default=DEFAULT_DATABASE_ID, help="Firestore Database ID")
     parser.add_argument("--customer-id", default="cust_retail_72871", help="Customer ID to test")
-    parser.add_argument("--healthcheck-url", default=None, help="Cloud Run daemon service URL to probe")
+    parser.add_argument("--runtime-url", default=None, help="Agent Runtime service URL to probe")
     parser.add_argument("--timeout", type=int, default=30, help="Wait timeout in seconds")
 
     args = parser.parse_args()
-    success = test_daemon(
+    success = test_agent_runtime(
         project_id=args.project,
         database_id=args.database,
         customer_id=args.customer_id,
-        health_url=args.healthcheck_url,
+        runtime_url=args.runtime_url,
         timeout_seconds=args.timeout
     )
     sys.exit(0 if success else 1)

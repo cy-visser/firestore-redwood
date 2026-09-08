@@ -21,8 +21,7 @@ CREATE_PROJECT=false
 RUN_TESTS=false
 RUN_AGENT=false
 BUILD_AGENT_IMAGE=false
-DEPLOY_AGENT=false
-TEST_AGENT_DAEMON=false
+TEST_AGENT_RUNTIME=false
 
 usage() {
   cat <<EOF
@@ -40,18 +39,16 @@ Options:
   -t, --teardown, --destroy Cleanly tear down all provisioned GCP infrastructure and stop jobs.
   -y, --auto-approve       Skip confirmation prompts during deployment or teardown.
   --run-tests              Execute Pytest test suite (tests/) inside .venv and exit.
-  --run-agent              Run the autonomous Loyalty Offer Agent daemon locally (Firestore real-time listener).
-  --build-agent-image      Build and push Loyalty Agent Daemon Docker container to Artifact Registry.
-  --deploy-agent           Deploy or update the Loyalty Agent Daemon service on Cloud Run via Terraform.
-  --test-agent-daemon      Validate Cloud Run Daemon: health check + live Firestore session injection.
+  --run-agent              Run the autonomous A2A Multi-Agent platform (Firestore real-time listener).
+  --build-agent-image      Build and push Agent Runtime container image to Artifact Registry.
+  --test-agent-runtime     Validate Agent Runtime: A2A discovery probe + live Firestore session injection.
 
 Examples:
   ./deploy.sh                         # Deploy entire infrastructure, seed 250 orders, and train BQML
-  ./deploy.sh --run-tests             # Execute full automated test suite (13/13 tests)
-  ./deploy.sh --run-agent             # Start the autonomous ADK agent listener locally
-  ./deploy.sh --build-agent-image     # Build and push Loyalty Agent Daemon image to Artifact Registry
-  ./deploy.sh --deploy-agent          # Deploy Loyalty Agent Daemon to Cloud Run via Terraform
-  ./deploy.sh --test-agent-daemon     # Test live Cloud Run daemon with synthetic mobile session
+  ./deploy.sh --run-tests             # Execute full automated test suite (23/23 tests)
+  ./deploy.sh --run-agent             # Start the autonomous A2A Multi-Agent platform locally
+  ./deploy.sh --build-agent-image     # Build and push Agent Runtime container image to Artifact Registry
+  ./deploy.sh --test-agent-runtime    # Test live Agent Runtime with synthetic mobile session
   ./deploy.sh --create-project        # Bootstrap a new GCP project first, then deploy components
   ./deploy.sh --seed-count 1000       # Deploy and seed 1,000 transactions
   ./deploy.sh --dry-run               # Preview Terraform execution plan
@@ -106,12 +103,8 @@ while [[ $# -gt 0 ]]; do
       BUILD_AGENT_IMAGE=true
       shift
       ;;
-    --deploy-agent)
-      DEPLOY_AGENT=true
-      shift
-      ;;
-    --test-agent-daemon)
-      TEST_AGENT_DAEMON=true
+    --test-agent-runtime)
+      TEST_AGENT_RUNTIME=true
       shift
       ;;
     *)
@@ -282,14 +275,14 @@ if [[ "$RUN_TESTS" == true ]]; then
 fi
 
 if [[ "$RUN_AGENT" == true ]]; then
-  echo -e "\n⚡ Starting Autonomous Loyalty Offer Agent (Firestore Real-time Listener)..."
-  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" -m loyalty_agent.main --daemon
+  echo -e "\n⚡ Starting Autonomous Firestore-to-Agent-Runtime Event Bridge..."
+  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" "$REDWOOD_DIR/scripts/run_firestore_agent_bridge.py"
   exit 0
 fi
 
 if [[ "$BUILD_AGENT_IMAGE" == true ]]; then
-  echo -e "\n🔨 Building Autonomous Loyalty Offer Agent Container Image..."
-  IMAGE_TAG="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/pipeline-images/loyalty-agent-daemon:latest"
+  echo -e "\n🔨 Building Autonomous A2A Multi-Agent Platform Container Image..."
+  IMAGE_TAG="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/pipeline-images/loyalty-agent-runtime:latest"
   echo "Target Image: $IMAGE_TAG"
 
   # Ensure Artifact Registry repository exists
@@ -304,45 +297,25 @@ if [[ "$BUILD_AGENT_IMAGE" == true ]]; then
 
   echo "Submitting build to Cloud Build..."
   gcloud builds submit "$REDWOOD_DIR" --tag "$IMAGE_TAG" --project="$GCP_PROJECT_ID"
-  echo "✅ Loyalty Offer Agent container successfully built and published to Artifact Registry:"
+  echo "✅ Loyalty Offer Agent Runtime container successfully built and published to Artifact Registry:"
   echo "   $IMAGE_TAG"
   exit 0
 fi
 
-if [[ "$DEPLOY_AGENT" == true ]]; then
-  echo -e "\n🚀 Deploying Autonomous Loyalty Agent Daemon to Cloud Run via Terraform..."
-  terraform -chdir="$TERRAFORM_DIR" init
-  terraform -chdir="$TERRAFORM_DIR" apply -auto-approve \
-    -target=google_service_account.pipeline_sa \
-    -target=google_project_iam_member.sa_aiplatform_user \
-    -target=google_project_iam_member.sa_firestore_owner \
-    -target=google_project_iam_member.sa_run_developer \
-    -target=google_project_iam_member.sa_run_invoker \
-    -target=google_project_iam_member.sa_artifactregistry_reader \
-    -target=google_artifact_registry_repository.pipeline_repo \
-    -target=google_cloud_run_v2_service.loyalty_agent_daemon \
-    -target=google_cloud_run_v2_service_iam_member.loyalty_agent_invoker
-  DAEMON_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw loyalty_agent_daemon_uri 2>/dev/null || true)
-  echo "✅ Loyalty Agent Daemon deployed successfully!"
-  echo "Service URL: $DAEMON_URL"
-  exit 0
-fi
-
-if [[ "$TEST_AGENT_DAEMON" == true ]]; then
-  echo -e "\n🧪 Testing Loyalty Agent Daemon End-to-End..."
-  DAEMON_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw loyalty_agent_daemon_uri 2>/dev/null || true)
+if [[ "$TEST_AGENT_RUNTIME" == true ]]; then
+  echo -e "\n🧪 Testing A2A Multi-Agent Platform on Agent Runtime End-to-End..."
   EXTRA_ARGS=()
-  if [[ -n "$DAEMON_URL" && "$DAEMON_URL" != "null" ]]; then
-    EXTRA_ARGS+=("--healthcheck-url" "$DAEMON_URL")
+  if [[ -n "${AGENT_RUNTIME_URL:-}" ]]; then
+    EXTRA_ARGS+=("--runtime-url" "$AGENT_RUNTIME_URL")
   fi
-  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" "$REDWOOD_DIR/scripts/test_agent_daemon.py" \
+  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" "$REDWOOD_DIR/scripts/test_agent_runtime.py" \
     --project "$GCP_PROJECT_ID" \
     --database "$FIRESTORE_DATABASE_ID" \
     "${EXTRA_ARGS[@]}" || {
-    echo "❌ Error: Loyalty Agent Daemon verification failed!" >&2
+    echo "❌ Error: A2A Multi-Agent Platform verification failed!" >&2
     exit 1
   }
-  echo "🎉 Loyalty Agent Daemon test passed successfully!"
+  echo "🎉 A2A Multi-Agent Platform test passed successfully!"
   exit 0
 fi
 

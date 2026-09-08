@@ -76,17 +76,6 @@ variable "bigquery_predictions_table_id" {
   default     = "customer_churn_risk"
 }
 
-variable "enable_loyalty_agent_daemon" {
-  description = "Whether to deploy the Autonomous Loyalty Agent Daemon on Cloud Run."
-  type        = bool
-  default     = true
-}
-
-variable "loyalty_agent_image" {
-  description = "Container image URL for the Loyalty Agent Daemon."
-  type        = string
-  default     = ""
-}
 
 variable "reasoning_model" {
   description = "The Gemini model for the autonomous agent reasoning engine."
@@ -98,4 +87,59 @@ variable "enable_artifact_registry" {
   description = "Whether to deploy the Artifact Registry repository."
   type        = bool
   default     = true
+}
+
+variable "enable_security_rules" {
+  description = "Whether to deploy Firestore security rules via Terraform."
+  type        = bool
+  default     = false
+}
+
+variable "enable_agent_engine" {
+  description = "Whether to deploy the Vertex AI Agent Engine (Reasoning Engine) via BYOC container (deprecated in favor of native Agent Runtime packaging)."
+  type        = bool
+  default     = false
+}
+
+
+variable "agent_engine_display_name" {
+  description = "Display name for the Vertex AI Agent Engine."
+  type        = string
+  default     = "redwood-retention-orchestrator"
+}
+
+variable "agent_engine_description" {
+  description = "Description for the Vertex AI Agent Engine."
+  type        = string
+  default     = "Redwood Retail Multi-Agent Retention Platform powered by Vertex AI Agent Runtime and A2A protocol"
+}
+
+variable "agent_image_tag" {
+  description = "Container image tag for the Agent Runtime container image."
+  type        = string
+  default     = "latest"
+}
+
+variable "agent_min_instances" {
+  description = "Minimum number of Agent Runtime instances."
+  type        = number
+  default     = 1
+}
+
+variable "agent_max_instances" {
+  description = "Maximum number of Agent Runtime instances."
+  type        = number
+  default     = 5
+}
+
+variable "agent_cpu" {
+  description = "CPU allocation for the Agent Runtime container."
+  type        = string
+  default     = "2"
+}
+
+variable "agent_memory" {
+  description = "Memory allocation for the Agent Runtime container."
+  type        = string
+  default     = "4Gi"
 }

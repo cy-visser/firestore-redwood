@@ -19,6 +19,7 @@ Redwood Retail is architected as a **two-phase, layered infrastructure model** t
 | **Phase 2** | **Source OLTP** | [`terraform/firestore.tf`](../terraform/firestore.tf) | Provisions Firestore Enterprise in Native Mode (`database: redwood`, `collection: retail`) with Point-in-Time Recovery (PITR). |
 | **Phase 2** | **Streaming CDC** | [`terraform/dataflow.tf`](../terraform/dataflow.tf) | Deploys Apache Beam streaming job on Google Cloud Dataflow with private worker VMs. |
 | **Phase 2** | **Analytics & BQML** | [`terraform/bigquery.tf`](../terraform/bigquery.tf) | Manages `redwood_retail` dataset, day-partitioned/clustered `orders_cdc` table, and BQML logistic regression customer churn model. |
+| **Phase 2** | **Agent Runtime Mesh** | [`docs/firestore_agent_runtime_rpc_integration.md`](firestore_agent_runtime_rpc_integration.md) | Deploys 6 discrete reasoning engines on Vertex AI Agent Runtime bridged to Firestore via persistent gRPC `Listen` streams. |
 
 ---
 
