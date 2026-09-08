@@ -26,7 +26,82 @@ from loyalty_agent.agents import (
     evaluate_churn_tier,
     evaluate_5pillar_heuristic
 )
-from loyalty_agent.main import start_multi_agent_server
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+import threading
+from typing import Dict, Any, Optional
+
+
+class MockTestMultiAgentHandler(BaseHTTPRequestHandler):
+    orchestrator = None
+    domain_agents: Dict[str, Any] = {}
+
+    def _send_json(self, status_code: int, data: Any):
+        body = json.dumps(data, indent=2, default=str).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        url_path = self.path.split("?")[0]
+        if url_path in ("/healthz", "/health"):
+            self._send_json(200, {
+                "status": "HEALTHY",
+                "agents": {
+                    prefix: {"name": ag.get_agent_card().name}
+                    for prefix, ag in self.domain_agents.items()
+                }
+            })
+            return
+        if url_path in ("/.well-known/agent-card.json", "/.well-known/agent.json"):
+            if self.orchestrator:
+                self._send_json(200, self.orchestrator.get_agent_card().model_dump())
+            return
+        for prefix, ag in self.domain_agents.items():
+            if url_path in (f"/{prefix}/.well-known/agent-card.json", f"/{prefix}/.well-known/agent.json"):
+                self._send_json(200, ag.get_agent_card().model_dump())
+                return
+        self._send_json(404, {"error": "Not found"})
+
+    def do_POST(self):
+        url_path = self.path.split("?")[0]
+        content_length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+        body_json = json.loads(raw_body)
+
+        if url_path == "/trigger_session":
+            session_id = body_json.get("sessionId")
+            offer = self.orchestrator.process_session(session_id)
+            self._send_json(200, {"sessionId": session_id, "action": "OFFER_ISSUED" if offer else "NO_OFFER_ISSUED", "offer": offer})
+            return
+
+        target_agent = None
+        if url_path in ("/a2a/v1/tasks", "/orchestrator/a2a/v1/tasks"):
+            target_agent = self.orchestrator
+        else:
+            for prefix, ag in self.domain_agents.items():
+                if url_path == f"/{prefix}/a2a/v1/tasks":
+                    target_agent = ag
+                    break
+        if target_agent:
+            task_req = TaskRequest.model_validate(body_json)
+            task_res = asyncio.run(target_agent.handle_task(task_req))
+            self._send_json(200, task_res.model_dump())
+            return
+        self._send_json(404, {"error": "Not found"})
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_multi_agent_server(orchestrator, domain_agents, port=8080):
+    MockTestMultiAgentHandler.orchestrator = orchestrator
+    MockTestMultiAgentHandler.domain_agents = domain_agents
+    server = ThreadingHTTPServer(("0.0.0.0", port), MockTestMultiAgentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
 
 
 # ------------------------------------------------------------------------------

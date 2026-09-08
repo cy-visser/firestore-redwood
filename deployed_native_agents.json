@@ -1,0 +1,50 @@
+{
+  "project_id": "redwood-retail-949ec9",
+  "region": "europe-west4",
+  "staging_bucket": "gs://redwood-retail-949ec9-redwood-retail-europe-west4",
+  "deployed_at": "2026-09-08T03:05:10Z",
+  "agents": {
+    "friction": {
+      "role": "friction",
+      "display_name": "redwood-friction-agent-native",
+      "resource_name": "projects/1097559589092/locations/europe-west4/reasoningEngines/4305344486742949888",
+      "engine_id": "4305344486742949888",
+      "elapsed_seconds": 139.5
+    },
+    "cooldown": {
+      "role": "cooldown",
+      "display_name": "redwood-cooldown-agent-native",
+      "resource_name": "projects/1097559589092/locations/europe-west4/reasoningEngines/3845977324751159296",
+      "engine_id": "3845977324751159296",
+      "elapsed_seconds": 143.3
+    },
+    "churn": {
+      "role": "churn",
+      "display_name": "redwood-churn-agent-native",
+      "resource_name": "projects/1097559589092/locations/europe-west4/reasoningEngines/5390923103171772416",
+      "engine_id": "5390923103171772416",
+      "elapsed_seconds": 143.8
+    },
+    "synthesis": {
+      "role": "synthesis",
+      "display_name": "redwood-synthesis-agent-native",
+      "resource_name": "projects/1097559589092/locations/europe-west4/reasoningEngines/3838307131635793920",
+      "engine_id": "3838307131635793920",
+      "elapsed_seconds": 147.9
+    },
+    "fulfillment": {
+      "role": "fulfillment",
+      "display_name": "redwood-fulfillment-agent-native",
+      "resource_name": "projects/1097559589092/locations/europe-west4/reasoningEngines/3285490277376065536",
+      "engine_id": "3285490277376065536",
+      "elapsed_seconds": 148.1
+    },
+    "orchestrator": {
+      "role": "orchestrator",
+      "display_name": "redwood-retention-orchestrator-native",
+      "resource_name": "projects/1097559589092/locations/europe-west4/reasoningEngines/8917030505170337792",
+      "engine_id": "8917030505170337792",
+      "elapsed_seconds": 125.6
+    }
+  }
+}
