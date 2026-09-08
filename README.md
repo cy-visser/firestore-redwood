@@ -74,7 +74,9 @@ You can deploy the entire end-to-end architecture (APIs, Firestore Enterprise Na
 * `./deploy.sh --teardown` (or `./teardown.sh`): Cleanly destroys all infrastructure and drains Dataflow jobs.
 
 > [!TIP]
-> **Mobile Frontend & Agent Runtime Guide**: For step-by-step instructions on deploying the Autonomous A2A Loyalty Agent on Agent Runtime for Cyrus's mobile app, see the **[Mobile Frontend & Agent Runtime Deployment Guide](docs/mobile_deployment_guide.md)**.
+> **Mobile Frontend & Agent Runtime Guides**:
+> * For step-by-step instructions on deploying the Autonomous A2A Loyalty Agent on Agent Runtime for Cyrus's mobile app, see the **[Mobile Frontend & Agent Runtime Deployment Guide](docs/mobile_deployment_guide.md)**.
+> * For the Level 400 deep dive on the real-time event-driven gRPC streaming bridge, payload schemas, and division of write responsibilities, see the **[Firestore to Agent Runtime Real-Time RPC Integration Guide](docs/firestore_agent_runtime_rpc_integration.md)**.
 
 #### Automated Provisioning Lifecycle:
 1. **(Optional) Project Bootstrap**: Provisions a new Google Cloud project via `terraform/bootstrap`, attaches billing, enables base APIs, and populates `.env`.
