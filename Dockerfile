@@ -11,11 +11,13 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy A2A Multi-Agent platform application files
+# Copy A2A Multi-Agent platform and bridge files
 COPY loyalty_agent/ ./loyalty_agent/
+COPY scripts/run_firestore_agent_bridge.py ./scripts/run_firestore_agent_bridge.py
+COPY deployed_native_agents.json ./deployed_native_agents.json
 
-# Expose container health check and A2A discovery port
+# Expose container health check port
 EXPOSE 8080
 
-# Run Redwood Retail A2A Multi-Agent platform on Agent Runtime
-ENTRYPOINT ["python", "-m", "loyalty_agent.main", "--serve"]
+# Run Redwood Retail Firestore-to-Agent-Runtime Event Bridge
+ENTRYPOINT ["python", "scripts/run_firestore_agent_bridge.py"]

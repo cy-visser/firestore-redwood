@@ -123,3 +123,14 @@ output "agent_engine_card" {
   description = "The A2A Agent Card registered with the Retention Orchestrator Agent Engine."
   value       = var.enable_agent_engine ? local.agent_card : "DISABLED"
 }
+
+output "event_bridge_name" {
+  description = "The Cloud Run service name of the Event Bridge."
+  value       = var.enable_event_bridge ? google_cloud_run_v2_service.event_bridge[0].name : "DISABLED"
+}
+
+output "event_bridge_url" {
+  description = "The service URL of the Event Bridge."
+  value       = var.enable_event_bridge ? google_cloud_run_v2_service.event_bridge[0].uri : "DISABLED"
+}
+

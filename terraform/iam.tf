@@ -80,14 +80,12 @@ resource "google_project_iam_member" "sa_artifactregistry_reader" {
 
 # Grant Artifact Registry Reader to Agent Runtime Service Agents
 resource "google_project_iam_member" "re_service_agent_ar_reader" {
-  count   = var.enable_agent_engine ? 1 : 0
   project = var.project_id
   role    = "roles/artifactregistry.reader"
   member  = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-aiplatform.iam.gserviceaccount.com"
 }
 
 resource "google_project_iam_member" "re_dedicated_service_agent_ar_reader" {
-  count   = var.enable_agent_engine ? 1 : 0
   project = var.project_id
   role    = "roles/artifactregistry.reader"
   member  = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-aiplatform-re.iam.gserviceaccount.com"
@@ -95,17 +93,16 @@ resource "google_project_iam_member" "re_dedicated_service_agent_ar_reader" {
 
 # Allow Agent Runtime Service Agents to act as the pipeline service account
 resource "google_service_account_iam_member" "agent_engine_sa_user" {
-  count              = var.enable_agent_engine ? 1 : 0
   service_account_id = google_service_account.pipeline_sa.name
   role               = "roles/iam.serviceAccountUser"
   member             = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-aiplatform.iam.gserviceaccount.com"
 }
 
 resource "google_service_account_iam_member" "re_dedicated_agent_engine_sa_user" {
-  count              = var.enable_agent_engine ? 1 : 0
   service_account_id = google_service_account.pipeline_sa.name
   role               = "roles/iam.serviceAccountUser"
   member             = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-aiplatform-re.iam.gserviceaccount.com"
 }
+
 
 

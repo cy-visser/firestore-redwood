@@ -5,6 +5,8 @@ Firestore-to-Agent-Runtime Event Bridge Daemon.
 Maintains a persistent HTTP/2 gRPC Listen stream on Firestore '/customer_sessions'
 and dispatches incoming PENDING login events via QueryReasoningEngine RPC to the
 Retention Orchestrator Reasoning Engine on Google Cloud Agent Runtime.
+Also runs an embedded lightweight HTTP healthcheck listener on $PORT (default: 8080)
+for Cloud Run startup and liveness probes.
 """
 
 import os
@@ -13,6 +15,8 @@ import json
 import time
 import signal
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,6 +36,29 @@ logger = logging.getLogger("firestore_agent_bridge")
 REGISTRY_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "deployed_native_agents.json")
 
 
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Responds to Cloud Run startup and liveness probes."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"status":"healthy","service":"firestore_agent_bridge"}\n')
+
+    def log_message(self, format, *args):
+        # Silence routine probe access logs
+        pass
+
+
+def start_health_server(port: int = 8080) -> HTTPServer:
+    """Spawns an embedded HTTP health server on a background daemon thread."""
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("🩺 Health probe listener active on 0.0.0.0:%d (/healthz, /)", port)
+    return server
+
+
 class FirestoreAgentRuntimeBridge:
     """
     Real-time bridge connecting Firestore change events to Agent Runtime Reasoning Engines.
@@ -44,21 +71,25 @@ class FirestoreAgentRuntimeBridge:
         database_id: Optional[str] = None,
         orchestrator_resource_name: Optional[str] = None
     ):
-        self.project_id = project_id or config.project_id
-        self.region = region or config.region
-        self.database_id = database_id or config.firestore_database
+        self.project_id = project_id or os.getenv("GCP_PROJECT_ID", os.getenv("GCP_PROJECT", config.project_id))
+        self.region = region or os.getenv("GCP_REGION", config.region)
+        self.database_id = database_id or os.getenv("FIRESTORE_DATABASE_ID", os.getenv("FIRESTORE_DATABASE", config.firestore_database))
 
-        if not orchestrator_resource_name and os.path.exists(REGISTRY_FILE):
-            with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
-                reg = json.load(f)
-                orchestrator_resource_name = reg.get("agents", {}).get("orchestrator", {}).get("resource_name")
+        orchestrator = orchestrator_resource_name or os.getenv("ORCHESTRATOR_RESOURCE_NAME")
+        if not orchestrator and os.path.exists(REGISTRY_FILE):
+            try:
+                with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
+                    reg = json.load(f)
+                    orchestrator = reg.get("agents", {}).get("orchestrator", {}).get("resource_name")
+            except Exception as e:
+                logger.warning("Could not read registry file %s: %s", REGISTRY_FILE, e)
 
-        if not orchestrator_resource_name:
+        if not orchestrator:
             raise ValueError(
-                "Orchestrator resource name not found. Provide --orchestrator or deploy native agents first."
+                "Orchestrator resource name not found. Provide --orchestrator or set ORCHESTRATOR_RESOURCE_NAME."
             )
 
-        self.orchestrator_resource_name = orchestrator_resource_name
+        self.orchestrator_resource_name = orchestrator
         self.fs = firestore.Client(project=self.project_id, database=self.database_id)
 
         logger.info("Connecting to Vertex AI Agent Runtime in %s...", self.region)
@@ -98,15 +129,19 @@ class FirestoreAgentRuntimeBridge:
             logger.error("❌ [RPC FAILED] Error invoking Agent Runtime for session %s: %s", session_id, e, exc_info=True)
             sess_ref.update({"agentProcessingStatus": "ERROR", "errorMessage": str(e)})
 
-    def run(self):
-        """Starts the persistent gRPC watch stream and blocks until interrupted."""
+    def run(self, port: int = 8080):
+        """Starts the health check server and persistent gRPC watch stream."""
         logger.info("=" * 65)
         logger.info("🌲 Starting Redwood Retail Firestore -> Agent Runtime Bridge")
         logger.info("• Project:      %s", self.project_id)
         logger.info("• Region:       %s", self.region)
         logger.info("• Database:     %s", self.database_id)
         logger.info("• Orchestrator: %s", self.orchestrator_resource_name)
+        logger.info("• Probe Port:   %d", port)
         logger.info("=" * 65)
+
+        # Start background health server for Cloud Run
+        start_health_server(port=port)
 
         self.listener = SessionEventListener(
             firestore_client=self.fs,
@@ -137,10 +172,11 @@ class FirestoreAgentRuntimeBridge:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Firestore to Agent Runtime Event Bridge Daemon")
-    parser.add_argument("--project", default=config.project_id, help="Google Cloud Project ID")
-    parser.add_argument("--region", default=config.region, help="Google Cloud Region")
-    parser.add_argument("--database", default=config.firestore_database, help="Firestore Database ID")
+    parser.add_argument("--project", default=None, help="Google Cloud Project ID")
+    parser.add_argument("--region", default=None, help="Google Cloud Region")
+    parser.add_argument("--database", default=None, help="Firestore Database ID")
     parser.add_argument("--orchestrator", default=None, help="Retention Orchestrator Reasoning Engine resource name")
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8080")), help="HTTP probe port")
     args = parser.parse_args()
 
     bridge = FirestoreAgentRuntimeBridge(
@@ -149,7 +185,7 @@ def main():
         database_id=args.database,
         orchestrator_resource_name=args.orchestrator
     )
-    bridge.run()
+    bridge.run(port=args.port)
 
 
 if __name__ == "__main__":

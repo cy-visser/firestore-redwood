@@ -96,10 +96,11 @@ variable "enable_security_rules" {
 }
 
 variable "enable_agent_engine" {
-  description = "Whether to deploy the Vertex AI Agent Engine (Reasoning Engine)."
+  description = "Whether to deploy the Vertex AI Agent Engine (Reasoning Engine) via BYOC container (deprecated in favor of native Agent Runtime packaging)."
   type        = bool
-  default     = true
+  default     = false
 }
+
 
 variable "agent_engine_display_name" {
   description = "Display name for the Vertex AI Agent Engine."
