@@ -275,8 +275,8 @@ if [[ "$RUN_TESTS" == true ]]; then
 fi
 
 if [[ "$RUN_AGENT" == true ]]; then
-  echo -e "\n⚡ Starting Autonomous A2A Multi-Agent Platform on Agent Runtime..."
-  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" -m loyalty_agent.main --serve
+  echo -e "\n⚡ Starting Autonomous Firestore-to-Agent-Runtime Event Bridge..."
+  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" "$REDWOOD_DIR/scripts/run_firestore_agent_bridge.py"
   exit 0
 fi
 
