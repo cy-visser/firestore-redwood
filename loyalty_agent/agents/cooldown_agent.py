@@ -61,10 +61,9 @@ class CooldownPolicyAgent(BaseA2AAgent):
         super().__init__(agent_card=card)
         self.register_skill_handler("check_cooldown_eligibility", self._handle_check_eligibility)
 
-    async def _handle_check_eligibility(self, parameters: Dict[str, Any], session_id: str) -> Dict[str, Any]:
-        customer_id = parameters["customerId"]
-        cooldown_days = parameters.get("cooldownDays", self.default_cooldown_days)
-
+    def check_eligibility(self, customer_id: str, cooldown_days: Optional[int] = None) -> Dict[str, Any]:
+        """Evaluates 7-day cooldown compliance and active offer presence in Firestore."""
+        cd_days = cooldown_days if cooldown_days is not None else self.default_cooldown_days
         now = datetime.now(timezone.utc)
         offers_ref = self.fs.collection("loyalty_offers")
         query = offers_ref.where("customerId", "==", customer_id)
@@ -109,3 +108,9 @@ class CooldownPolicyAgent(BaseA2AAgent):
             "cooldownUntil": None,
             "reason": "ELIGIBLE_FOR_EVALUATION"
         }
+
+    async def _handle_check_eligibility(self, parameters: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+        customer_id = parameters["customerId"]
+        cooldown_days = parameters.get("cooldownDays", self.default_cooldown_days)
+        return self.check_eligibility(customer_id, cooldown_days=cooldown_days)
+

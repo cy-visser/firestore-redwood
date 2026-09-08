@@ -140,7 +140,14 @@ class ChurnIntelligenceAgent(BaseA2AAgent):
         super().__init__(agent_card=card)
         self.register_skill_handler("evaluate_churn_propensity", self._handle_evaluate_churn)
 
-    async def _handle_evaluate_churn(self, parameters: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+    def evaluate_churn(self, customer_id: str, historical_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Evaluates customer churn propensity via Firestore cache, BQML, or heuristic fallback."""
+        params = {"customerId": customer_id}
+        if historical_data:
+            params["customerData"] = historical_data
+        return self._evaluate_churn_sync(params)
+
+    def _evaluate_churn_sync(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
         customer_id = parameters["customerId"]
         customer_data = parameters.get("customerData", {})
 
@@ -207,3 +214,6 @@ class ChurnIntelligenceAgent(BaseA2AAgent):
             "churnTier": evaluate_churn_tier(heuristic_prob),
             "evaluationSource": "HEURISTIC_FALLBACK"
         }
+
+    async def _handle_evaluate_churn(self, parameters: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+        return self._evaluate_churn_sync(parameters)

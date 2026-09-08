@@ -68,19 +68,50 @@ output "artifact_registry_repo" {
   value       = var.enable_artifact_registry ? google_artifact_registry_repository.pipeline_repo[0].name : "DISABLED"
 }
 
+# Discrete A2A Reasoning Engines
+output "cooldown_agent_name" {
+  description = "The full resource name of the Standalone Cooldown Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.cooldown_agent[0].name : "DISABLED"
+}
+
+output "churn_agent_name" {
+  description = "The full resource name of the Standalone Churn Intelligence Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.churn_agent[0].name : "DISABLED"
+}
+
+output "friction_agent_name" {
+  description = "The full resource name of the Standalone Customer Friction Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.friction_agent[0].name : "DISABLED"
+}
+
+output "synthesis_agent_name" {
+  description = "The full resource name of the Standalone Offer Synthesis Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.synthesis_agent[0].name : "DISABLED"
+}
+
+output "fulfillment_agent_name" {
+  description = "The full resource name of the Standalone Offer Fulfillment Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.fulfillment_agent[0].name : "DISABLED"
+}
+
+output "orchestrator_agent_name" {
+  description = "The full resource name of the Standalone Retention Orchestrator Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_orchestrator[0].name : "DISABLED"
+}
+
 output "agent_engine_id" {
-  description = "The resource ID of the deployed Vertex AI Agent Engine (Reasoning Engine)."
-  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_agent_engine[0].id : "DISABLED"
+  description = "The resource ID of the deployed Retention Orchestrator Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_orchestrator[0].id : "DISABLED"
 }
 
 output "agent_engine_name" {
-  description = "The full resource name of the deployed Vertex AI Agent Engine."
-  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_agent_engine[0].name : "DISABLED"
+  description = "The full resource name of the deployed Retention Orchestrator Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_orchestrator[0].name : "DISABLED"
 }
 
 output "agent_engine_display_name" {
-  description = "Display name of the Vertex AI Agent Engine."
-  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_agent_engine[0].display_name : "DISABLED"
+  description = "Display name of the Retention Orchestrator Agent Engine."
+  value       = var.enable_agent_engine ? google_vertex_ai_reasoning_engine.retention_orchestrator[0].display_name : "DISABLED"
 }
 
 output "agent_engine_image" {
@@ -89,6 +120,6 @@ output "agent_engine_image" {
 }
 
 output "agent_engine_card" {
-  description = "The A2A Agent Card registered with the Agent Engine."
+  description = "The A2A Agent Card registered with the Retention Orchestrator Agent Engine."
   value       = var.enable_agent_engine ? local.agent_card : "DISABLED"
 }

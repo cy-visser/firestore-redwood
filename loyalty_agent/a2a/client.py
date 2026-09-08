@@ -87,7 +87,45 @@ class A2AClient:
         if not skill:
             raise A2AExecutionError(f"Agent at {clean_url} does not declare skill '{skill_id}' in its AgentCard.")
 
-        # 3. Dispatch remote HTTP request
+        # 3. Check for Vertex AI Reasoning Engine execution
+        is_re = (
+            clean_url.startswith("projects/") or
+            clean_url.startswith("vertexai://") or
+            clean_url.isdigit() or
+            (not clean_url.startswith("http://") and not clean_url.startswith("https://"))
+        )
+        if is_re:
+            from loyalty_agent.config import config
+            resource_name = clean_url.replace("vertexai://", "")
+            if not resource_name.startswith("projects/"):
+                resource_name = f"projects/{config.project_id}/locations/{config.region}/reasoningEngines/{resource_name}"
+            start_t = time.perf_counter()
+            import asyncio
+            import vertexai
+            from vertexai.preview import reasoning_engines
+            vertexai.init(project=config.project_id, location=config.region)
+            loop = asyncio.get_running_loop()
+
+            def _call_engine():
+                vertexai.init(project=config.project_id, location=config.region)
+                engine = reasoning_engines.ReasoningEngine(resource_name)
+                return engine.handle_task(task_request_data=request.model_dump())
+
+            try:
+                raw_resp = await loop.run_in_executor(None, _call_engine)
+                latency = (time.perf_counter() - start_t) * 1000
+                response = TaskResponse.model_validate(raw_resp)
+                response.execution_metadata["latency_ms"] = round(latency, 2)
+                response.execution_metadata["transport"] = "vertex_ai_reasoning_engine"
+                if response.status == TaskState.FAILED:
+                    raise A2AExecutionError(f"A2A Task failed on {resource_name}: {response.error_message}")
+                return response
+            except Exception as exc:
+                if isinstance(exc, A2AExecutionError):
+                    raise
+                raise A2AExecutionError(f"Error invoking Reasoning Engine at {resource_name}: {exc}") from exc
+
+        # 4. Dispatch remote HTTP request
         task_endpoint = f"{clean_url}/a2a/v1/tasks"
         start_t = time.perf_counter()
 

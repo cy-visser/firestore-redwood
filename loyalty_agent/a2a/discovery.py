@@ -65,6 +65,39 @@ class A2ADiscoveryClient:
             self._cache[clean_url] = card
             return card
 
+        # Check for Vertex AI Reasoning Engine resource path
+        is_re = (
+            clean_url.startswith("projects/") or
+            clean_url.startswith("vertexai://") or
+            clean_url.isdigit() or
+            (not clean_url.startswith("http://") and not clean_url.startswith("https://"))
+        )
+        if is_re:
+            from loyalty_agent.config import config
+            resource_name = clean_url.replace("vertexai://", "")
+            if not resource_name.startswith("projects/"):
+                resource_name = f"projects/{config.project_id}/locations/{config.region}/reasoningEngines/{resource_name}"
+            try:
+                import asyncio
+                import vertexai
+                from vertexai.preview import reasoning_engines
+                vertexai.init(project=config.project_id, location=config.region)
+                loop = asyncio.get_running_loop()
+                def _fetch_card():
+                    vertexai.init(project=config.project_id, location=config.region)
+                    engine = reasoning_engines.ReasoningEngine(resource_name)
+                    return engine.get_agent_card()
+                card_data = await loop.run_in_executor(None, _fetch_card)
+                card = AgentCard.model_validate(card_data)
+                self._cache[clean_url] = card
+                self._cache[resource_name] = card
+                for skill in card.skills:
+                    self._skill_index[skill.id] = resource_name
+                logger.info("Successfully discovered A2A Agent '%s' (%s) via Reasoning Engine %s", card.name, card.version, resource_name)
+                return card
+            except Exception as exc:
+                raise AgentDiscoveryError(f"Failed to discover AgentCard from Vertex AI Reasoning Engine {resource_name}: {exc}") from exc
+
         # Perform remote HTTP discovery across standard well-known paths
         last_error = None
         async with httpx.AsyncClient(timeout=self.timeout) as client:

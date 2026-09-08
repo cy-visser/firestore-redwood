@@ -11,11 +11,19 @@ from typing import Dict
 @dataclass(frozen=True)
 class AgentConfig:
     # Google Cloud Environment
-    project_id: str = os.getenv("GCP_PROJECT_ID", "redwood-retail-949ec9")
-    region: str = os.getenv("GCP_REGION", "europe-west4")
-    firestore_database: str = os.getenv("FIRESTORE_DATABASE_ID", "redwood")
-    bigquery_dataset: str = os.getenv("BIGQUERY_DATASET_ID", "redwood_retail")
-    churn_predictions_table: str = "customer_churn_risk"
+    project_id: str = field(default_factory=lambda: os.getenv("GCP_PROJECT") or os.getenv("GCP_PROJECT_ID", "redwood-retail-949ec9"))
+    region: str = field(default_factory=lambda: os.getenv("GCP_REGION") or os.getenv("LOCATION", "europe-west4"))
+    firestore_database: str = field(default_factory=lambda: os.getenv("FIRESTORE_DATABASE") or os.getenv("FIRESTORE_DATABASE_ID", "redwood"))
+    bigquery_dataset: str = field(default_factory=lambda: os.getenv("BIGQUERY_DATASET") or os.getenv("BIGQUERY_DATASET_ID", "redwood_retail"))
+    churn_predictions_table: str = field(default_factory=lambda: os.getenv("BIGQUERY_PREDICTIONS_TABLE") or os.getenv("BIGQUERY_TABLE_ID", "customer_churn_risk"))
+
+    @property
+    def gcp_project(self) -> str:
+        return self.project_id
+
+    @property
+    def gcp_region(self) -> str:
+        return self.region
 
     # AI Reasoning Engine Standard
     reasoning_model: str = "gemini-3.8-flash"

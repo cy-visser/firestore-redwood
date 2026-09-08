@@ -89,6 +89,12 @@ variable "enable_artifact_registry" {
   default     = true
 }
 
+variable "enable_security_rules" {
+  description = "Whether to deploy Firestore security rules via Terraform."
+  type        = bool
+  default     = false
+}
+
 variable "enable_agent_engine" {
   description = "Whether to deploy the Vertex AI Agent Engine (Reasoning Engine)."
   type        = bool

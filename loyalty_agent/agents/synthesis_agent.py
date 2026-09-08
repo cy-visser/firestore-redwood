@@ -102,10 +102,29 @@ class OfferSynthesisAgent(BaseA2AAgent):
             "generationSource": "DETERMINISTIC_RULES"
         }
 
-    async def _handle_synthesize_offer(self, parameters: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+    def synthesize_offer(
+        self,
+        customer_id: str,
+        churn_tier: str = "HIGH",
+        primary_friction: Optional[str] = None,
+        historical_data: Optional[Dict[str, Any]] = None,
+        churn_probability: float = 0.85,
+        discount_cap_percent: int = 25
+    ) -> Dict[str, Any]:
+        """Synthesizes retention offer copy with Gemini generative AI or deterministic fallback."""
+        params = {
+            "customerId": customer_id,
+            "churnProbability": churn_probability,
+            "churnTier": churn_tier,
+            "primaryComplaint": primary_friction,
+            "discountCapPercent": discount_cap_percent
+        }
+        return self._synthesize_offer_sync(params)
+
+    def _synthesize_offer_sync(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
         customer_id = parameters["customerId"]
-        churn_prob = parameters["churnProbability"]
-        churn_tier = parameters["churnTier"]
+        churn_prob = parameters.get("churnProbability", 0.85)
+        churn_tier = parameters.get("churnTier", "HIGH")
         complaint = parameters.get("primaryComplaint")
         discount_cap = parameters.get("discountCapPercent", 15)
         eval_source = parameters.get("evaluationSource", "A2A_ORCHESTRATED")
@@ -137,3 +156,6 @@ class OfferSynthesisAgent(BaseA2AAgent):
         offer_payload["discountPercentage"] = clamped_discount
 
         return offer_payload
+
+    async def _handle_synthesize_offer(self, parameters: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+        return self._synthesize_offer_sync(parameters)

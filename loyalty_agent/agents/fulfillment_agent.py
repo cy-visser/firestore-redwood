@@ -73,7 +73,21 @@ class OfferFulfillmentAgent(BaseA2AAgent):
         super().__init__(agent_card=card)
         self.register_skill_handler("fulfill_loyalty_voucher", self._handle_fulfill_voucher)
 
-    async def _handle_fulfill_voucher(self, parameters: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+    def fulfill_voucher(
+        self,
+        customer_id: str,
+        offer_dict: Dict[str, Any],
+        session_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Atomically persists validated loyalty voucher to Firestore."""
+        params = {
+            "customerId": customer_id,
+            "sessionId": session_id or f"sess_{customer_id}",
+            "offerPayload": offer_dict
+        }
+        return self._fulfill_voucher_sync(params, session_id or f"sess_{customer_id}")
+
+    def _fulfill_voucher_sync(self, parameters: Dict[str, Any], session_id: str) -> Dict[str, Any]:
         customer_id = parameters["customerId"]
         active_session_id = parameters.get("sessionId") or session_id
         offer_payload = parameters["offerPayload"]
@@ -86,7 +100,7 @@ class OfferFulfillmentAgent(BaseA2AAgent):
         cooldown_until = now + timedelta(days=cooldown_days)
         ttl_expiry = now + timedelta(days=ttl_days)
 
-        offer_id = f"off_{active_session_id}_retention"
+        offer_id = offer_payload.get("offerId") or f"off_{active_session_id}_retention"
 
         # Normalize fields across naming variations
         title = offer_payload.get("title") or offer_payload.get("headline", "Special Customer Loyalty Incentive")
@@ -147,16 +161,19 @@ class OfferFulfillmentAgent(BaseA2AAgent):
         if self.fs:
             self.fs.collection("loyalty_offers").document(offer_id).set(validated_payload)
 
-            # Update session document
-            sess_ref = self.fs.collection("customer_sessions").document(active_session_id)
-            sess_ref.update({
-                "agentProcessingStatus": "PROCESSED",
-                "status": "PROCESSED",
-                "offerId": offer_id,
-                "activeOfferId": offer_id,
-                "processedAt": now.isoformat(),
-                "skipReason": None
-            })
+            # Update session document if present
+            try:
+                sess_ref = self.fs.collection("customer_sessions").document(active_session_id)
+                sess_ref.set({
+                    "agentProcessingStatus": "PROCESSED",
+                    "status": "PROCESSED",
+                    "offerId": offer_id,
+                    "activeOfferId": offer_id,
+                    "processedAt": now.isoformat(),
+                    "skipReason": None
+                }, merge=True)
+            except Exception as exc:
+                logger.warning("Could not update session %s in Firestore: %s", active_session_id, exc)
 
         return {
             "offerId": offer_id,
@@ -164,3 +181,6 @@ class OfferFulfillmentAgent(BaseA2AAgent):
             "status": "COMPLETED",
             "persistedAt": now.isoformat()
         }
+
+    async def _handle_fulfill_voucher(self, parameters: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+        return self._fulfill_voucher_sync(parameters, session_id)

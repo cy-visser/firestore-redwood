@@ -144,6 +144,14 @@ resource "google_bigquery_table" "customer_churn_risk" {
 
   description = "Materialized daily batch churn risk scores computed by BigQuery ML to eliminate OLTP login latency (SDD Section 1.2)"
 
+  lifecycle {
+    ignore_changes = [
+      clustering,
+      time_partitioning,
+      schema
+    ]
+  }
+
   clustering = ["customer_id", "churn_risk_tier"]
 
   time_partitioning {

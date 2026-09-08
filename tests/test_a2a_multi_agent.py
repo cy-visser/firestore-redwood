@@ -487,3 +487,74 @@ async def test_retention_agent_engine_native(mock_firestore, mock_bigquery, mock
         "parameters": {"sessionId": "sess_eng_01"}
     })
     assert task_res["status"] == "COMPLETED"
+
+
+@pytest.mark.anyio
+async def test_standalone_agent_roles_discrete(mock_firestore, mock_bigquery, mock_gemini):
+    """Verifies that each agent role can run independently as a standalone engine."""
+    from loyalty_agent.main import StandaloneAgentEngine
+
+    # 1. Cooldown Agent
+    cd_engine = StandaloneAgentEngine(role="cooldown")
+    cd_engine.fs_client = mock_firestore
+    cd_engine.set_up()
+    cd_card = cd_engine.get_agent_card()
+    assert cd_card["name"] == "Cooldown & Policy Agent"
+    assert any(s["id"] == "check_cooldown_eligibility" for s in cd_card["skills"])
+    cd_res = cd_engine.query(customer_id="cust_test_1")
+    assert cd_res["isEligible"] is True
+
+    # 2. Churn Agent
+    mock_bigquery.set_predictions("cust_churn_test", 0.82)
+    ch_engine = StandaloneAgentEngine(role="churn")
+    ch_engine.fs_client = mock_firestore
+    ch_engine.bq_client = mock_bigquery
+    ch_engine.set_up()
+    ch_card = ch_engine.get_agent_card()
+    assert ch_card["name"] == "Churn Intelligence Agent"
+    ch_res = ch_engine.query(customer_id="cust_churn_test")
+    assert ch_res["churnProbability"] == 0.82
+    assert ch_res["churnTier"] == "CRITICAL"
+
+    # 3. Friction Agent
+    mock_firestore.collection("customers").document("cust_fric_test").set({
+        "customerId": "cust_fric_test",
+        "primaryComplaintReason": "LATE_DELIVERY"
+    })
+    fr_engine = StandaloneAgentEngine(role="friction")
+    fr_engine.fs_client = mock_firestore
+    fr_engine.set_up()
+    fr_card = fr_engine.get_agent_card()
+    assert fr_card["name"] == "Customer Friction Agent"
+    fr_res = fr_engine.query(customer_id="cust_fric_test")
+    assert fr_res["primaryFriction"] == "LATE_DELIVERY"
+
+    # 4. Synthesis Agent
+    sy_engine = StandaloneAgentEngine(role="synthesis")
+    sy_engine.genai_client = mock_gemini
+    sy_engine.set_up()
+    sy_card = sy_engine.get_agent_card()
+    assert sy_card["name"] == "Offer Synthesis Agent"
+    sy_res = sy_engine.query(
+        customer_id="cust_synth_test",
+        churn_tier="CRITICAL",
+        primary_friction="LATE_DELIVERY"
+    )
+    assert sy_res["discountPercent"] == 25
+
+    # 5. Fulfillment Agent
+    fu_engine = StandaloneAgentEngine(role="fulfillment")
+    fu_engine.fs_client = mock_firestore
+    fu_engine.set_up()
+    fu_card = fu_engine.get_agent_card()
+    assert fu_card["name"] == "Offer Fulfillment Agent"
+    test_offer = {
+        "offerId": "off_standalone_test",
+        "title": "VIP Offer",
+        "discountPercent": 25,
+        "promoCode": "TEST-25",
+        "status": "ACTIVE"
+    }
+    fu_res = fu_engine.query(customer_id="cust_fu_test", offer=test_offer, session_id="sess_test")
+    assert fu_res["offerId"] == "off_standalone_test"
+

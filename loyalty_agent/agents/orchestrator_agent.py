@@ -38,11 +38,11 @@ class RetentionOrchestratorAgent(BaseA2AAgent):
         discovery_client: Optional[A2ADiscoveryClient] = None,
         a2a_client: Optional[A2AClient] = None,
         base_url: str = "http://localhost:8081/orchestrator",
-        cooldown_agent_url: str = "http://localhost:8081/cooldown",
-        churn_agent_url: str = "http://localhost:8081/churn",
-        friction_agent_url: str = "http://localhost:8081/friction",
-        synthesis_agent_url: str = "http://localhost:8081/synthesis",
-        fulfillment_agent_url: str = "http://localhost:8081/fulfillment",
+        cooldown_agent_url: Optional[str] = None,
+        churn_agent_url: Optional[str] = None,
+        friction_agent_url: Optional[str] = None,
+        synthesis_agent_url: Optional[str] = None,
+        fulfillment_agent_url: Optional[str] = None,
         cooldown_days: int = config.cooldown_days,
         churn_threshold: float = config.churn_trigger_threshold,
         acute_friction_boost: float = config.acute_friction_boost,
@@ -55,11 +55,12 @@ class RetentionOrchestratorAgent(BaseA2AAgent):
         self.discovery = discovery_client or A2ADiscoveryClient()
         self.a2a_client = a2a_client or A2AClient(discovery_client=self.discovery)
 
-        self.cooldown_agent_url = cooldown_agent_url
-        self.churn_agent_url = churn_agent_url
-        self.friction_agent_url = friction_agent_url
-        self.synthesis_agent_url = synthesis_agent_url
-        self.fulfillment_agent_url = fulfillment_agent_url
+        import os
+        self.cooldown_agent_url = cooldown_agent_url or os.getenv("COOLDOWN_AGENT_URL", "http://localhost:8081/cooldown")
+        self.churn_agent_url = churn_agent_url or os.getenv("CHURN_AGENT_URL", "http://localhost:8081/churn")
+        self.friction_agent_url = friction_agent_url or os.getenv("FRICTION_AGENT_URL", "http://localhost:8081/friction")
+        self.synthesis_agent_url = synthesis_agent_url or os.getenv("SYNTHESIS_AGENT_URL", "http://localhost:8081/synthesis")
+        self.fulfillment_agent_url = fulfillment_agent_url or os.getenv("FULFILLMENT_AGENT_URL", "http://localhost:8081/fulfillment")
 
         self.cooldown_days = cooldown_days
         self.churn_threshold = churn_threshold
