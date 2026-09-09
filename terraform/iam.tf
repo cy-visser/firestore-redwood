@@ -56,12 +56,20 @@ resource "google_service_account_iam_member" "dataflow_sa_actas" {
   service_account_id = google_service_account.pipeline_sa.name
   role               = "roles/iam.serviceAccountUser"
   member             = "serviceAccount:service-${data.google_project.project.number}@dataflow-service-producer-prod.iam.gserviceaccount.com"
+
+  depends_on = [
+    google_project_service_identity.dataflow_sa
+  ]
 }
 
 resource "google_service_account_iam_member" "dataflow_sa_service_agent" {
   service_account_id = google_service_account.pipeline_sa.name
   role               = "roles/dataflow.serviceAgent"
   member             = "serviceAccount:service-${data.google_project.project.number}@dataflow-service-producer-prod.iam.gserviceaccount.com"
+
+  depends_on = [
+    google_project_service_identity.dataflow_sa
+  ]
 }
 
 # Service Account Vertex AI User Role (for Gemini reasoning in Loyalty Agent)
@@ -83,12 +91,20 @@ resource "google_project_iam_member" "re_service_agent_ar_reader" {
   project = var.project_id
   role    = "roles/artifactregistry.reader"
   member  = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-aiplatform.iam.gserviceaccount.com"
+
+  depends_on = [
+    google_project_service_identity.aiplatform_sa
+  ]
 }
 
 resource "google_project_iam_member" "re_dedicated_service_agent_ar_reader" {
   project = var.project_id
   role    = "roles/artifactregistry.reader"
   member  = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-aiplatform-re.iam.gserviceaccount.com"
+
+  depends_on = [
+    google_project_service_identity.aiplatform_sa
+  ]
 }
 
 # Allow Agent Runtime Service Agents to act as the pipeline service account
@@ -96,12 +112,20 @@ resource "google_service_account_iam_member" "agent_engine_sa_user" {
   service_account_id = google_service_account.pipeline_sa.name
   role               = "roles/iam.serviceAccountUser"
   member             = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-aiplatform.iam.gserviceaccount.com"
+
+  depends_on = [
+    google_project_service_identity.aiplatform_sa
+  ]
 }
 
 resource "google_service_account_iam_member" "re_dedicated_agent_engine_sa_user" {
   service_account_id = google_service_account.pipeline_sa.name
   role               = "roles/iam.serviceAccountUser"
   member             = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-aiplatform-re.iam.gserviceaccount.com"
+
+  depends_on = [
+    google_project_service_identity.aiplatform_sa
+  ]
 }
 
 

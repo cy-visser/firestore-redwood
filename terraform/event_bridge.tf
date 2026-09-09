@@ -8,7 +8,13 @@
 variable "enable_event_bridge" {
   description = "Whether to deploy the Firestore-to-Agent-Runtime Event Bridge on Cloud Run."
   type        = bool
-  default     = true
+  default     = false
+}
+
+variable "event_bridge_admin_email" {
+  description = "Optional admin email granted roles/run.invoker on the Event Bridge Cloud Run service."
+  type        = string
+  default     = ""
 }
 
 variable "event_bridge_image_tag" {
@@ -139,10 +145,10 @@ resource "google_cloud_run_v2_service_iam_member" "event_bridge_invoker" {
 }
 
 resource "google_cloud_run_v2_service_iam_member" "event_bridge_admin_invoker" {
-  count    = var.enable_event_bridge ? 1 : 0
+  count    = var.enable_event_bridge && var.event_bridge_admin_email != "" ? 1 : 0
   project  = var.project_id
   location = var.region
   name     = google_cloud_run_v2_service.event_bridge[0].name
   role     = "roles/run.invoker"
-  member   = "user:admin@ganeshraja.altostrat.com"
+  member   = "user:${var.event_bridge_admin_email}"
 }
