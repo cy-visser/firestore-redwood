@@ -369,6 +369,12 @@ fi
 # 4. TERRAFORM PROVISIONING
 # ------------------------------------------------------------------------------
 echo -e "\n🚀 Step 1/4: Provisioning Infrastructure via Terraform..."
+
+# Pre-create Google-managed service identities for Vertex AI & Dataflow so IAM bindings succeed on first run
+gcloud services enable aiplatform.googleapis.com dataflow.googleapis.com --project="$GCP_PROJECT_ID" &>/dev/null || true
+gcloud beta services identity create --service=aiplatform.googleapis.com --project="$GCP_PROJECT_ID" &>/dev/null || true
+gcloud beta services identity create --service=dataflow.googleapis.com --project="$GCP_PROJECT_ID" &>/dev/null || true
+
 terraform -chdir="$TERRAFORM_DIR" init
 terraform -chdir="$TERRAFORM_DIR" apply -auto-approve
 

@@ -27,3 +27,25 @@ resource "google_project_service" "services" {
   disable_on_destroy         = false
   disable_dependent_services = false
 }
+
+# Provision Google-managed Service Agents before IAM bindings are applied
+resource "google_project_service_identity" "aiplatform_sa" {
+  provider = google-beta
+  project  = var.project_id
+  service  = "aiplatform.googleapis.com"
+
+  depends_on = [
+    google_project_service.services["aiplatform.googleapis.com"]
+  ]
+}
+
+resource "google_project_service_identity" "dataflow_sa" {
+  provider = google-beta
+  project  = var.project_id
+  service  = "dataflow.googleapis.com"
+
+  depends_on = [
+    google_project_service.services["dataflow.googleapis.com"]
+  ]
+}
+
