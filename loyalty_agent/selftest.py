@@ -34,7 +34,6 @@ from loyalty_agent.agent import (  # noqa: E402
     flatten_profile,
 )
 from loyalty_agent.config import config  # noqa: E402
-from loyalty_agent.listener import SessionEventListener  # noqa: E402
 from loyalty_agent.schemas import LoyaltyOffer  # noqa: E402
 
 FAILURES: List[str] = []
@@ -237,20 +236,6 @@ class LegacyGeminiClient:
 
     def generate_content(self, prompt):  # pragma: no cover - must never be reached
         raise AssertionError("the agent must not call Client.generate_content")
-
-
-class InlineExecutor:
-    """Runs listener work on the calling thread so ordering is deterministic."""
-
-    def __init__(self):
-        self.calls: List[Any] = []
-
-    def submit(self, fn, *args, **kwargs):
-        self.calls.append(args[0] if args else None)
-        return fn(*args, **kwargs)
-
-    def shutdown(self, wait: bool = True):
-        self.shutdown_called = True
 
 
 # ---------------------------------------------------------------------------
@@ -669,40 +654,6 @@ def test_session_state_machine() -> None:
     check("session without a customer is ignored", agent.process_session(SESSION_ID), None)
 
 
-def test_listener_replay_guard() -> None:
-    print("\n[listener]")
-    listener = SessionEventListener(firestore_client=None, session_processor=lambda sid: sid)
-    processed: List[str] = []
-    listener.processor = processed.append
-    listener.executor = InlineExecutor()
-
-    def change(session_id: str, change_type: str, status: str = "PENDING"):
-        document = SimpleNamespace(id=session_id, to_dict=lambda: {"agentProcessingStatus": status})
-        return SimpleNamespace(type=SimpleNamespace(name=change_type), document=document)
-
-    listener.on_snapshot_callback(None, [change("sess_a", "ADDED")], None)
-    check("ADDED is processed", processed, ["sess_a"])
-
-    # A watch reconnect replays the whole result set as ADDED changes.
-    listener.on_snapshot_callback(None, [change("sess_a", "ADDED")], None)
-    check("replayed ADDED is ignored", processed, ["sess_a"])
-
-    listener.on_snapshot_callback(None, [change("sess_b", "REMOVED")], None)
-    check("REMOVED is ignored", processed, ["sess_a"])
-
-    listener.on_snapshot_callback(None, [change("sess_c", "MODIFIED")], None)
-    check("MODIFIED is processed", processed, ["sess_a", "sess_c"])
-
-    listener.on_snapshot_callback(None, [change("sess_d", "ADDED", status="PROCESSING")], None)
-    check("already claimed session is ignored", processed, ["sess_a", "sess_c"])
-
-    listener.on_snapshot_callback(None, [change("sess_e", "ADDED", status="PROCESSED")], None)
-    check("finished session is ignored", processed, ["sess_a", "sess_c"])
-
-    listener.executor.calls.clear()
-    listener.stop()
-
-
 def main() -> int:
     print("=" * 62)
     print(" Redwood loyalty agent self-test")
@@ -717,7 +668,6 @@ def main() -> int:
     test_offer_id_and_schema()
     test_offer_synthesis()
     test_session_state_machine()
-    test_listener_replay_guard()
 
     print("\n" + "=" * 62)
     if FAILURES:

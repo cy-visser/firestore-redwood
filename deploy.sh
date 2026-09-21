@@ -24,9 +24,7 @@ TEARDOWN_MODE=false
 AUTO_APPROVE=false
 CREATE_PROJECT=false
 RUN_TESTS=false
-RUN_AGENT=false
-BUILD_AGENT_IMAGE=false
-TEST_AGENT_RUNTIME=false
+VERIFY_DEMO=false
 SKIP_IMAGE_BUILD=false
 SKIP_AGENT_DEPLOY=false
 
@@ -50,16 +48,13 @@ Options:
   -t, --teardown, --destroy Cleanly tear down all provisioned GCP infrastructure and stop jobs.
   -y, --auto-approve       Skip confirmation prompts during deployment or teardown.
   --run-tests              Execute the CDC and loyalty agent self-test suites and exit.
-  --run-agent              Run the loyalty agent locally (Firestore real-time listener).
-  --build-agent-image      Build and push Agent Runtime container image to Artifact Registry.
-  --test-agent-runtime     Validate Agent Runtime: live Firestore session injection.
+  --verify-demo            Write a session for each demo customer against the deployed
+                           stack and check the agent reacts correctly, then exit.
 
 Examples:
-  ./deploy.sh                         # Deploy entire infrastructure, seed 250 orders, and train BQML
+  ./deploy.sh                         # Deploy everything, seed 400 customers, train the churn model
   ./deploy.sh --run-tests             # Execute the self-test suites
-  ./deploy.sh --run-agent             # Start the loyalty agent locally
-  ./deploy.sh --build-agent-image     # Build and push Agent Runtime container image to Artifact Registry
-  ./deploy.sh --test-agent-runtime    # Test live Agent Runtime with synthetic mobile session
+  ./deploy.sh --verify-demo           # Check the deployed stack end to end
   ./deploy.sh --create-project        # Bootstrap a new GCP project first, then deploy components
   ./deploy.sh --seed-count 1000       # Deploy and seed 1,000 customers
   ./deploy.sh --dry-run               # Preview Terraform execution plan
@@ -114,16 +109,8 @@ while [[ $# -gt 0 ]]; do
       RUN_TESTS=true
       shift
       ;;
-    --run-agent)
-      RUN_AGENT=true
-      shift
-      ;;
-    --build-agent-image)
-      BUILD_AGENT_IMAGE=true
-      shift
-      ;;
-    --test-agent-runtime)
-      TEST_AGENT_RUNTIME=true
+    --verify-demo)
+      VERIFY_DEMO=true
       shift
       ;;
     *)
@@ -340,48 +327,14 @@ if [[ "$RUN_TESTS" == true ]]; then
   exit 0
 fi
 
-if [[ "$RUN_AGENT" == true ]]; then
-  echo -e "\n⚡ Starting Autonomous Firestore-to-Agent-Runtime Event Bridge..."
-  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" "$REDWOOD_DIR/scripts/run_firestore_agent_bridge.py"
-  exit 0
-fi
-
-if [[ "$BUILD_AGENT_IMAGE" == true ]]; then
-  echo -e "\n🔨 Building Autonomous A2A Multi-Agent Platform Container Image..."
-  IMAGE_TAG="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/pipeline-images/loyalty-agent-runtime:latest"
-  echo "Target Image: $IMAGE_TAG"
-
-  # Ensure Artifact Registry repository exists
-  if ! gcloud artifacts repositories describe pipeline-images --location="$GCP_REGION" --project="$GCP_PROJECT_ID" &>/dev/null; then
-    echo "Creating Artifact Registry repository 'pipeline-images' in $GCP_REGION..."
-    gcloud artifacts repositories create pipeline-images \
-      --repository-format=docker \
-      --location="$GCP_REGION" \
-      --project="$GCP_PROJECT_ID" \
-      --description="Docker repository for Redwood Retail pipeline and agent images"
-  fi
-
-  echo "Submitting build to Cloud Build..."
-  gcloud builds submit "$REDWOOD_DIR" --tag "$IMAGE_TAG" --project="$GCP_PROJECT_ID"
-  echo "✅ Loyalty Offer Agent Runtime container successfully built and published to Artifact Registry:"
-  echo "   $IMAGE_TAG"
-  exit 0
-fi
-
-if [[ "$TEST_AGENT_RUNTIME" == true ]]; then
-  echo -e "\n🧪 Testing A2A Multi-Agent Platform on Agent Runtime End-to-End..."
-  EXTRA_ARGS=()
-  if [[ -n "${AGENT_RUNTIME_URL:-}" ]]; then
-    EXTRA_ARGS+=("--runtime-url" "$AGENT_RUNTIME_URL")
-  fi
-  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" "$REDWOOD_DIR/scripts/test_agent_runtime.py" \
+if [[ "$VERIFY_DEMO" == true ]]; then
+  echo -e "\n🧪 Verifying the demo flow against the deployed stack..."
+  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" "$REDWOOD_DIR/scripts/verify_demo_flow.py" \
     --project "$GCP_PROJECT_ID" \
-    --database "$FIRESTORE_DATABASE_ID" \
-    "${EXTRA_ARGS[@]}" || {
-    echo "❌ Error: A2A Multi-Agent Platform verification failed!" >&2
+    --database "$FIRESTORE_DATABASE_ID" || {
+    echo "❌ Demo flow verification failed." >&2
     exit 1
   }
-  echo "🎉 A2A Multi-Agent Platform test passed successfully!"
   exit 0
 fi
 

@@ -2,7 +2,7 @@
 
 An interactive, visually appealing mobile retail application client that connects directly to **Google Cloud Firestore Enterprise Native** (database: `redwood`, collection: `retail`). The application allows customers to browse hardware catalog items, manage cart and logistics, submit satisfaction feedback, and place orders that generate the **exact same JSON schema** as [`generate_retail_dataset.py`](../generate_retail_dataset.py).
 
-Every submitted order streams via **Cloud Dataflow** in real-time to Google BigQuery (`redwood_retail.retail_cdc`) and powers **BigQuery ML customer churn models**.
+Every submitted order is replicated to BigQuery (`redwood_retail.retail_cdc`) within seconds by the Eventarc-driven CDC service, and powers the BigQuery churn model. See [docs/architecture.md](../docs/architecture.md).
 
 ---
 
@@ -55,7 +55,7 @@ Every submitted order streams via **Cloud Dataflow** in real-time to Google BigQ
                                     | Real-Time CDC Change Stream
                                     v
 +-------------------------------------------------------------------------+
-|                       Google Cloud Dataflow                             |
+|          Eventarc -> Cloud Run CDC service -> BigQuery                  |
 |          Streaming Pipeline: firestore-retail-to-bigquery               |
 +-------------------------------------------------------------------------+
                                     |

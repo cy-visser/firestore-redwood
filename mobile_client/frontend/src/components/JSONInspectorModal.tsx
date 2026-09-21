@@ -58,7 +58,7 @@ export const JSONInspectorModal: React.FC<JSONInspectorModalProps> = ({
             ✓ Native Firestore
           </span>
           <span className="px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 whitespace-nowrap">
-            ✓ Dataflow CDC Stream
+            ✓ Eventarc CDC Stream
           </span>
           <span className="px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 whitespace-nowrap">
             ✓ BigQuery ML Features
