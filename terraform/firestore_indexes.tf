@@ -73,6 +73,34 @@ resource "google_firestore_index" "customer_sessions_by_customer" {
   ]
 }
 
+# Composite index for the agent's offer cooldown lookup:
+# WHERE customerId == :cid AND createdAt >= :cutoff ORDER BY createdAt DESC
+#
+# This is not served by loyalty_offers_active_by_customer above. Firestore
+# selects an index by field prefix, and that index places status between
+# customerId and createdAt, so it can only answer queries that also constrain
+# status. The cooldown lookup deliberately does not, because it has to see
+# expired and superseded offers as well as active ones.
+resource "google_firestore_index" "loyalty_offers_recent_by_customer" {
+  project    = var.project_id
+  database   = var.firestore_database_id
+  collection = "loyalty_offers"
+
+  fields {
+    field_path = "customerId"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = "createdAt"
+    order      = "DESCENDING"
+  }
+
+  depends_on = [
+    terraform_data.firestore_database
+  ]
+}
+
 # TTL policy on customer_sessions collection (30-day session document purge)
 resource "google_firestore_field" "customer_sessions_ttl" {
   project    = var.project_id
