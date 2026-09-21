@@ -6,8 +6,8 @@
 # before Terraform can create the Cloud Run service that runs it, and the
 # Eventarc triggers have to exist before seeding or the seeded documents
 # produce no change events and never reach BigQuery. Seeding before the
-# triggers are live is recoverable via the backfill endpoint, but it is slower
-# and easy to forget, so the steps are sequenced to avoid needing it.
+# triggers are live is recoverable, since the run ends with a reconciliation
+# pass, but that pass is a safety net rather than the intended path.
 # ==============================================================================
 set -euo pipefail
 
@@ -47,15 +47,15 @@ Options:
   --dry-run                Validate configuration and run Terraform plan without modifying GCP resources.
   -t, --teardown, --destroy Cleanly tear down all provisioned GCP infrastructure and stop jobs.
   -y, --auto-approve       Skip confirmation prompts during deployment or teardown.
-  --run-tests              Execute Pytest test suite (tests/) inside .venv and exit.
-  --run-agent              Run the autonomous A2A Multi-Agent platform (Firestore real-time listener).
+  --run-tests              Execute the CDC and loyalty agent self-test suites and exit.
+  --run-agent              Run the loyalty agent locally (Firestore real-time listener).
   --build-agent-image      Build and push Agent Runtime container image to Artifact Registry.
-  --test-agent-runtime     Validate Agent Runtime: A2A discovery probe + live Firestore session injection.
+  --test-agent-runtime     Validate Agent Runtime: live Firestore session injection.
 
 Examples:
   ./deploy.sh                         # Deploy entire infrastructure, seed 250 orders, and train BQML
-  ./deploy.sh --run-tests             # Execute full automated test suite (23/23 tests)
-  ./deploy.sh --run-agent             # Start the autonomous A2A Multi-Agent platform locally
+  ./deploy.sh --run-tests             # Execute the self-test suites
+  ./deploy.sh --run-agent             # Start the loyalty agent locally
   ./deploy.sh --build-agent-image     # Build and push Agent Runtime container image to Artifact Registry
   ./deploy.sh --test-agent-runtime    # Test live Agent Runtime with synthetic mobile session
   ./deploy.sh --create-project        # Bootstrap a new GCP project first, then deploy components
@@ -199,13 +199,23 @@ REQUIRED_VARS=(
   BIGQUERY_HISTORICAL_VIEW
   BIGQUERY_CHURN_MODEL
   GCS_BUCKET_PREFIX
-  DATAFLOW_SERVICE_ACCOUNT
 )
 
 # Optional, with defaults matching the Terraform variables.
 FIRESTORE_CUSTOMERS_COLLECTION="${FIRESTORE_CUSTOMERS_COLLECTION:-customers}"
 BIGQUERY_ORDERS_TABLE="${BIGQUERY_ORDERS_TABLE:-${FIRESTORE_COLLECTION}_current}"
 ARTIFACT_REPOSITORY="${ARTIFACT_REPOSITORY:-pipeline-images}"
+
+# Terraform has always called this resource pipeline_sa; only the .env name
+# still referred to Dataflow. Accept the old name so existing .env files keep
+# working. The account id itself is left alone deliberately: changing it would
+# make Terraform destroy and recreate the account, taking its IAM grants with
+# it, purely to rename something.
+PIPELINE_SERVICE_ACCOUNT="${PIPELINE_SERVICE_ACCOUNT:-${DATAFLOW_SERVICE_ACCOUNT:-}}"
+if [[ -z "$PIPELINE_SERVICE_ACCOUNT" ]]; then
+  echo "❌ Error: PIPELINE_SERVICE_ACCOUNT is missing or empty in .env." >&2
+  exit 1
+fi
 
 MISSING_VARS=()
 for var in "${REQUIRED_VARS[@]}"; do
@@ -230,7 +240,7 @@ export TF_VAR_firestore_collection="$FIRESTORE_COLLECTION"
 export TF_VAR_bigquery_dataset_id="$BIGQUERY_DATASET"
 export TF_VAR_bigquery_cdc_table_id="$BIGQUERY_CDC_TABLE"
 export TF_VAR_gcs_bucket_name_prefix="$GCS_BUCKET_PREFIX"
-export TF_VAR_service_account_id="$DATAFLOW_SERVICE_ACCOUNT"
+export TF_VAR_service_account_id="$PIPELINE_SERVICE_ACCOUNT"
 export TF_VAR_firestore_customers_collection="$FIRESTORE_CUSTOMERS_COLLECTION"
 export TF_VAR_artifact_repository_id="$ARTIFACT_REPOSITORY"
 
@@ -273,22 +283,44 @@ if [[ -z "${PYTHON_EXEC:-}" || ! -x "$PYTHON_EXEC" ]]; then
 fi
 export PYTHON_EXEC
 
-# Ensure Python requirements are met in virtual environment
-"$PYTHON_EXEC" -c "import dotenv, google.cloud.firestore, google.auth, setuptools, build, pytest" 2>/dev/null || {
+# Ensure Python requirements are met in virtual environment. The probe imports
+# the same packages the install line provides, so a partially provisioned venv
+# is repaired rather than silently accepted.
+"$PYTHON_EXEC" -c "
+import dotenv, pydantic, setuptools, vertexai
+import google.auth, google.cloud.firestore, google.cloud.bigquery
+import google.cloud.bigquery_storage
+" 2>/dev/null || {
   echo "📦 Installing required Python dependencies inside virtual environment..."
-  "$PYTHON_EXEC" -m pip install -q "apache-beam[gcp]>=2.75.0" "google-cloud-firestore>=2.20.0" "google-cloud-bigquery>=3.25.0" "python-dotenv>=1.0.0" "setuptools" "build" "pytest>=8.0.0"
+  "$PYTHON_EXEC" -m pip install -q \
+    "google-cloud-firestore>=2.20.0" \
+    "google-cloud-bigquery>=3.25.0" \
+    "google-cloud-bigquery-storage>=2.25.0" \
+    "google-cloud-aiplatform>=1.60.0" \
+    "python-dotenv>=1.0.0" \
+    "pydantic>=2.0.0" \
+    "protobuf>=4.25.0" \
+    "setuptools"
 }
 
 # ------------------------------------------------------------------------------
 # 1.1 Optional: Automated Test Runner & Agent Run Modes
 # ------------------------------------------------------------------------------
 if [[ "$RUN_TESTS" == true ]]; then
-  echo -e "\n🧪 Running Redwood Retail Loyalty Offer Agent Test Suite..."
-  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" -m pytest "$REDWOOD_DIR/tests/" -v --tb=short || {
-    echo "❌ Error: Loyalty Offer Agent test suite failed!" >&2
-    exit 1
-  }
-  echo "🎉 All Loyalty Offer Agent tests passed successfully!"
+  echo -e "\n🧪 Running Redwood Retail test suites..."
+
+  # These replace the old tests/ directory, which only ever covered the A2A
+  # agent mesh and broke at import once that collapsed into a single agent.
+  # Each module exercises the real code path rather than a mock of it.
+  for SUITE in "$REDWOOD_DIR/cdc_service/selftest.py" "$REDWOOD_DIR/loyalty_agent/selftest.py"; do
+    echo -e "\n--- $(basename "$(dirname "$SUITE")") ---"
+    PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" "$SUITE" || {
+      echo "❌ Error: $SUITE failed!" >&2
+      exit 1
+    }
+  done
+
+  echo -e "\n🎉 All test suites passed."
   exit 0
 fi
 
@@ -461,18 +493,9 @@ if [[ "$SKIP_SEED" != true ]]; then
   echo "✅ Seeding complete."
   echo "⏳ Waiting for Eventarc to replicate documents into BigQuery..."
 
-  # Each seeded document raises a change event, so replication runs
-  # concurrently with seeding and is usually close to done already. Wait for the
-  # count to stop climbing rather than for a fixed target, since the exact order
-  # count depends on the generated archetypes.
-  MAX_WAIT=420
-  START_WAIT=$(date +%s)
-  ROW_COUNT=0
-  STABLE_READINGS=0
-  LAST_COUNT=-1
-
-  while true; do
-    ROW_COUNT=$("$PYTHON_EXEC" -c "
+  # Count helper, used both while watching replication and after reconciling.
+  count_orders() {
+    "$PYTHON_EXEC" -c "
 from google.cloud import bigquery
 c = bigquery.Client(project='$GCP_PROJECT_ID')
 try:
@@ -480,7 +503,23 @@ try:
     print(r[0].n if r else 0)
 except Exception:
     print(0)
-" 2>/dev/null || echo 0)
+" 2>/dev/null || echo 0
+  }
+
+  # Each seeded document raises a change event, so replication runs
+  # concurrently with seeding and is usually close to done already. Wait for the
+  # count to stop climbing rather than for a fixed target, since the exact order
+  # count depends on the generated archetypes. This window only gives the live
+  # path a chance to finish on its own; the reconciliation below is what
+  # guarantees the final state, so there is no need to wait this out.
+  MAX_WAIT=120
+  START_WAIT=$(date +%s)
+  ROW_COUNT=0
+  STABLE_READINGS=0
+  LAST_COUNT=-1
+
+  while true; do
+    ROW_COUNT=$(count_orders)
 
     if [[ "$ROW_COUNT" -gt 0 && "$ROW_COUNT" -eq "$LAST_COUNT" ]]; then
       STABLE_READINGS=$(( STABLE_READINGS + 1 ))
@@ -497,7 +536,7 @@ except Exception:
     NOW=$(date +%s)
     ELAPSED=$(( NOW - START_WAIT ))
     if [[ $ELAPSED -ge $MAX_WAIT ]]; then
-      echo "⚠️  Replication still moving after ${MAX_WAIT}s (at $ROW_COUNT rows)."
+      echo "   Replication still moving after ${MAX_WAIT}s (at $ROW_COUNT rows); reconciling below."
       break
     fi
 
@@ -505,21 +544,21 @@ except Exception:
     sleep 10
   done
 
-  # Backfill anything the triggers missed. Eventarc only sees changes made
-  # after a trigger exists, so a re-seed against a half-built stack, or a
-  # trigger that was still activating, leaves gaps. The endpoint upserts, so
-  # calling it when nothing is missing is harmless.
-  if [[ -n "${CDC_URL:-}" && "$ROW_COUNT" -eq 0 ]]; then
-    echo "No rows replicated; reconciling via the backfill endpoint..."
-    TOKEN=$(gcloud auth print-identity-token 2>/dev/null || true)
-    for COLL in "$FIRESTORE_COLLECTION" "$FIRESTORE_CUSTOMERS_COLLECTION"; do
-      curl -sS -X POST "$CDC_URL/admin/backfill" \
-        -H "Authorization: Bearer $TOKEN" \
-        -H "Content-Type: application/json" \
-        -d "{\"collection\": \"$COLL\"}" | head -c 400
-      echo
-    done
-  fi
+  # Reconcile unconditionally. Eventarc only sees changes made after a trigger
+  # exists, so anything seeded against a half-built stack is invisible. The
+  # subtler case is a re-seed: the generator is deterministic, so it rewrites
+  # documents byte-for-byte, Firestore raises no change event at all, and the
+  # table sits at a stale count that looks perfectly healthy. Neither gap is
+  # detectable from the row count alone, which is why this does not run
+  # conditionally. Rows go through the same UPSERT path as live events and are
+  # sequenced on each document's own update time, so this cannot duplicate a
+  # row or overwrite newer data with older.
+  echo "🔄 Reconciling Firestore into BigQuery..."
+  "$PYTHON_EXEC" "$REDWOOD_DIR/cdc_service/backfill.py" --all --ensure-tables
+
+  ROW_COUNT=$(count_orders)
+  echo "✅ $ROW_COUNT orders in $BIGQUERY_DATASET.$BIGQUERY_ORDERS_TABLE."
+
 else
   echo -e "\n⏭️  Step 3/5: Skipping seeding (--skip-seed requested)."
 fi
@@ -558,10 +597,11 @@ echo " Region:             $GCP_REGION"
 echo " Firestore DB:       $FIRESTORE_DATABASE_ID (Native Mode, Collection: $FIRESTORE_COLLECTION)"
 echo " BigQuery Table:     $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE"
 echo " BigQuery Model:     $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CHURN_MODEL"
-echo " Dataflow Streaming: $DATAFLOW_JOB_NAME"
+echo " CDC Service:        ${CDC_URL:-not deployed}"
 echo "-----------------------------------------------------------------"
 echo " 🌐 Google Cloud Console Quick Links:"
-echo " • Dataflow Jobs: https://console.cloud.google.com/dataflow/jobs?project=$GCP_PROJECT_ID"
+echo " • Cloud Run: https://console.cloud.google.com/run?project=$GCP_PROJECT_ID"
+echo " • Eventarc Triggers: https://console.cloud.google.com/eventarc/triggers?project=$GCP_PROJECT_ID"
 echo " • BigQuery Studio: https://console.cloud.google.com/bigquery?project=$GCP_PROJECT_ID"
 echo " • Firestore Databases: https://console.cloud.google.com/firestore/databases?project=$GCP_PROJECT_ID"
 echo "-----------------------------------------------------------------"
