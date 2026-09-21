@@ -452,4 +452,12 @@ WHEN NOT MATCHED THEN INSERT (
   source.cart_abandonment_count, source.support_tickets_count,
   source.sentiment_score, source.automated_retention_action,
   source.calculation_timestamp
-);
+)
+-- Drop customers the source no longer knows about. Without this the table only
+-- ever grows: re-seeding the demo produces a fresh set of customer ids, the old
+-- ones stop matching, and their scores sit there indefinitely. A run against a
+-- 402-customer dataset left 650 rows behind, 250 of them scored from data that
+-- had already been deleted, and the agent has no way to tell those apart from
+-- live ones.
+WHEN NOT MATCHED BY SOURCE THEN DELETE;
+
