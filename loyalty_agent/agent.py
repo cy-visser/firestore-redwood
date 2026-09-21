@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -255,9 +256,91 @@ class LoyaltyAgent:
         )
         self.audit_ttl_days = audit_ttl_days if audit_ttl_days is not None else config.offer_audit_ttl_days
 
+        # Stamped onto a session when this instance claims it. Agent Engine can
+        # run several instances, so a session stuck in PROCESSING is only
+        # traceable if it records which one took it.
+        self.worker_id = f"agent-{uuid.uuid4().hex[:8]}"
+
     # ------------------------------------------------------------------
     # Entry point
     # ------------------------------------------------------------------
+
+    # States a session can be in when the agent is handed it. Anything outside
+    # this set means another delivery of the same event already took it, or it
+    # has already reached a terminal state, and there is nothing to do.
+    _CLAIMABLE_STATUSES = (None, "", "PENDING")
+
+    def _claim_session(
+        self, sess_ref: Any, session_id: str, now: datetime
+    ) -> tuple[bool, Dict[str, Any]]:
+        """Move a session from PENDING to PROCESSING, exactly once.
+
+        Returns (claimed, session_data). A False return is a normal outcome,
+        not an error: it means some other invocation got there first.
+
+        The transaction matters. Eventarc redelivers, the bridge returns 500 on
+        failure to ask for a retry, and a customer can tap sign in twice. Two
+        invocations that both read PENDING would both run the full evaluation,
+        and because neither offer exists yet both would pass the cooldown check
+        and issue one.
+        """
+        transaction_factory = getattr(self.fs, "transaction", None)
+
+        if transaction_factory is None:
+            # Test doubles and any client without transaction support. This is
+            # a narrower guarantee than the transactional path, since the read
+            # and the write are not atomic, but it still rejects a session that
+            # was claimed before this call started.
+            snap = sess_ref.get()
+            if not snap.exists:
+                logger.warning("Session %s not found in Firestore.", session_id)
+                return False, {}
+            data = snap.to_dict() or {}
+            status = data.get("agentProcessingStatus")
+            if status not in self._CLAIMABLE_STATUSES:
+                logger.info(
+                    "Session %s is already %s; leaving it alone.", session_id, status
+                )
+                return False, data
+            sess_ref.update({
+                "agentProcessingStatus": "PROCESSING",
+                "processingStartedAt": now.isoformat(),
+                "agentWorkerId": self.worker_id,
+            })
+            data["agentProcessingStatus"] = "PROCESSING"
+            return True, data
+
+        from google.cloud import firestore as _firestore
+
+        transaction = transaction_factory()
+        claimed: Dict[str, Any] = {}
+
+        @_firestore.transactional
+        def _claim(txn) -> bool:
+            snap = sess_ref.get(transaction=txn)
+            if not snap.exists:
+                logger.warning("Session %s not found in Firestore.", session_id)
+                return False
+            data = snap.to_dict() or {}
+            claimed.update(data)
+            status = data.get("agentProcessingStatus")
+            if status not in self._CLAIMABLE_STATUSES:
+                logger.info(
+                    "Session %s is already %s; leaving it alone.", session_id, status
+                )
+                return False
+            txn.update(sess_ref, {
+                "agentProcessingStatus": "PROCESSING",
+                "processingStartedAt": now.isoformat(),
+                "agentWorkerId": self.worker_id,
+            })
+            return True
+
+        if not _claim(transaction):
+            return False, claimed
+
+        claimed["agentProcessingStatus"] = "PROCESSING"
+        return True, claimed
 
     def process_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Run the retention evaluation for one session.
@@ -271,18 +354,35 @@ class LoyaltyAgent:
             return None
 
         sess_ref = self.fs.collection(SESSIONS_COLLECTION).document(session_id)
-        sess_snap = sess_ref.get()
-        if not sess_snap.exists:
-            logger.warning("Session %s not found in Firestore.", session_id)
+        now = datetime.now(timezone.utc)
+
+        # Claim the session before doing any work. Eventarc delivery is
+        # at-least-once, so the same event can arrive twice and two logins by
+        # the same customer can overlap. Without a claim every delivery ran the
+        # full BigQuery and Gemini path, and two sessions for one customer
+        # could both pass the cooldown check because neither offer existed yet.
+        #
+        # The claim also writes processingStartedAt, which is the only boundary
+        # that separates "Eventarc and the bridge delivered this" from "the
+        # agent is working on it". Without it the two are indistinguishable.
+        claimed, sess_data = self._claim_session(sess_ref, session_id, now)
+        if not claimed:
             return None
 
-        sess_data = sess_snap.to_dict() or {}
         customer_id = sess_data.get("customerId")
         if not customer_id:
+            # The claim already moved the document to PROCESSING. Leaving it
+            # there would strand it, since nothing else ever revisits a session
+            # in that state. Give it a terminal status instead.
             logger.warning("Session %s has no customerId.", session_id)
+            sess_ref.update({
+                "agentProcessingStatus": "SKIPPED",
+                "status": "PROCESSED",
+                "skipReason": "NO_CUSTOMER_ID",
+                "processedAt": now.isoformat()
+            })
             return None
 
-        now = datetime.now(timezone.utc)
         profile = self._load_profile(customer_id)
 
         churn = self._lookup_churn(customer_id, profile, sess_data.get("customerData"))

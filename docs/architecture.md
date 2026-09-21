@@ -338,15 +338,27 @@ would hide behind a startup probe timeout.
 
 **The loop guard.** The agent writes its result back to the session document,
 which raises another change event. The bridge forwards only sessions whose
-`agentProcessingStatus` is still `PENDING`, so the write-back is delivered and
-ignored.
+`agentProcessingStatus` is still `PENDING`, so both the claim and the final
+write-back are delivered and ignored.
+
+**The claim.** Before doing any work, `process_session` moves the session from
+`PENDING` to `PROCESSING` inside a Firestore transaction, stamping
+`processingStartedAt` and an `agentWorkerId` unique to the running instance. A
+session that is already in any other state is left alone and the invocation
+returns without evaluating anything. This is what makes redelivery safe: two
+invocations that both read `PENDING` would otherwise both run the full
+BigQuery and Gemini path, and two sessions for the same customer would both
+pass the cooldown check, because at that moment neither offer exists yet. The
+claim is also the only boundary that separates event delivery from agent work,
+so it is what lets the console report those two spans apart. A session claimed
+but then found unusable — no `customerId` — is released to `SKIPPED` rather
+than stranded, since nothing revisits a document left in `PROCESSING`.
 
 **Failure handling is asymmetric on purpose.** An unparseable event returns 200,
 because retrying will never help. An agent failure returns 500 so Eventarc
-retries, which is safe because the agent claims a session before working on it
-and ignores one already claimed. Deduplication lives in the agent only; a
-second opinion about what counts as a duplicate is a second thing that can
-disagree.
+retries, which is safe because of the claim above. Deduplication lives in the
+agent only; a second opinion about what counts as a duplicate is a second thing
+that can disagree.
 
 ---
 

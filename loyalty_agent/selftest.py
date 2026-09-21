@@ -288,12 +288,15 @@ def build_agent(
     segment: Optional[str] = None,
 ):
     """Assemble an agent over fakes, returning (agent, firestore, bigquery)."""
+    # PENDING is what every producer writes, and what the bridge requires
+    # before it will forward a session. Starting the fixture anywhere else
+    # would test a state the agent never actually receives.
     session_doc = session if session is not None else {
         "sessionId": SESSION_ID,
         "customerId": CUSTOMER_ID,
         "loginTimestamp": datetime.now(timezone.utc).isoformat(),
         "status": "ACTIVE",
-        "agentProcessingStatus": "PROCESSING",
+        "agentProcessingStatus": "PENDING",
     }
 
     fs = FakeFirestore({
@@ -654,6 +657,47 @@ def test_session_state_machine() -> None:
     check("session without a customer is ignored", agent.process_session(SESSION_ID), None)
 
 
+def test_session_claim() -> None:
+    print("\n[session claim]")
+
+    # The claim has to be visible on the document, because it is what the
+    # operator console uses to separate event delivery from agent work.
+    agent, fs, _ = build_agent(churn_probability=0.90)
+    agent.process_session(SESSION_ID)
+    session = fs.session()
+    check_true("claim records a start time", session.get("processingStartedAt") is not None)
+    check_true("claim records a worker", session.get("agentWorkerId") is not None)
+
+    # The case the claim exists for. Eventarc is at-least-once, so the same
+    # session can arrive twice; the second delivery must not re-evaluate it.
+    agent, fs, _ = build_agent(churn_probability=0.90)
+    first = agent.process_session(SESSION_ID)
+    check_true("first delivery issues an offer", first is not None)
+    second = agent.process_session(SESSION_ID)
+    check("redelivery is ignored", second, None)
+    check("session keeps its terminal status", fs.session()["agentProcessingStatus"], "PROCESSED")
+    check("no second offer written", len(fs.offers()), 1)
+
+    # A session another worker is mid-way through must be left alone rather
+    # than raced.
+    agent, fs, _ = build_agent(
+        churn_probability=0.90,
+        session={
+            "sessionId": SESSION_ID,
+            "customerId": CUSTOMER_ID,
+            "agentProcessingStatus": "PROCESSING",
+        },
+    )
+    check("in-flight session is left alone", agent.process_session(SESSION_ID), None)
+
+    # Claiming a session the agent then cannot act on must still release it,
+    # or it sits in PROCESSING forever with nothing scheduled to revisit it.
+    agent, fs, _ = build_agent(churn_probability=0.90, session={"sessionId": SESSION_ID})
+    agent.process_session(SESSION_ID)
+    check("unusable session is released", fs.session()["agentProcessingStatus"], "SKIPPED")
+    check("release records why", fs.session()["skipReason"], "NO_CUSTOMER_ID")
+
+
 def main() -> int:
     print("=" * 62)
     print(" Redwood loyalty agent self-test")
@@ -668,6 +712,7 @@ def main() -> int:
     test_offer_id_and_schema()
     test_offer_synthesis()
     test_session_state_machine()
+    test_session_claim()
 
     print("\n" + "=" * 62)
     if FAILURES:

@@ -31,7 +31,7 @@ import os
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -53,18 +53,30 @@ EXPECTATIONS = {
 }
 
 
+# Statuses the agent passes through rather than finishes on. PENDING is the
+# state the session is written in; PROCESSING means the agent has claimed it
+# and is still working. Neither is a result to report.
+NON_TERMINAL_STATUSES = {None, "", "PENDING", "PROCESSING"}
+
+
 def wait_for_agent(
     fs: firestore.Client, session_id: str, timeout: int
 ) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Poll the session until the agent leaves a terminal status on it."""
+    """Poll the session until the agent leaves a terminal status on it.
+
+    On timeout the last document seen is still returned, because whether the
+    session was ever claimed is what distinguishes a delivery failure from an
+    agent failure.
+    """
     deadline = time.time() + timeout
+    data: Dict[str, Any] = {}
     while time.time() < deadline:
         data = fs.collection(SESSIONS_COLLECTION).document(session_id).get().to_dict() or {}
         status = data.get("agentProcessingStatus")
-        if status and status != "PENDING":
+        if status not in NON_TERMINAL_STATUSES:
             return status, data
         time.sleep(2)
-    return None, {}
+    return None, data
 
 
 def offers_for(fs: firestore.Client, customer_id: str) -> Dict[str, Dict[str, Any]]:
@@ -91,8 +103,15 @@ def run_case(
         # the event is delivered and deliberately ignored.
         "agentProcessingStatus": "PENDING",
         "status": "PENDING",
+        # loginTimestamp is the field the composite indexes order on. loginAt
+        # is carried too because the mobile client writes it and queries in
+        # the console filter on it.
+        "loginTimestamp": now,
         "loginAt": now,
         "createdAt": now,
+        # The collection's TTL policy purges on expireAt. A --keep run would
+        # otherwise leave verification sessions in the database forever.
+        "expireAt": now + timedelta(days=1),
         "channel": "VERIFICATION",
     })
     print(f"  wrote {SESSIONS_COLLECTION}/{session_id}")
@@ -103,9 +122,15 @@ def run_case(
 
     ok = True
     if status is None:
-        print(f"  FAIL  still PENDING after {timeout}s")
-        print("        The usual cause is the Eventarc trigger not reaching the")
-        print("        bridge, or the bridge failing to resolve the agent.")
+        if data.get("agentProcessingStatus") == "PROCESSING":
+            worker = data.get("agentWorkerId") or "unknown"
+            print(f"  FAIL  claimed by {worker} but never finished within {timeout}s")
+            print("        The event was delivered, so the fault is inside the agent.")
+            print("        Check the ReasoningEngine logs for the failing step.")
+        else:
+            print(f"  FAIL  never claimed within {timeout}s")
+            print("        The usual cause is the Eventarc trigger not reaching the")
+            print("        bridge, or the bridge failing to resolve the agent.")
         ok = False
     else:
         print(f"  agent responded in {elapsed:.0f}s: {status}"
