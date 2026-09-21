@@ -1,29 +1,17 @@
 """
-Redwood Retail Autonomous Loyalty Multi-Agent System on Google Cloud Agent Runtime.
-Built on the official A2A (Agent2Agent) Protocol Specification.
+Redwood Retail Autonomous Loyalty Offer Agent.
 """
 
-from loyalty_agent.config import config, AgentConfig
+from loyalty_agent.agent import LoyaltyAgent, evaluate_5pillar_heuristic, evaluate_churn_tier
+from loyalty_agent.config import AgentConfig, ConfigurationError, config
 from loyalty_agent.listener import SessionEventListener
-from loyalty_agent.agents import (
-    BaseA2AAgent,
-    RetentionOrchestratorAgent,
-    CooldownPolicyAgent,
-    CustomerFrictionAgent,
-    ChurnIntelligenceAgent,
-    OfferSynthesisAgent,
-    OfferFulfillmentAgent,
-)
 
 __all__ = [
     "config",
     "AgentConfig",
+    "ConfigurationError",
     "SessionEventListener",
-    "BaseA2AAgent",
-    "RetentionOrchestratorAgent",
-    "CooldownPolicyAgent",
-    "CustomerFrictionAgent",
-    "ChurnIntelligenceAgent",
-    "OfferSynthesisAgent",
-    "OfferFulfillmentAgent",
+    "LoyaltyAgent",
+    "evaluate_churn_tier",
+    "evaluate_5pillar_heuristic",
 ]

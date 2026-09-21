@@ -11,10 +11,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy A2A Multi-Agent platform and bridge files
+# Copy the loyalty agent and the bridge that runs it
 COPY loyalty_agent/ ./loyalty_agent/
 COPY scripts/run_firestore_agent_bridge.py ./scripts/run_firestore_agent_bridge.py
-COPY deployed_native_agents.json ./deployed_native_agents.json
 
 # Expose container health check port
 EXPOSE 8080

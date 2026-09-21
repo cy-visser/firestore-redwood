@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Test script for Redwood Retail A2A Multi-Agent Retention Platform on Agent Runtime.
-Validates A2A discovery endpoint (/.well-known/agent-card.json), creates a test
-customer session in Firestore, and verifies that the multi-agent orchestrator
-processes the session and issues or surfaces a loyalty offer.
+Live check for the Redwood Retail loyalty offer agent.
+Creates a test customer session in Firestore and verifies that the agent
+processes it and issues or surfaces a loyalty offer. Optionally probes the
+bridge health endpoint first.
 """
 
 import sys
@@ -14,17 +14,22 @@ import urllib.request
 import json
 from datetime import datetime, timezone
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from google.cloud import firestore
 
-# Default configuration
-DEFAULT_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "redwood-retail-949ec9")
-DEFAULT_DATABASE_ID = os.getenv("FIRESTORE_DATABASE_ID", "redwood")
+from loyalty_agent.config import config
+
+# Resolved from the environment by the agent config, which refuses to guess a
+# project rather than defaulting to someone else's.
+DEFAULT_PROJECT_ID = config.project_id
+DEFAULT_DATABASE_ID = config.firestore_database
 
 
-def check_agent_runtime(url: str, timeout: int = 10) -> bool:
-    """Probes the Agent Runtime A2A discovery and health endpoints."""
-    print(f"🩺 Probing Agent Runtime discovery endpoint at {url} ...")
-    headers = {"User-Agent": "Redwood-Agent-Runtime-Test/1.0"}
+def check_bridge_health(url: str, timeout: int = 10) -> bool:
+    """Probes the bridge health endpoint."""
+    print(f"🩺 Probing bridge health endpoint at {url} ...")
+    headers = {"User-Agent": "Redwood-Loyalty-Agent-Test/1.0"}
     try:
         import subprocess
         token = subprocess.check_output(
@@ -37,7 +42,6 @@ def check_agent_runtime(url: str, timeout: int = 10) -> bool:
         pass
 
     probe_urls = [
-        url.rstrip("/") + "/.well-known/agent-card.json",
         url.rstrip("/") + "/healthz",
         url.rstrip("/") + "/"
     ]
@@ -48,29 +52,28 @@ def check_agent_runtime(url: str, timeout: int = 10) -> bool:
                 if response.status == 200:
                     body = response.read().decode("utf-8")
                     data = json.loads(body)
-                    name = data.get("name") or data.get("platform", "Agent Runtime")
-                    print(f"✅ Agent Runtime discovery verified on {p_url}! Agent: {name}")
+                    print(f"✅ Bridge healthy on {p_url}: {data.get('service', 'unknown service')}")
                     return True
         except Exception:
             continue
 
-    print("⚠️ Warning: Agent Runtime probe did not respond (service might require internal network or IAM invoker).")
+    print("⚠️ Warning: bridge probe did not respond (service might require internal network or IAM invoker).")
     return False
 
 
 def test_agent_runtime(project_id: str, database_id: str, customer_id: str, runtime_url: str = None, timeout_seconds: int = 30):
     print("=" * 65)
-    print(" 🌲 REDWOOD RETAIL: A2A Multi-Agent Platform Verification")
+    print(" 🌲 REDWOOD RETAIL: Loyalty Offer Agent Verification")
     print("=" * 65)
     print(f"Target GCP Project:     {project_id}")
     print(f"Firestore Database:     {database_id}")
     print(f"Test Customer ID:       {customer_id}")
     if runtime_url:
-        print(f"Agent Runtime URL:      {runtime_url}")
+        print(f"Bridge URL:             {runtime_url}")
     print("-" * 65)
 
     if runtime_url:
-        check_agent_runtime(runtime_url)
+        check_bridge_health(runtime_url)
 
     print(f"\n📡 Connecting to Firestore database '{database_id}' in project '{project_id}'...")
     db = firestore.Client(project=project_id, database=database_id)
@@ -96,7 +99,7 @@ def test_agent_runtime(project_id: str, database_id: str, customer_id: str, runt
     db.collection("customer_sessions").document(session_id).set(session_data)
     print("✅ Session document successfully created in Firestore.")
 
-    print(f"\n⏳ Waiting for A2A Retention Orchestrator to process session (timeout: {timeout_seconds}s)...")
+    print(f"\n⏳ Waiting for the loyalty agent to process the session (timeout: {timeout_seconds}s)...")
     start_time = time.time()
     processed = False
     session_result = None
@@ -108,7 +111,7 @@ def test_agent_runtime(project_id: str, database_id: str, customer_id: str, runt
             status = data.get("agentProcessingStatus")
             if status in ("PROCESSED", "SKIPPED"):
                 elapsed = time.time() - start_time
-                print(f"🎯 Session processed by A2A Orchestrator in {elapsed:.2f}s! Status: {status}")
+                print(f"🎯 Session processed in {elapsed:.2f}s! Status: {status}")
                 processed = True
                 session_result = data
                 break
@@ -117,8 +120,8 @@ def test_agent_runtime(project_id: str, database_id: str, customer_id: str, runt
         print(f"   Polling Firestore... (elapsed: {int(time.time() - start_time)}s)")
 
     if not processed:
-        print(f"❌ Error: Agent Runtime did not process session within {timeout_seconds} seconds.")
-        print("Please check that the Agent Runtime process is running and has permissions on Firestore.")
+        print(f"❌ Error: the agent did not process the session within {timeout_seconds} seconds.")
+        print("Please check that the bridge daemon is running and has permissions on Firestore.")
         return False
 
     # Check for newly generated offer
@@ -131,7 +134,7 @@ def test_agent_runtime(project_id: str, database_id: str, customer_id: str, runt
 
     if offers:
         offer_found = offers[0].to_dict()
-        print("\n🎉 SUCCESS! Real-time Loyalty Offer Generated by A2A Platform:")
+        print("\n🎉 SUCCESS! Real-time loyalty offer generated:")
         print(f" • Offer ID:              {offer_found.get('offerId')}")
         print(f" • Promo Code:             {offer_found.get('promoCode')}")
         print(f" • Discount:               {offer_found.get('discountPercent')}%")
@@ -155,11 +158,11 @@ def test_agent_runtime(project_id: str, database_id: str, customer_id: str, runt
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test Redwood Retail A2A Multi-Agent Platform on Agent Runtime")
+    parser = argparse.ArgumentParser(description="Verify the Redwood Retail loyalty offer agent end to end")
     parser.add_argument("--project", default=DEFAULT_PROJECT_ID, help="GCP Project ID")
     parser.add_argument("--database", default=DEFAULT_DATABASE_ID, help="Firestore Database ID")
     parser.add_argument("--customer-id", default="cust_retail_72871", help="Customer ID to test")
-    parser.add_argument("--runtime-url", default=None, help="Agent Runtime service URL to probe")
+    parser.add_argument("--runtime-url", default=None, help="Bridge service URL to probe")
     parser.add_argument("--timeout", type=int, default=30, help="Wait timeout in seconds")
 
     args = parser.parse_args()
