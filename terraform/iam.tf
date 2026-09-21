@@ -1,4 +1,4 @@
-# Dedicated Service Account for Dataflow Pipeline & Applications
+# Dedicated Service Account for the CDC service, churn jobs and the agent.
 resource "google_service_account" "pipeline_sa" {
   project      = var.project_id
   account_id   = var.service_account_id
@@ -30,21 +30,7 @@ resource "google_project_iam_member" "sa_bigquery_job_user" {
   member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
 }
 
-# Service Account Dataflow Worker Role
-resource "google_project_iam_member" "sa_dataflow_worker" {
-  project = var.project_id
-  role    = "roles/dataflow.worker"
-  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
-}
-
-# Service Account Dataflow Admin Role
-resource "google_project_iam_member" "sa_dataflow_admin" {
-  project = var.project_id
-  role    = "roles/dataflow.admin"
-  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
-}
-
-# Service Account GCS Object Admin Role (for Dataflow staging/temp buckets)
+# Service Account GCS Object Admin Role (build sources, exports)
 resource "google_project_iam_member" "sa_storage_admin" {
   project = var.project_id
   role    = "roles/storage.objectAdmin"
@@ -73,27 +59,6 @@ resource "google_project_iam_member" "demo_principals_firestore" {
   project  = var.project_id
   role     = "roles/datastore.user"
   member   = "serviceAccount:${google_service_account.demo_principals[each.key].email}"
-}
-
-# Allow Dataflow Service Agent to access and act as the custom worker service account
-resource "google_service_account_iam_member" "dataflow_sa_actas" {
-  service_account_id = google_service_account.pipeline_sa.name
-  role               = "roles/iam.serviceAccountUser"
-  member             = "serviceAccount:service-${data.google_project.project.number}@dataflow-service-producer-prod.iam.gserviceaccount.com"
-
-  depends_on = [
-    google_project_service_identity.dataflow_sa
-  ]
-}
-
-resource "google_service_account_iam_member" "dataflow_sa_service_agent" {
-  service_account_id = google_service_account.pipeline_sa.name
-  role               = "roles/dataflow.serviceAgent"
-  member             = "serviceAccount:service-${data.google_project.project.number}@dataflow-service-producer-prod.iam.gserviceaccount.com"
-
-  depends_on = [
-    google_project_service_identity.dataflow_sa
-  ]
 }
 
 # Service Account Vertex AI User Role (for Gemini reasoning in Loyalty Agent)

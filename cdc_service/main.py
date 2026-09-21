@@ -35,7 +35,11 @@ from flask import Flask, jsonify, request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from bq_cdc_writer import CdcSink, extract_row, sequence_number  # noqa: E402
-from firestore_event import DocumentEvent, parse_document_event  # noqa: E402
+from firestore_event import (  # noqa: E402
+    DocumentEvent,
+    parse_document_event,
+    parse_event_body,
+)
 from schemas import ColumnContext, TableSpec, build_routes  # noqa: E402
 
 logging.basicConfig(
@@ -188,10 +192,10 @@ def receive_event():
         return jsonify(status="ignored", reason="not a CloudEvent"), 200
 
     try:
-        payload = request.get_json(force=True, silent=False) or {}
+        payload = parse_event_body(request.get_data(), request.content_type)
     except Exception as err:  # noqa: BLE001
         logger.error("Unparseable event body for %s: %s", event_id, err)
-        return jsonify(status="dropped", reason="malformed JSON"), 200
+        return jsonify(status="dropped", reason="malformed payload"), 200
 
     try:
         event = parse_document_event(payload, event_id, event_type, event_time)

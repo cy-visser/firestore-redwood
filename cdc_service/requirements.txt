@@ -3,4 +3,7 @@ gunicorn>=21.2.0
 google-cloud-bigquery>=3.14.0
 google-cloud-bigquery-storage>=2.24.0
 google-cloud-firestore>=2.14.0
+# Generated DocumentEventData message. Required because Eventarc only accepts
+# application/protobuf for Firestore sources.
+google-events>=0.13.0
 protobuf>=4.25.0

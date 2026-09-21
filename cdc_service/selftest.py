@@ -362,6 +362,71 @@ def test_delete_row_is_key_only() -> None:
     check("delete tagged", getattr(parsed, CHANGE_TYPE_COLUMN), "DELETE")
 
 
+def test_protobuf_wire_format() -> None:
+    """The real wire format must decode to the same values as the JSON fixture.
+
+    Eventarc only accepts application/protobuf for Firestore sources, so every
+    production event takes this path. Building the message, serialising it and
+    reading it back proves the MessageToDict normalisation actually yields the
+    protojson shape the decoder expects, rather than us assuming it does.
+    """
+    print("\n[protobuf wire format]")
+
+    try:
+        from google.events.cloud import firestore_v1
+    except ImportError:
+        print("  SKIP  google-events not installed")
+        return
+
+    from firestore_event import parse_event_body
+
+    event_data = firestore_v1.DocumentEventData()
+    document = event_data.value
+    document.name = (
+        "projects/demo/databases/redwood/documents/retail/ORD-2609-DEMO1-0017"
+    )
+    document.fields["orderId"] = firestore_v1.Value(
+        string_value="ORD-2609-DEMO1-0017"
+    )
+    document.fields["customerId"] = firestore_v1.Value(string_value="cust_demo1")
+    # Exercises the int64-as-string rule that trips up naive JSON handling.
+    document.fields["quantity"] = firestore_v1.Value(integer_value=21)
+    document.fields["isLoyaltyMember"] = firestore_v1.Value(boolean_value=True)
+    document.fields["financials"] = firestore_v1.Value(
+        map_value=firestore_v1.MapValue(
+            fields={"grandTotal": firestore_v1.Value(double_value=1272.53)}
+        )
+    )
+
+    raw = type(event_data).pb(event_data).SerializeToString()
+    check_true("serialises to bytes", isinstance(raw, bytes) and len(raw) > 0)
+
+    payload = parse_event_body(raw, "application/protobuf")
+    check_true("protojson has value", "value" in payload)
+
+    decoded = decode_fields(payload["value"]["fields"])
+    check("proto string", decoded["customerId"], "cust_demo1")
+    check("proto int64", decoded["quantity"], 21)
+    check_true("proto int64 is int", isinstance(decoded["quantity"], int))
+    check("proto bool", decoded["isLoyaltyMember"], True)
+    check("proto nested double", decoded["financials"]["grandTotal"], 1272.53)
+
+    event = parse_document_event(
+        payload, "evt-proto", "google.cloud.firestore.document.v1.created"
+    )
+    check("proto collection", event.collection, "retail")
+    check("proto document id", event.document_id, "ORD-2609-DEMO1-0017")
+
+    # A JSON body must still work, so a mislabelled or future-JSON trigger does
+    # not take the service down.
+    as_json = json.dumps(sample_event("created")).encode()
+    check_true("json body still parses",
+               "value" in parse_event_body(as_json, "application/json"))
+    check_true("json body parses despite protobuf header",
+               "value" in parse_event_body(as_json, "application/protobuf"))
+    check("empty body yields empty dict", parse_event_body(b"", None), {})
+
+
 def main() -> int:
     print("=" * 62)
     print(" Redwood CDC mapping self-test")
@@ -369,6 +434,7 @@ def main() -> int:
 
     test_value_decoding()
     test_event_parsing()
+    test_protobuf_wire_format()
     test_coercion()
     test_row_extraction()
     test_proto_build()

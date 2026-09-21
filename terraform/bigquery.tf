@@ -2,7 +2,7 @@ resource "google_bigquery_dataset" "redwood_retail" {
   project                    = var.project_id
   dataset_id                 = var.bigquery_dataset_id
   friendly_name              = "Redwood Retail Dataset"
-  description                = "Real-time retail orders dataset mirrored from Firestore Enterprise via Dataflow CDC"
+  description                = "Retail orders and customers mirrored from Firestore Enterprise via Eventarc change data capture"
   location                   = var.region
   delete_contents_on_destroy = true
 
@@ -23,7 +23,7 @@ resource "google_bigquery_table" "orders_cdc" {
   table_id            = var.bigquery_cdc_table_id
   deletion_protection = false
 
-  description = "Real-time Change Data Capture (CDC) table replicated from Firestore orders change stream"
+  description = "Append-only change ledger replicated from the Firestore orders change stream. Current state lives in retail_current."
 
   clustering = ["order_id", "customer_id", "order_status"]
 

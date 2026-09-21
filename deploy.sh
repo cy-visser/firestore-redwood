@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Redwood Retail: Single-Command End-to-End Deployment Pipeline
-# Provisions Terraform infrastructure, starts Cloud Dataflow CDC replication,
-# seeds synthetic Firestore transactions, and trains BigQuery ML models.
+#
+# Order matters here. The CDC container has to exist in Artifact Registry
+# before Terraform can create the Cloud Run service that runs it, and the
+# Eventarc triggers have to exist before seeding or the seeded documents
+# produce no change events and never reach BigQuery. Seeding before the
+# triggers are live is recoverable via the backfill endpoint, but it is slower
+# and easy to forget, so the steps are sequenced to avoid needing it.
 # ==============================================================================
 set -euo pipefail
 
@@ -11,7 +16,7 @@ TERRAFORM_DIR="$REDWOOD_DIR/terraform"
 PYTHON_EXEC="${PYTHON_EXEC:-}"
 
 # Default configuration flags
-SEED_COUNT=250
+SEED_COUNT=400
 SKIP_SEED=false
 SKIP_BQML=false
 DRY_RUN=false
@@ -22,6 +27,7 @@ RUN_TESTS=false
 RUN_AGENT=false
 BUILD_AGENT_IMAGE=false
 TEST_AGENT_RUNTIME=false
+SKIP_IMAGE_BUILD=false
 
 usage() {
   cat <<EOF
@@ -32,9 +38,12 @@ Single-command full deployment and lifecycle management for Redwood Retail.
 Options:
   -h, --help               Show this help message and exit.
   -p, --create-project     Provision a new GCP project using terraform/bootstrap before deploying components.
-  -s, --seed-count <N>     Number of initial synthetic orders to generate into Firestore (default: 250).
+  -s, --seed-count <N>     Number of synthetic customers to generate (default: 400). Each
+                           produces roughly 4-20 orders depending on archetype, and the two
+                           demo personas are seeded in addition to this count.
   --skip-seed              Skip generating synthetic transactions into Firestore.
   --skip-bqml              Skip training and evaluating BigQuery ML churn models.
+  --skip-image-build       Reuse the CDC container already in Artifact Registry.
   --dry-run                Validate configuration and run Terraform plan without modifying GCP resources.
   -t, --teardown, --destroy Cleanly tear down all provisioned GCP infrastructure and stop jobs.
   -y, --auto-approve       Skip confirmation prompts during deployment or teardown.
@@ -50,7 +59,7 @@ Examples:
   ./deploy.sh --build-agent-image     # Build and push Agent Runtime container image to Artifact Registry
   ./deploy.sh --test-agent-runtime    # Test live Agent Runtime with synthetic mobile session
   ./deploy.sh --create-project        # Bootstrap a new GCP project first, then deploy components
-  ./deploy.sh --seed-count 1000       # Deploy and seed 1,000 transactions
+  ./deploy.sh --seed-count 1000       # Deploy and seed 1,000 customers
   ./deploy.sh --dry-run               # Preview Terraform execution plan
   ./deploy.sh --teardown              # Destroy all cloud resources cleanly
 EOF
@@ -77,6 +86,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-bqml)
       SKIP_BQML=true
+      shift
+      ;;
+    --skip-image-build)
+      SKIP_IMAGE_BUILD=true
       shift
       ;;
     --dry-run)
@@ -186,9 +199,13 @@ REQUIRED_VARS=(
   BIGQUERY_HISTORICAL_VIEW
   BIGQUERY_CHURN_MODEL
   GCS_BUCKET_PREFIX
-  DATAFLOW_JOB_NAME
   DATAFLOW_SERVICE_ACCOUNT
 )
+
+# Optional, with defaults matching the Terraform variables.
+FIRESTORE_CUSTOMERS_COLLECTION="${FIRESTORE_CUSTOMERS_COLLECTION:-customers}"
+BIGQUERY_ORDERS_TABLE="${BIGQUERY_ORDERS_TABLE:-${FIRESTORE_COLLECTION}_current}"
+ARTIFACT_REPOSITORY="${ARTIFACT_REPOSITORY:-pipeline-images}"
 
 MISSING_VARS=()
 for var in "${REQUIRED_VARS[@]}"; do
@@ -214,13 +231,14 @@ export TF_VAR_bigquery_dataset_id="$BIGQUERY_DATASET"
 export TF_VAR_bigquery_cdc_table_id="$BIGQUERY_CDC_TABLE"
 export TF_VAR_gcs_bucket_name_prefix="$GCS_BUCKET_PREFIX"
 export TF_VAR_service_account_id="$DATAFLOW_SERVICE_ACCOUNT"
-export TF_VAR_dataflow_job_name="$DATAFLOW_JOB_NAME"
+export TF_VAR_firestore_customers_collection="$FIRESTORE_CUSTOMERS_COLLECTION"
+export TF_VAR_artifact_repository_id="$ARTIFACT_REPOSITORY"
 
 echo "Project ID:          $GCP_PROJECT_ID"
 echo "Region:              $GCP_REGION"
 echo "Firestore Database:  $FIRESTORE_DATABASE_ID (Native Mode, collection: $FIRESTORE_COLLECTION)"
-echo "BigQuery Sink:       $BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE"
-echo "Dataflow Job:        $DATAFLOW_JOB_NAME"
+echo "BigQuery Sink:       $BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE (ledger) + $BIGQUERY_ORDERS_TABLE (mirror)"
+echo "Replication:         Eventarc -> Cloud Run -> BigQuery Storage Write API"
 echo "Mode:                $([[ "$TEARDOWN_MODE" == true ]] && echo "TEARDOWN" || ([[ "$DRY_RUN" == true ]] && echo "DRY RUN / PLAN" || echo "FULL DEPLOYMENT"))"
 echo "================================================================="
 
@@ -332,10 +350,7 @@ if [[ "$TEARDOWN_MODE" == true ]]; then
     fi
   fi
 
-  echo -e "\n🧹 Step 1/2: Pre-emptively stopping Dataflow streaming pipeline and waiting for VM shutdown..."
-  bash "$TERRAFORM_DIR/scripts/cleanup_dataflow_job.sh" "$GCP_PROJECT_ID" "$GCP_REGION" "$DATAFLOW_JOB_NAME"
-
-  echo -e "\n🧹 Step 2/2: Destroying cloud infrastructure via Terraform..."
+  echo -e "\n🧹 Destroying cloud infrastructure via Terraform..."
   MAX_DESTROY_ATTEMPTS=3
   for ((attempt=1; attempt<=MAX_DESTROY_ATTEMPTS; attempt++)); do
     if terraform -chdir="$TERRAFORM_DIR" destroy -auto-approve; then
@@ -368,66 +383,145 @@ fi
 # ------------------------------------------------------------------------------
 # 4. TERRAFORM PROVISIONING
 # ------------------------------------------------------------------------------
-echo -e "\n🚀 Step 1/4: Provisioning Infrastructure via Terraform..."
+echo -e "\n🔨 Step 1/5: Building the CDC container..."
 
-# Pre-create Google-managed service identities for Vertex AI & Dataflow so IAM bindings succeed on first run
-gcloud services enable aiplatform.googleapis.com dataflow.googleapis.com --project="$GCP_PROJECT_ID" &>/dev/null || true
-gcloud beta services identity create --service=aiplatform.googleapis.com --project="$GCP_PROJECT_ID" &>/dev/null || true
-gcloud beta services identity create --service=dataflow.googleapis.com --project="$GCP_PROJECT_ID" &>/dev/null || true
+# Terraform cannot create the Cloud Run service until this image exists, so the
+# build has to come first rather than alongside.
+CDC_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/redwood-cdc:latest"
+
+if [[ "$SKIP_IMAGE_BUILD" == true ]]; then
+  echo "⏭️  Reusing existing image ($CDC_IMAGE)."
+else
+  gcloud services enable cloudbuild.googleapis.com artifactregistry.googleapis.com \
+    --project="$GCP_PROJECT_ID" &>/dev/null || true
+
+  if ! gcloud artifacts repositories describe "$ARTIFACT_REPOSITORY" \
+       --location="$GCP_REGION" --project="$GCP_PROJECT_ID" &>/dev/null; then
+    echo "Creating Artifact Registry repository '$ARTIFACT_REPOSITORY'..."
+    gcloud artifacts repositories create "$ARTIFACT_REPOSITORY" \
+      --repository-format=docker --location="$GCP_REGION" \
+      --project="$GCP_PROJECT_ID" \
+      --description="Redwood Retail pipeline and agent images"
+  fi
+
+  gcloud builds submit "$REDWOOD_DIR/cdc_service" \
+    --tag="$CDC_IMAGE" --project="$GCP_PROJECT_ID" --region="$GCP_REGION"
+  echo "✅ CDC container published: $CDC_IMAGE"
+fi
+
+# Resolve the tag to a digest and deploy that instead. Terraform compares the
+# image string, so redeploying ":latest" after a rebuild is a no-op plan and
+# the service carries on serving the image the revision was first created with.
+# Passing the digest makes a rebuild an actual change.
+CDC_IMAGE_DIGEST=$(gcloud artifacts docker images describe "$CDC_IMAGE" \
+  --format='value(image_summary.digest)' --project="$GCP_PROJECT_ID" 2>/dev/null || true)
+if [[ -n "$CDC_IMAGE_DIGEST" ]]; then
+  export TF_VAR_cdc_image_digest="$CDC_IMAGE_DIGEST"
+  echo "   Pinned digest: $CDC_IMAGE_DIGEST"
+else
+  echo "⚠️  Could not resolve the image digest; falling back to the mutable tag."
+  echo "    A rebuilt image may not roll out until the service is redeployed."
+fi
+
+echo -e "\n🚀 Step 2/5: Provisioning Infrastructure via Terraform..."
+
+# Pre-create Google-managed service identities so the IAM bindings below them
+# succeed on a first run. Eventarc in particular refuses to create a Firestore
+# trigger until both its own and Firestore's service agent exist, and the
+# resulting error names neither of them.
+gcloud services enable aiplatform.googleapis.com eventarc.googleapis.com \
+  firestore.googleapis.com --project="$GCP_PROJECT_ID" &>/dev/null || true
+for SVC in aiplatform eventarc firestore; do
+  gcloud beta services identity create --service="${SVC}.googleapis.com" \
+    --project="$GCP_PROJECT_ID" &>/dev/null || true
+done
 
 terraform -chdir="$TERRAFORM_DIR" init
 terraform -chdir="$TERRAFORM_DIR" apply -auto-approve
 
+CDC_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw cdc_service_url 2>/dev/null || true)
 echo "✅ Terraform infrastructure provisioning completed."
+[[ -n "$CDC_URL" ]] && echo "   CDC service: $CDC_URL"
 
 # ------------------------------------------------------------------------------
 # 5. DATA SEEDING (SYNTHETIC TRANSACTIONS)
 # ------------------------------------------------------------------------------
 if [[ "$SKIP_SEED" != true ]]; then
-  echo -e "\n📦 Step 2/4: Seeding Synthetic Transactions into Firestore Enterprise..."
+  echo -e "\n📦 Step 3/5: Seeding customers and order histories into Firestore..."
   "$PYTHON_EXEC" "$REDWOOD_DIR/generate_retail_dataset.py" \
     --count "$SEED_COUNT" \
     --workers 4 \
     --project "$GCP_PROJECT_ID" \
     --region "$GCP_REGION" \
     --database "$FIRESTORE_DATABASE_ID" \
-    --collection "$FIRESTORE_COLLECTION"
+    --collection "$FIRESTORE_COLLECTION" \
+    --customers-collection "$FIRESTORE_CUSTOMERS_COLLECTION" \
+    --drop-existing
 
-  echo "✅ Successfully seeded $SEED_COUNT orders into Firestore."
-  echo "⏳ Waiting for Cloud Dataflow to replicate events into BigQuery ($BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE)..."
-  
-  MAX_WAIT=300
+  echo "✅ Seeding complete."
+  echo "⏳ Waiting for Eventarc to replicate documents into BigQuery..."
+
+  # Each seeded document raises a change event, so replication runs
+  # concurrently with seeding and is usually close to done already. Wait for the
+  # count to stop climbing rather than for a fixed target, since the exact order
+  # count depends on the generated archetypes.
+  MAX_WAIT=420
   START_WAIT=$(date +%s)
   ROW_COUNT=0
+  STABLE_READINGS=0
+  LAST_COUNT=-1
+
   while true; do
     ROW_COUNT=$("$PYTHON_EXEC" -c "
 from google.cloud import bigquery
-client = bigquery.Client(project='$GCP_PROJECT_ID')
-query = 'SELECT COUNT(*) AS total FROM \`$GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE\`'
+c = bigquery.Client(project='$GCP_PROJECT_ID')
 try:
-    results = list(client.query(query).result())
-    print(results[0].total if results else 0)
+    r = list(c.query('SELECT COUNT(*) AS n FROM \`$GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_ORDERS_TABLE\`').result())
+    print(r[0].n if r else 0)
 except Exception:
     print(0)
 " 2>/dev/null || echo 0)
 
-    if [[ "$ROW_COUNT" -gt 0 ]]; then
-      echo "✅ Confirmed $ROW_COUNT records replicated into BigQuery table '$BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE'."
+    if [[ "$ROW_COUNT" -gt 0 && "$ROW_COUNT" -eq "$LAST_COUNT" ]]; then
+      STABLE_READINGS=$(( STABLE_READINGS + 1 ))
+    else
+      STABLE_READINGS=0
+    fi
+    LAST_COUNT="$ROW_COUNT"
+
+    if [[ "$STABLE_READINGS" -ge 3 ]]; then
+      echo "✅ Replication settled at $ROW_COUNT orders in $BIGQUERY_ORDERS_TABLE."
       break
     fi
 
     NOW=$(date +%s)
     ELAPSED=$(( NOW - START_WAIT ))
     if [[ $ELAPSED -ge $MAX_WAIT ]]; then
-      echo "⚠️ Reached ${MAX_WAIT}s wait limit for initial Dataflow replication. Continuing..."
+      echo "⚠️  Replication still moving after ${MAX_WAIT}s (at $ROW_COUNT rows)."
       break
     fi
 
-    echo "   Waiting for Dataflow workers to stream events (${ELAPSED}s elapsed)..."
+    echo "   $ROW_COUNT orders replicated (${ELAPSED}s elapsed)..."
     sleep 10
   done
+
+  # Backfill anything the triggers missed. Eventarc only sees changes made
+  # after a trigger exists, so a re-seed against a half-built stack, or a
+  # trigger that was still activating, leaves gaps. The endpoint upserts, so
+  # calling it when nothing is missing is harmless.
+  if [[ -n "${CDC_URL:-}" && "$ROW_COUNT" -eq 0 ]]; then
+    echo "No rows replicated; reconciling via the backfill endpoint..."
+    TOKEN=$(gcloud auth print-identity-token 2>/dev/null || true)
+    for COLL in "$FIRESTORE_COLLECTION" "$FIRESTORE_CUSTOMERS_COLLECTION"; do
+      curl -sS -X POST "$CDC_URL/admin/backfill" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"collection\": \"$COLL\"}" | head -c 400
+      echo
+    done
+  fi
 else
-  echo -e "\n⏭️  Step 2/4: Skipping synthetic data seeding (--skip-seed requested)."
+  echo -e "\n⏭️  Step 3/5: Skipping seeding (--skip-seed requested)."
 fi
 
 # ------------------------------------------------------------------------------
@@ -435,18 +529,22 @@ fi
 # ------------------------------------------------------------------------------
 if [[ "$SKIP_BQML" != true ]]; then
   if [[ "${ROW_COUNT:-0}" -eq 0 && "$SKIP_SEED" != true ]]; then
-    echo -e "\n⚠️ Warning: No records found in BigQuery CDC table yet ($BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE)."
-    echo "Cloud Dataflow workers are still initializing in the background."
-    echo "Skipping immediate BQML training to prevent 'Input data doesn't contain any rows' error."
-    echo "Once Dataflow workers finish streaming records, train the model by running:"
-    echo "   $PYTHON_EXEC $REDWOOD_DIR/run_bigquery_analysis.py --execute"
+    # Training on an empty table fails with "Input data doesn't contain any
+    # rows", which reads like a modelling problem rather than the replication
+    # problem it actually is. Say what happened and where to look.
+    echo -e "\n⚠️  No orders reached $BIGQUERY_DATASET.$BIGQUERY_ORDERS_TABLE, so there is nothing to train on."
+    echo "    Check the CDC service and its triggers:"
+    echo "      gcloud run services logs read redwood-cdc --region=$GCP_REGION --limit=50"
+    echo "      gcloud eventarc triggers list --location=$GCP_REGION"
+    echo "    Then re-run:"
+    echo "      $PYTHON_EXEC $REDWOOD_DIR/run_bigquery_analysis.py --execute --report"
   else
-    echo -e "\n🧠 Step 3/4: Building BigQuery Feature Views & Training Churn ML Model..."
-    "$PYTHON_EXEC" "$REDWOOD_DIR/run_bigquery_analysis.py" --execute
-    echo "✅ BigQuery ML pipeline execution completed."
+    echo -e "\n🧠 Step 4/5: Building feature views and training the churn model..."
+    "$PYTHON_EXEC" "$REDWOOD_DIR/run_bigquery_analysis.py" --execute --report
+    echo "✅ Churn pipeline completed."
   fi
 else
-  echo -e "\n⏭️  Step 3/4: Skipping BigQuery ML training (--skip-bqml requested)."
+  echo -e "\n⏭️  Step 4/5: Skipping churn model training (--skip-bqml requested)."
 fi
 
 # ------------------------------------------------------------------------------

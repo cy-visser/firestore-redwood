@@ -3,11 +3,17 @@
 # Stores container images for pipeline and Agent Runtime deployments.
 # ==============================================================================
 
+variable "artifact_repository_id" {
+  description = "Artifact Registry repository holding the pipeline and agent container images."
+  type        = string
+  default     = "pipeline-images"
+}
+
 resource "google_artifact_registry_repository" "pipeline_repo" {
   count         = var.enable_artifact_registry ? 1 : 0
   project       = var.project_id
   location      = var.region
-  repository_id = "pipeline-images"
+  repository_id = var.artifact_repository_id
   description   = "Docker repository for Redwood Retail pipeline and agent images"
   format        = "DOCKER"
 

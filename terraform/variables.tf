@@ -9,7 +9,7 @@ variable "project_id" {
 }
 
 variable "region" {
-  description = "The primary single region for all resources (Firestore, BigQuery, GCS, Dataflow)."
+  description = "The primary single region for all resources (Firestore, BigQuery, GCS, Cloud Run, Eventarc)."
   type        = string
   default     = "europe-west4"
 }
@@ -51,7 +51,7 @@ variable "gcs_bucket_name_prefix" {
 }
 
 variable "service_account_id" {
-  description = "The account ID for the dedicated Service Account."
+  description = "The account ID for the dedicated Service Account. Retains the dataflow-era name so existing IAM grants and state do not churn."
   type        = string
   default     = "dataflow-redwood-sa"
 }
@@ -59,19 +59,13 @@ variable "service_account_id" {
 variable "service_account_display_name" {
   description = "Display name for the dedicated Service Account."
   type        = string
-  default     = "Dataflow Redwood Retail Service Account"
+  default     = "Redwood Retail Pipeline Service Account"
 }
 
 variable "firestore_collection" {
   description = "The Firestore collection to stream to BigQuery."
   type        = string
   default     = "retail"
-}
-
-variable "dataflow_job_name" {
-  description = "Name for the Dataflow streaming CDC replication job."
-  type        = string
-  default     = "firestore-retail-to-bigquery"
 }
 
 variable "bigquery_predictions_table_id" {

@@ -44,7 +44,7 @@ output "bigquery_orders_cdc_table" {
 }
 
 output "storage_bucket_name" {
-  description = "The Cloud Storage bucket name for Dataflow temp and staging."
+  description = "The Cloud Storage bucket name for build artifacts and exports."
   value       = google_storage_bucket.redwood_bucket.name
 }
 
@@ -56,11 +56,6 @@ output "storage_bucket_url" {
 output "service_account_email" {
   description = "The email of the dedicated Service Account."
   value       = google_service_account.pipeline_sa.email
-}
-
-output "dataflow_job_name" {
-  description = "The Dataflow CDC replication streaming job name."
-  value       = var.dataflow_job_name
 }
 
 output "artifact_registry_repo" {

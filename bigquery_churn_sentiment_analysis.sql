@@ -1,268 +1,363 @@
--- ==============================================================================
--- BigQuery Analytics Workbook: Redwood Retail Customer Churn Prediction (BQML)
--- Dataset: `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}`
--- Replicated in real-time from Firestore Enterprise via Cloud Dataflow CDC
+-- =============================================================================
+-- Redwood Retail: churn modelling on BigQuery.
 --
--- Note: Placeholders (${GCP_PROJECT_ID}, ${BIGQUERY_DATASET}, ${BIGQUERY_CDC_TABLE},
--- ${BIGQUERY_HISTORICAL_VIEW}, ${BIGQUERY_CHURN_MODEL}) are populated dynamically
--- from your .env file via `run_bigquery_analysis.py`.
--- ==============================================================================
+-- WHY THIS WAS REWRITTEN
+--
+-- The previous script defined its label with a rule:
+--
+--     is_churned = days_since_last_purchase > 90
+--                  OR login_frequency_monthly < 2
+--                  OR cart_abandonment_count > 3
+--                  OR return_rate_percent > 25
+--                  OR complaints_count > 2
+--                  OR sentiment_score < -0.3
+--
+-- and then trained on those same six columns. The model was therefore being
+-- asked to rediscover a threshold it had already been handed, which is why it
+-- scored so well and why the scores meant nothing: it was measuring the rule,
+-- not churn. Several of the remaining features were near-proxies for the same
+-- quantities (feedback_rating drives sentiment_score, abandoned_cart_value_90d
+-- tracks cart_abandonment_count, support_tickets_count tracks complaints_count),
+-- so removing the exact duplicates alone would not have fixed it.
+--
+-- Churn is now an observed outcome rather than a rule. Features are computed
+-- from everything known up to a cutoff date; the label is whether the customer
+-- actually purchased in the window *after* that cutoff. Nothing on the feature
+-- side can see across the cutoff.
+--
+-- Train and score share one definition. `customer_features(as_of)` is a table
+-- function called with the cutoff during training and with today's date during
+-- inference, so the two cannot drift apart. That is the structural fix; a pair
+-- of parallel views that merely look similar would rot within a release.
+--
+-- Source is the typed `retail_current` mirror rather than JSON in the CDC
+-- ledger. The old feature view pulled every field through
+-- COALESCE(SAFE_CAST(JSON_VALUE(...)), <default>), so a renamed or retyped
+-- document field silently became a default value and the model quietly trained
+-- on zeros. Reading typed columns turns that into an error.
+--
+-- Placeholders are substituted by run_bigquery_analysis.py.
+-- =============================================================================
 
--- ------------------------------------------------------------------------------
--- 1. Feature Engineering View: `${BIGQUERY_HISTORICAL_VIEW}`
--- Extracts and aggregates 4 data pillars across all customer touchpoints:
---   1) Transactional Data (Spend, AOV, Frequency, Recency)
---   2) Engagement & Activity (Logins, Duration, App Score, Abandonment)
---   3) Customer Support / Satisfaction (Tickets, Complaints, Returns, Sentiment)
---   4) Demographics & Account State (Loyalty Tier, Account Age, Location)
--- ------------------------------------------------------------------------------
-CREATE OR REPLACE VIEW `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_HISTORICAL_VIEW}` AS
-WITH customer_raw_features AS (
-  SELECT
-    COALESCE(customer_id, JSON_VALUE(document_data, '$.customerId')) AS customer_id,
-    ANY_VALUE(COALESCE(customer_name, JSON_VALUE(document_data, '$.customerName'))) AS customer_name,
-    ANY_VALUE(COALESCE(customer_email, JSON_VALUE(document_data, '$.customerEmail'))) AS customer_email,
-    ANY_VALUE(COALESCE(customer_segment, JSON_VALUE(document_data, '$.customerSegment'))) AS customer_segment,
 
-    -- Demographics & Account State
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.accountState.isLoyaltyMember') AS INT64),
-      0
-    )) AS is_loyalty_member,
-    ANY_VALUE(COALESCE(
-      JSON_VALUE(document_data, '$.accountState.loyaltyTier'),
-      'NONE'
-    )) AS loyalty_tier,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.accountState.accountAgeDays') AS INT64),
-      180
-    )) AS account_age_days,
-    ANY_VALUE(JSON_VALUE(document_data, '$.shippingAddress.city')) AS location_city,
-    ANY_VALUE(JSON_VALUE(document_data, '$.shippingAddress.countryCode')) AS location_country,
-
-    -- Transactional Data
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.transactionalMetrics.totalSpend90d') AS FLOAT64),
-      grand_total
-    )) AS total_spend_90d,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.transactionalMetrics.lifetimeSpend') AS FLOAT64),
-      grand_total
-    )) AS lifetime_spend,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.transactionalMetrics.avgOrderValue') AS FLOAT64),
-      grand_total
-    )) AS avg_order_value,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.transactionalMetrics.purchaseFrequencyMonthly') AS FLOAT64),
-      1.0
-    )) AS purchase_frequency_monthly,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.transactionalMetrics.daysSinceLastPurchase') AS INT64),
-      15
-    )) AS days_since_last_purchase,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.transactionalMetrics.ordersCountLast12m') AS INT64),
-      1
-    )) AS orders_count_last_12m,
-
-    -- Engagement & Activity
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.engagement.loginFrequencyMonthly') AS INT64),
-      10
-    )) AS login_frequency_monthly,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.engagement.avgSessionDurationMinutes') AS FLOAT64),
-      8.5
-    )) AS avg_session_duration_minutes,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.engagement.appEngagementScore') AS FLOAT64),
-      0.50
-    )) AS app_engagement_score,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.engagement.appSessionsLast30d') AS INT64),
-      10
-    )) AS app_sessions_last_30d,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.engagement.cartAbandonmentCount') AS INT64),
-      0
-    )) AS cart_abandonment_count,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.engagement.abandonedCartValue90d') AS FLOAT64),
-      0.0
-    )) AS abandoned_cart_value_90d,
-
-    -- Customer Support & Satisfaction
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.supportMetrics.supportTicketsCount') AS INT64),
-      0
-    )) AS support_tickets_count,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.supportMetrics.openSupportTicketsCount') AS INT64),
-      0
-    )) AS open_support_tickets_count,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.supportMetrics.complaintsCount') AS INT64),
-      0
-    )) AS complaints_count,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.supportMetrics.returnFrequency') AS INT64),
-      0
-    )) AS return_frequency,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.supportMetrics.returnRatePercent') AS FLOAT64),
-      0.0
-    )) AS return_rate_percent,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.supportMetrics.sentimentScore') AS FLOAT64),
-      SAFE_CAST(JSON_VALUE(document_data, '$.customerFeedback.sentimentScore') AS FLOAT64),
-      0.50
-    )) AS sentiment_score,
-    ANY_VALUE(COALESCE(
-      SAFE_CAST(JSON_VALUE(document_data, '$.customerFeedback.rating') AS INT64),
-      4
-    )) AS feedback_rating
-
-  FROM
-    `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_CDC_TABLE}`
-  WHERE
-    COALESCE(customer_id, JSON_VALUE(document_data, '$.customerId')) IS NOT NULL
-  GROUP BY
-    customer_id
-)
+-- -----------------------------------------------------------------------------
+-- 1. Order facts.
+--
+-- One row per live order. Reads the CDC mirror, which already reflects deletes,
+-- so cancelled-and-removed orders do not linger in the feature set. Rows with
+-- no customer or no order date cannot contribute to a per-customer time series
+-- and are dropped here rather than being silently coalesced to a default.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.order_facts` AS
 SELECT
-  *,
-  -- Business Rule: Calculate ground-truth is_churned label directly in BigQuery
-  -- A customer is classified as churned if:
-  --   1) Inactivity >= 60 days AND exhibiting severe engagement drop (<= 3 logins/mo OR >= 3 cart abandonments OR >= 15% return rate)
-  --   2) Or high complaint volume with negative sentiment (>= 2 complaints AND sentiment_score < -0.30)
-  CASE
-    WHEN days_since_last_purchase >= 60 
-      AND (login_frequency_monthly <= 3 OR cart_abandonment_count >= 3 OR return_rate_percent >= 15.0)
-      THEN 1
-    WHEN complaints_count >= 2 AND sentiment_score < -0.30
-      THEN 1
-    ELSE 0
-  END AS is_churned
-FROM
-  customer_raw_features;
-
-
--- ------------------------------------------------------------------------------
--- 2. Train BigQuery ML Logistic Regression Model (`${BIGQUERY_CHURN_MODEL}`)
--- Uses L2 regularization, class balancing, and automated feature preprocessing.
--- ------------------------------------------------------------------------------
-CREATE OR REPLACE MODEL `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_CHURN_MODEL}`
-OPTIONS(
-  model_type = 'logistic_reg',
-  input_label_cols = ['is_churned'],
-  auto_class_weights = TRUE,
-  data_split_method = 'AUTO_SPLIT',
-  l2_reg = 0.1,
-  max_iterations = 25,
-  enable_global_explain = TRUE
-) AS
-SELECT
-  -- Transactional Features
-  total_spend_90d,
-  days_since_last_purchase,
-  avg_order_value,
-  purchase_frequency_monthly,
-  orders_count_last_12m,
-  -- Engagement & Activity Features
+  customer_id,
+  order_id,
+  DATE(created_at)                        AS order_date,
+  created_at,
+  customer_name,
+  customer_email,
+  customer_segment,
+  loyalty_tier,
+  is_loyalty_member,
+  account_age_days,
+  order_status,
+  payment_status,
+  grand_total,
+  profit_margin,
+  -- Point-in-time behavioural readings carried on each order. They describe
+  -- the customer as at the moment the order was placed, which is what makes
+  -- them safe to use as features once windowed against a cutoff.
   login_frequency_monthly,
   avg_session_duration_minutes,
   app_engagement_score,
   cart_abandonment_count,
   abandoned_cart_value_90d,
-  -- Customer Support & Satisfaction Features
   support_tickets_count,
   open_support_tickets_count,
   complaints_count,
   return_rate_percent,
   sentiment_score,
-  feedback_rating,
-  -- Demographics & Account State Features
-  is_loyalty_member,
-  loyalty_tier,
-  account_age_days,
-  customer_segment,
-  location_country,
-  -- Target Label
-  is_churned
-FROM
-  `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_HISTORICAL_VIEW}`;
+  has_active_complaint,
+  feedback_rating
+FROM `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_ORDERS_TABLE}`
+WHERE customer_id IS NOT NULL
+  AND created_at IS NOT NULL
+  -- A cancelled order is not evidence of engagement, and counting it as a
+  -- purchase would mask exactly the disengagement we are trying to detect.
+  AND COALESCE(order_status, '') != 'CANCELLED';
 
 
--- ------------------------------------------------------------------------------
--- 3. Model Evaluation: Comprehensive Performance Metrics
--- Returns Precision, Recall, Accuracy, F1-score, Log Loss, and ROC AUC
--- ------------------------------------------------------------------------------
-SELECT
-  *
-FROM
-  ML.EVALUATE(
-    MODEL `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_CHURN_MODEL}`,
-    (
-      SELECT * FROM `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_HISTORICAL_VIEW}`
+-- -----------------------------------------------------------------------------
+-- 2. Feature table function.
+--
+-- Everything here is filtered to `order_date <= as_of`. That single predicate
+-- is what makes the features honest: called with a past cutoff it reconstructs
+-- what was knowable then, and called with CURRENT_DATE it produces the live
+-- feature vector. Training and inference therefore run identical code.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE TABLE FUNCTION
+  `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.customer_features`(as_of DATE) AS (
+  WITH
+  visible_orders AS (
+    SELECT *
+    FROM `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.order_facts`
+    WHERE order_date <= as_of
+  ),
+
+  -- The most recent order per customer supplies the identity and behavioural
+  -- readings. ROW_NUMBER rather than ANY_VALUE: the old view grouped by
+  -- customer and wrapped every column in ANY_VALUE(), so each feature could
+  -- come from a different order and the resulting row described no actual
+  -- point in time. Ties are broken on order_id to keep runs reproducible.
+  latest_order AS (
+    SELECT * EXCEPT(rn)
+    FROM (
+      SELECT
+        o.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY customer_id
+          ORDER BY created_at DESC, order_id DESC
+        ) AS rn
+      FROM visible_orders o
     )
-  );
+    WHERE rn = 1
+  ),
 
--- Confusion Matrix
+  aggregates AS (
+    SELECT
+      customer_id,
+      COUNT(*)                                        AS orders_lifetime,
+      SUM(grand_total)                                AS spend_lifetime,
+      AVG(grand_total)                                AS avg_order_value,
+      STDDEV_SAMP(grand_total)                        AS stddev_order_value,
+      MIN(order_date)                                 AS first_order_date,
+      MAX(order_date)                                 AS last_order_date,
+      AVG(profit_margin)                              AS avg_profit_margin,
+
+      COUNTIF(order_date > DATE_SUB(as_of, INTERVAL 90 DAY))   AS orders_90d,
+      COUNTIF(order_date > DATE_SUB(as_of, INTERVAL 180 DAY))  AS orders_180d,
+      COUNTIF(order_date > DATE_SUB(as_of, INTERVAL 365 DAY))  AS orders_365d,
+
+      SUM(IF(order_date > DATE_SUB(as_of, INTERVAL 90 DAY), grand_total, 0))  AS spend_90d,
+      SUM(IF(order_date > DATE_SUB(as_of, INTERVAL 365 DAY), grand_total, 0)) AS spend_365d,
+
+      -- The 90 days before the trailing 90, used to express direction of
+      -- travel. A customer spending steadily and one winding down can look
+      -- identical on a single window.
+      SUM(IF(order_date <= DATE_SUB(as_of, INTERVAL 90 DAY)
+             AND order_date > DATE_SUB(as_of, INTERVAL 180 DAY),
+             grand_total, 0))                         AS spend_prior_90d,
+      COUNTIF(order_date <= DATE_SUB(as_of, INTERVAL 90 DAY)
+              AND order_date > DATE_SUB(as_of, INTERVAL 180 DAY)) AS orders_prior_90d,
+
+      AVG(IF(order_date > DATE_SUB(as_of, INTERVAL 180 DAY), sentiment_score, NULL))
+                                                      AS avg_sentiment_180d,
+      AVG(IF(order_date > DATE_SUB(as_of, INTERVAL 180 DAY), feedback_rating, NULL))
+                                                      AS avg_rating_180d,
+      COUNTIF(has_active_complaint)                   AS complaint_orders_lifetime
+    FROM visible_orders
+    GROUP BY customer_id
+  )
+
+  SELECT
+    a.customer_id,
+
+    -- Identity and segmentation
+    l.customer_name,
+    l.customer_email,
+    l.customer_segment,
+    l.loyalty_tier,
+    COALESCE(l.is_loyalty_member, FALSE)              AS is_loyalty_member,
+    l.account_age_days,
+
+    -- Recency / frequency / monetary
+    DATE_DIFF(as_of, a.last_order_date, DAY)          AS days_since_last_purchase,
+    DATE_DIFF(as_of, a.first_order_date, DAY)         AS tenure_days,
+    a.orders_lifetime,
+    a.orders_90d,
+    a.orders_180d,
+    a.orders_365d,
+    a.spend_lifetime,
+    a.spend_90d,
+    a.spend_365d,
+    a.avg_order_value,
+    COALESCE(a.stddev_order_value, 0.0)               AS stddev_order_value,
+    a.avg_profit_margin,
+
+    -- Average gap between orders so far. Undefined for a single order, which
+    -- is left NULL rather than filled with a number that would imply a cadence
+    -- we have not observed.
+    SAFE_DIVIDE(
+      DATE_DIFF(a.last_order_date, a.first_order_date, DAY),
+      NULLIF(a.orders_lifetime - 1, 0)
+    )                                                 AS avg_interpurchase_days,
+
+    -- Silence measured in units of that customer's own rhythm. Thirty days
+    -- quiet means nothing for a quarterly buyer and a great deal for a weekly
+    -- one, so the absolute recency above cannot separate them.
+    SAFE_DIVIDE(
+      DATE_DIFF(as_of, a.last_order_date, DAY),
+      NULLIF(SAFE_DIVIDE(
+        DATE_DIFF(a.last_order_date, a.first_order_date, DAY),
+        NULLIF(a.orders_lifetime - 1, 0)
+      ), 0)
+    )                                                 AS recency_vs_cadence,
+
+    -- Direction of travel. Below 1.0 means the customer is winding down.
+    SAFE_DIVIDE(a.spend_90d, NULLIF(a.spend_prior_90d, 0))   AS spend_trend_ratio,
+    SAFE_DIVIDE(a.orders_90d, NULLIF(a.orders_prior_90d, 0)) AS order_trend_ratio,
+
+    -- Engagement and support, as last observed at or before the cutoff.
+    l.login_frequency_monthly,
+    l.avg_session_duration_minutes,
+    l.app_engagement_score,
+    l.cart_abandonment_count,
+    l.abandoned_cart_value_90d,
+    l.support_tickets_count,
+    l.open_support_tickets_count,
+    l.complaints_count,
+    l.return_rate_percent,
+    a.avg_sentiment_180d                              AS sentiment_score,
+    a.avg_rating_180d,
+    a.complaint_orders_lifetime,
+
+    as_of                                             AS feature_as_of_date
+  FROM aggregates a
+  JOIN latest_order l USING (customer_id)
+);
+
+
+-- -----------------------------------------------------------------------------
+-- 3. Label table function.
+--
+-- Churn is "bought nothing in the horizon following the cutoff". This is the
+-- only place the future is consulted, and the feature function above never
+-- reaches past `as_of`, so the two windows cannot overlap.
+--
+-- Only customers with a purchase history at the cutoff get a label; a customer
+-- whose first order arrives after the cutoff cannot meaningfully be said to
+-- have churned at it.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE TABLE FUNCTION
+  `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.customer_churn_labels`(
+    as_of DATE, horizon_days INT64
+  ) AS (
+  SELECT
+    customer_id,
+    IF(
+      COUNTIF(
+        order_date > as_of
+        AND order_date <= DATE_ADD(as_of, INTERVAL horizon_days DAY)
+      ) > 0,
+      0, 1
+    )                                                 AS is_churned,
+    COUNTIF(
+      order_date > as_of
+      AND order_date <= DATE_ADD(as_of, INTERVAL horizon_days DAY)
+    )                                                 AS orders_in_horizon
+  FROM `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.order_facts`
+  GROUP BY customer_id
+  HAVING COUNTIF(order_date <= as_of) > 0
+);
+
+
+-- -----------------------------------------------------------------------------
+-- 4. Training set.
+--
+-- The cutoff sits one horizon back from today so the outcome window has fully
+-- elapsed; scoring a horizon that has not finished yet would label
+-- still-active customers as churned purely because the clock has not run out.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW
+  `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.customer_churn_training_data` AS
+WITH cutoff AS (
+  SELECT DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY) AS as_of
+)
 SELECT
+  f.*,
+  l.is_churned,
+  l.orders_in_horizon
+FROM cutoff c
+CROSS JOIN `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.customer_features`(
+  (SELECT as_of FROM cutoff)
+) f
+JOIN `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.customer_churn_labels`(
+  (SELECT as_of FROM cutoff), 90
+) l
+USING (customer_id);
+
+
+-- -----------------------------------------------------------------------------
+-- 5. Live feature view, kept under the historical name so existing readers and
+--    the loyalty agent do not have to change.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW
+  `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_HISTORICAL_VIEW}` AS
+SELECT *
+FROM `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.customer_features`(CURRENT_DATE());
+
+
+-- -----------------------------------------------------------------------------
+-- 6. The model.
+--
+-- Logistic regression, for a demo where an explainable coefficient per feature
+-- is worth more than a couple of points of AUC. Identity columns are excluded:
+-- customer_id, name and email are unique per row and would let a tree-based
+-- learner memorise, and carry no signal for a regression either.
+--
+-- auto_class_weights is on because the classes are unbalanced (roughly 29%
+-- churn); without it the model can score well by predicting "retained" for
+-- everyone, which is precisely the customer it exists to catch.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE MODEL `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_CHURN_MODEL}`
+OPTIONS (
+  model_type              = 'LOGISTIC_REG',
+  input_label_cols        = ['is_churned'],
+  auto_class_weights      = TRUE,
+  data_split_method       = 'RANDOM',
+  data_split_eval_fraction = 0.2,
+  l2_reg                  = 0.1,
+  max_iterations          = 50,
+  early_stop              = TRUE,
+  enable_global_explain   = TRUE
+) AS
+SELECT * EXCEPT (
+  customer_id,
+  customer_name,
+  customer_email,
+  feature_as_of_date,
+  -- Dropped: this counts the very purchases the label is defined on.
+  orders_in_horizon
+)
+FROM `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.customer_churn_training_data`;
+
+
+-- -----------------------------------------------------------------------------
+-- 7. Evaluation, persisted so a regression is visible rather than buried in a
+--    job history. Worth reading after every run: a near-perfect score on a
+--    problem like this is evidence of leakage, not of a good model.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE TABLE
+  `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.customer_churn_model_evaluation` AS
+SELECT
+  CURRENT_TIMESTAMP() AS evaluated_at,
   *
-FROM
-  ML.CONFUSION_MATRIX(
-    MODEL `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_CHURN_MODEL}`,
-    (
-      SELECT * FROM `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_HISTORICAL_VIEW}`
-    )
-  );
-
--- ROC Curve and Threshold Tradeoffs
-SELECT
-  *
-FROM
-  ML.ROC_CURVE(
-    MODEL `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_CHURN_MODEL}`,
-    (
-      SELECT * FROM `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_HISTORICAL_VIEW}`
-    )
-  );
+FROM ML.EVALUATE(
+  MODEL `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_CHURN_MODEL}`
+);
 
 
--- ------------------------------------------------------------------------------
--- 4. Model Explainability: Global Feature Importance & Weights
--- Identifies top factors influencing customer churn predictions
--- ------------------------------------------------------------------------------
-SELECT
-  feature,
-  attribution
-FROM
-  ML.GLOBAL_EXPLAIN(MODEL `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_CHURN_MODEL}`)
-ORDER BY
-  attribution DESC;
-
--- Raw Logistic Regression Feature Weights
-SELECT
-  processed_input,
-  weight,
-  category_weights
-FROM
-  ML.WEIGHTS(MODEL `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_CHURN_MODEL}`)
-ORDER BY
-  ABS(weight) DESC;
-
-
--- ------------------------------------------------------------------------------
--- 5. Batch Churn Inference Table Materialization (`customer_churn_risk`)
--- Materializes daily baseline predictions to eliminate OLTP login latency (SDD Section 1.2)
--- ------------------------------------------------------------------------------
-CREATE OR REPLACE TABLE `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.customer_churn_risk`
-PARTITION BY DATE(calculation_timestamp)
-CLUSTER BY customer_id, churn_risk_tier
-AS
-WITH customer_predictions AS (
+-- -----------------------------------------------------------------------------
+-- 8. Score every customer and merge into the serving table.
+--
+-- MERGE rather than CREATE OR REPLACE TABLE. The previous script replaced the
+-- table outright, which dropped the schema, partitioning and clustering that
+-- Terraform had declared; the drift was hidden behind an ignore_changes block
+-- rather than fixed. A merge leaves the table definition alone and keeps
+-- exactly one current row per customer, which is what the agent reads.
+-- -----------------------------------------------------------------------------
+MERGE `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.customer_churn_risk` AS target
+USING (
   SELECT
     customer_id,
     customer_name,
@@ -270,63 +365,91 @@ WITH customer_predictions AS (
     customer_segment,
     loyalty_tier,
     predicted_is_churned,
-    prob.prob AS churn_probability,
+    churn_probability,
+    CASE
+      WHEN churn_probability >= 0.80 THEN 'CRITICAL'
+      WHEN churn_probability >= 0.60 THEN 'HIGH'
+      WHEN churn_probability >= 0.40 THEN 'MODERATE'
+      ELSE 'LOW'
+    END AS churn_risk_tier,
     total_spend_90d,
     days_since_last_purchase,
     cart_abandonment_count,
     support_tickets_count,
-    sentiment_score
-  FROM
-    ML.PREDICT(
+    sentiment_score,
+    -- The intervention is chosen from value as well as risk: a high-risk
+    -- customer who spends little does not justify the same concession as one
+    -- who spends a lot, and the agent uses this as a starting recommendation.
+    CASE
+      WHEN churn_probability >= 0.80 AND total_spend_90d >= 5000
+        THEN 'EXECUTIVE_OUTREACH_PLUS_TIER_UPGRADE'
+      WHEN churn_probability >= 0.80
+        THEN 'HIGH_VALUE_RETENTION_OFFER'
+      WHEN churn_probability >= 0.60 AND cart_abandonment_count >= 3
+        THEN 'CART_RECOVERY_INCENTIVE'
+      WHEN churn_probability >= 0.60
+        THEN 'TARGETED_LOYALTY_DISCOUNT'
+      WHEN churn_probability >= 0.40
+        THEN 'ENGAGEMENT_CAMPAIGN'
+      ELSE 'MONITOR_ONLY'
+    END AS automated_retention_action,
+    CURRENT_TIMESTAMP() AS calculation_timestamp
+  FROM (
+    SELECT
+      f.customer_id,
+      f.customer_name,
+      f.customer_email,
+      f.customer_segment,
+      f.loyalty_tier,
+      f.spend_90d                       AS total_spend_90d,
+      f.days_since_last_purchase,
+      f.cart_abandonment_count,
+      f.support_tickets_count,
+      f.sentiment_score,
+      p.predicted_is_churned,
+      -- ML.PREDICT returns one probability per class; pick the positive one
+      -- explicitly rather than relying on array ordering.
+      (
+        SELECT prob
+        FROM UNNEST(p.predicted_is_churned_probs)
+        WHERE label = 1
+      )                                 AS churn_probability
+    FROM ML.PREDICT(
       MODEL `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_CHURN_MODEL}`,
-      (SELECT * FROM `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_HISTORICAL_VIEW}`)
-    ),
-    UNNEST(predicted_is_churned_probs) AS prob
-  WHERE
-    prob.label = 1
-)
-SELECT
-  customer_id,
-  customer_name,
-  customer_email,
-  customer_segment,
-  loyalty_tier,
-  predicted_is_churned,
-  ROUND(churn_probability, 4) AS churn_probability,
-  CASE
-    WHEN churn_probability >= 0.75 THEN 'CRITICAL'
-    WHEN churn_probability >= 0.50 THEN 'HIGH'
-    WHEN churn_probability >= 0.25 THEN 'MODERATE'
-    ELSE 'LOW'
-  END AS churn_risk_tier,
-  total_spend_90d,
-  days_since_last_purchase,
-  cart_abandonment_count,
-  support_tickets_count,
-  sentiment_score,
-  CASE
-    WHEN churn_probability >= 0.75 THEN '🚨 CRITICAL: Trigger 25% Instant Retention Code + Priority AM Outreach'
-    WHEN churn_probability >= 0.50 THEN '⚠️ HIGH RISK: Dispatch Free Express Shipping Voucher'
-    WHEN churn_probability >= 0.25 THEN '🟡 MODERATE: Send Personalized Re-engagement Newsletter'
-    ELSE '🟢 HEALTHY: Standard Loyalty Nurturing'
-  END AS automated_retention_action,
-  CURRENT_TIMESTAMP() AS calculation_timestamp
-FROM
-  customer_predictions;
-
--- Verification query: Inspect high-priority retention targets
-SELECT
-  customer_id,
-  customer_name,
-  loyalty_tier,
-  churn_probability,
-  churn_risk_tier,
-  automated_retention_action,
+      TABLE `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_HISTORICAL_VIEW}`
+    ) AS p
+    JOIN `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.${BIGQUERY_HISTORICAL_VIEW}` AS f
+      USING (customer_id)
+  )
+) AS source
+ON target.customer_id = source.customer_id
+WHEN MATCHED THEN UPDATE SET
+  customer_name              = source.customer_name,
+  customer_email             = source.customer_email,
+  customer_segment           = source.customer_segment,
+  loyalty_tier               = source.loyalty_tier,
+  predicted_is_churned       = source.predicted_is_churned,
+  churn_probability          = source.churn_probability,
+  churn_risk_tier            = source.churn_risk_tier,
+  total_spend_90d            = source.total_spend_90d,
+  days_since_last_purchase   = source.days_since_last_purchase,
+  cart_abandonment_count     = source.cart_abandonment_count,
+  support_tickets_count      = source.support_tickets_count,
+  sentiment_score            = source.sentiment_score,
+  automated_retention_action = source.automated_retention_action,
+  calculation_timestamp      = source.calculation_timestamp
+WHEN NOT MATCHED THEN INSERT (
+  customer_id, customer_name, customer_email, customer_segment, loyalty_tier,
+  predicted_is_churned, churn_probability, churn_risk_tier,
+  total_spend_90d, days_since_last_purchase, cart_abandonment_count,
+  support_tickets_count, sentiment_score, automated_retention_action,
   calculation_timestamp
-FROM
-  `${GCP_PROJECT_ID}.${BIGQUERY_DATASET}.customer_churn_risk`
-ORDER BY
-  churn_probability DESC
-LIMIT 100;
-
-
+) VALUES (
+  source.customer_id, source.customer_name, source.customer_email,
+  source.customer_segment, source.loyalty_tier,
+  source.predicted_is_churned, source.churn_probability, source.churn_risk_tier,
+  source.total_spend_90d, source.days_since_last_purchase,
+  source.cart_abandonment_count, source.support_tickets_count,
+  source.sentiment_score, source.automated_retention_action,
+  source.calculation_timestamp
+);

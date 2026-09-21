@@ -2,13 +2,19 @@
 Decoding for Firestore document events delivered over Eventarc.
 
 Eventarc delivers ``google.cloud.firestore.document.v1.*`` events whose payload
-is a ``DocumentEventData`` message. We request ``application/json`` on the
-trigger, so the body arrives as the protojson encoding of that message rather
-than as binary protobuf. That keeps the service free of the ``google-events``
-protobuf dependency, at the cost of having to unwrap Firestore's tagged
-``Value`` union ourselves, which is what this module does.
+is a ``DocumentEventData`` message. Firestore sources accept only
+``application/protobuf``: setting ``application/json`` on the trigger is
+rejected at creation time with a ``trigger.event_data_content_type`` field
+violation, so the binary encoding is not a choice.
 
-The shape we receive looks like::
+The body is parsed with the generated message and then converted to its
+protojson form, which is the shape the rest of this module works in. Going via
+the dict rather than reading protobuf fields directly keeps the decoding rules
+in one place, lets the self-test build fixtures by hand without constructing
+protobufs, and means a body that does arrive as JSON is handled by the same
+path.
+
+The normalised shape looks like::
 
     {
       "oldValue": { ... Document ... },
@@ -33,8 +39,12 @@ where Firestore reports a no-op write.
 from __future__ import annotations
 
 import base64
+import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # Event types Eventarc emits for Firestore. The ``.withAuthContext`` variants
 # carry the same payload under an extra wrapper, which we do not subscribe to.
@@ -50,6 +60,43 @@ _OPERATION_BY_EVENT = {
     EVENT_UPDATED: "update",
     EVENT_DELETED: "delete",
 }
+
+
+def parse_event_body(body: bytes, content_type: Optional[str]) -> Dict[str, Any]:
+    """Normalise a raw Eventarc request body into the protojson dict shape.
+
+    Handles both wire formats. Content type is only a hint: a body that starts
+    with ``{`` is treated as JSON regardless of what the header claims, because
+    a mislabelled body is easier to recover from than to diagnose.
+    """
+    if not body:
+        return {}
+
+    looks_like_json = body.lstrip()[:1] in (b"{", b"[")
+    wants_json = bool(content_type and "json" in content_type.lower())
+
+    if looks_like_json or wants_json:
+        try:
+            return json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            if looks_like_json:
+                raise
+            # Header said JSON but the bytes are not; fall through to protobuf.
+
+    from google.events.cloud import firestore_v1
+    from google.protobuf.json_format import MessageToDict
+
+    event_data = firestore_v1.DocumentEventData()
+    # The proto-plus wrapper does not expose ParseFromString, so go through the
+    # underlying protobuf message.
+    type(event_data).pb(event_data).ParseFromString(body)
+
+    # MessageToDict produces exactly the protojson encoding: lowerCamelCase
+    # keys, int64 rendered as strings, timestamps as RFC 3339 strings.
+    return MessageToDict(
+        type(event_data).pb(event_data),
+        preserving_proto_field_name=False,
+    )
 
 
 def _parse_timestamp(raw: Optional[str]) -> Optional[datetime]:
