@@ -30,13 +30,23 @@ def _require_project_id() -> str:
     This used to default to a specific project id, which meant a misconfigured
     environment silently read and wrote someone else's Firestore and BigQuery
     instead of failing.
+
+    GOOGLE_CLOUD_PROJECT is included because Google-managed runtimes set it
+    themselves. Without it the agent could not start on Agent Engine at all:
+    config is built at import time, there is no .env in that runtime, and the
+    failure surfaces as an unexplained "failed to start and cannot serve
+    traffic" on the deployment call.
     """
-    project = os.getenv("GCP_PROJECT_ID") or os.getenv("GCP_PROJECT")
+    project = (
+        os.getenv("GCP_PROJECT_ID")
+        or os.getenv("GCP_PROJECT")
+        or os.getenv("GOOGLE_CLOUD_PROJECT")
+    )
     if not project:
         raise ConfigurationError(
             "No Google Cloud project configured. Set GCP_PROJECT_ID (or "
-            "GCP_PROJECT) in the environment or in the .env file at the "
-            "repository root."
+            "GCP_PROJECT, or GOOGLE_CLOUD_PROJECT) in the environment or in "
+            "the .env file at the repository root."
         )
     return project
 

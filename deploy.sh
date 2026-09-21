@@ -28,6 +28,7 @@ RUN_AGENT=false
 BUILD_AGENT_IMAGE=false
 TEST_AGENT_RUNTIME=false
 SKIP_IMAGE_BUILD=false
+SKIP_AGENT_DEPLOY=false
 
 usage() {
   cat <<EOF
@@ -43,7 +44,8 @@ Options:
                            demo personas are seeded in addition to this count.
   --skip-seed              Skip generating synthetic transactions into Firestore.
   --skip-bqml              Skip training and evaluating BigQuery ML churn models.
-  --skip-image-build       Reuse the CDC container already in Artifact Registry.
+  --skip-image-build       Reuse the container images already in Artifact Registry.
+  --skip-agent-deploy      Leave the deployed loyalty agent as it is.
   --dry-run                Validate configuration and run Terraform plan without modifying GCP resources.
   -t, --teardown, --destroy Cleanly tear down all provisioned GCP infrastructure and stop jobs.
   -y, --auto-approve       Skip confirmation prompts during deployment or teardown.
@@ -90,6 +92,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-image-build)
       SKIP_IMAGE_BUILD=true
+      shift
+      ;;
+    --skip-agent-deploy)
+      SKIP_AGENT_DEPLOY=true
       shift
       ;;
     --dry-run)
@@ -155,8 +161,13 @@ if [[ "$CREATE_PROJECT" == true ]]; then
       exit 0
     fi
   else
+    # An `if` for the same reason as the Terraform output reporting below:
+    # under `set -e` the `&&` form exits the script whenever the test is false,
+    # which here means every run that did not pass --yes.
     APPROVE_FLAG=""
-    [[ "$AUTO_APPROVE" == true ]] && APPROVE_FLAG="-auto-approve"
+    if [[ "$AUTO_APPROVE" == true ]]; then
+      APPROVE_FLAG="-auto-approve"
+    fi
     echo "🏗️  Applying project creation..."
     terraform -chdir="$TERRAFORM_DIR/bootstrap" apply $APPROVE_FLAG
 
@@ -287,16 +298,21 @@ export PYTHON_EXEC
 # the same packages the install line provides, so a partially provisioned venv
 # is repaired rather than silently accepted.
 "$PYTHON_EXEC" -c "
-import dotenv, pydantic, setuptools, vertexai
+import cloudpickle, dotenv, pydantic, setuptools, vertexai
 import google.auth, google.cloud.firestore, google.cloud.bigquery
 import google.cloud.bigquery_storage
 " 2>/dev/null || {
   echo "📦 Installing required Python dependencies inside virtual environment..."
+  # cloudpickle is what Agent Engine uses to serialise the agent object, but
+  # the base google-cloud-aiplatform install does not pull it in, so step 5
+  # fails on a fresh virtual environment without it. It is what the
+  # [agent_engines] extra would add.
   "$PYTHON_EXEC" -m pip install -q \
     "google-cloud-firestore>=2.20.0" \
     "google-cloud-bigquery>=3.25.0" \
     "google-cloud-bigquery-storage>=2.25.0" \
     "google-cloud-aiplatform>=1.60.0" \
+    "cloudpickle>=3.0.0" \
     "python-dotenv>=1.0.0" \
     "pydantic>=2.0.0" \
     "protobuf>=4.25.0" \
@@ -415,15 +431,14 @@ fi
 # ------------------------------------------------------------------------------
 # 4. TERRAFORM PROVISIONING
 # ------------------------------------------------------------------------------
-echo -e "\n🔨 Step 1/5: Building the CDC container..."
+echo -e "\n🔨 Step 1/6: Building the service containers..."
 
-# Terraform cannot create the Cloud Run service until this image exists, so the
-# build has to come first rather than alongside.
+# Terraform cannot create either Cloud Run service until its image exists, so
+# the builds have to come first rather than alongside.
 CDC_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/redwood-cdc:latest"
+BRIDGE_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/redwood-agent-bridge:latest"
 
-if [[ "$SKIP_IMAGE_BUILD" == true ]]; then
-  echo "⏭️  Reusing existing image ($CDC_IMAGE)."
-else
+ensure_repository() {
   gcloud services enable cloudbuild.googleapis.com artifactregistry.googleapis.com \
     --project="$GCP_PROJECT_ID" &>/dev/null || true
 
@@ -435,27 +450,55 @@ else
       --project="$GCP_PROJECT_ID" \
       --description="Redwood Retail pipeline and agent images"
   fi
-
-  gcloud builds submit "$REDWOOD_DIR/cdc_service" \
-    --tag="$CDC_IMAGE" --project="$GCP_PROJECT_ID" --region="$GCP_REGION"
-  echo "✅ CDC container published: $CDC_IMAGE"
-fi
+}
 
 # Resolve the tag to a digest and deploy that instead. Terraform compares the
-# image string, so redeploying ":latest" after a rebuild is a no-op plan and
-# the service carries on serving the image the revision was first created with.
-# Passing the digest makes a rebuild an actual change.
-CDC_IMAGE_DIGEST=$(gcloud artifacts docker images describe "$CDC_IMAGE" \
-  --format='value(image_summary.digest)' --project="$GCP_PROJECT_ID" 2>/dev/null || true)
-if [[ -n "$CDC_IMAGE_DIGEST" ]]; then
-  export TF_VAR_cdc_image_digest="$CDC_IMAGE_DIGEST"
-  echo "   Pinned digest: $CDC_IMAGE_DIGEST"
+# image string, so redeploying ":latest" after a rebuild is a no-op plan and the
+# service carries on serving the image the revision was first created with.
+# Passing the digest makes a rebuild an actual change. This bit us once already:
+# the CDC service served a stale revision while :latest had moved on, and every
+# event failed against the old code path.
+pin_digest() {
+  local image="$1" tf_var="$2" digest
+  digest=$(gcloud artifacts docker images describe "$image" \
+    --format='value(image_summary.digest)' --project="$GCP_PROJECT_ID" 2>/dev/null || true)
+  if [[ -n "$digest" ]]; then
+    export "$tf_var=$digest"
+    echo "   Pinned digest: $digest"
+  else
+    echo "⚠️  Could not resolve the digest for $image; falling back to the mutable tag."
+    echo "    A rebuilt image may not roll out until the service is redeployed."
+  fi
+}
+
+if [[ "$SKIP_IMAGE_BUILD" == true ]]; then
+  echo "⏭️  Reusing existing images."
 else
-  echo "⚠️  Could not resolve the image digest; falling back to the mutable tag."
-  echo "    A rebuilt image may not roll out until the service is redeployed."
+  ensure_repository
+
+  # The bridge shares the CDC service's Firestore event decoder, so its build
+  # context is the repository root rather than its own directory.
+  echo "   Building the CDC service..."
+  gcloud builds submit "$REDWOOD_DIR/cdc_service" \
+    --tag="$CDC_IMAGE" --project="$GCP_PROJECT_ID" --region="$GCP_REGION"
+
+  echo "   Building the agent bridge..."
+  gcloud builds submit "$REDWOOD_DIR" \
+    --config=/dev/stdin --project="$GCP_PROJECT_ID" --region="$GCP_REGION" <<EOF
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "$BRIDGE_IMAGE", "-f", "agent_bridge/Dockerfile", "."]
+images: ["$BRIDGE_IMAGE"]
+EOF
+
+  echo "✅ Containers published."
 fi
 
-echo -e "\n🚀 Step 2/5: Provisioning Infrastructure via Terraform..."
+pin_digest "$CDC_IMAGE" TF_VAR_cdc_image_digest
+pin_digest "$BRIDGE_IMAGE" TF_VAR_agent_bridge_image_digest
+
+
+echo -e "\n🚀 Step 2/6: Provisioning Infrastructure via Terraform..."
 
 # Pre-create Google-managed service identities so the IAM bindings below them
 # succeed on a first run. Eventarc in particular refuses to create a Firestore
@@ -472,14 +515,25 @@ terraform -chdir="$TERRAFORM_DIR" init
 terraform -chdir="$TERRAFORM_DIR" apply -auto-approve
 
 CDC_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw cdc_service_url 2>/dev/null || true)
+BRIDGE_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw agent_bridge_url 2>/dev/null || true)
+CHURN_SCHEDULE=$(terraform -chdir="$TERRAFORM_DIR" output -raw churn_schedule_name 2>/dev/null || true)
 echo "✅ Terraform infrastructure provisioning completed."
-[[ -n "$CDC_URL" ]] && echo "   CDC service: $CDC_URL"
+# Written as `if` rather than `[[ ... ]] && echo`: the latter evaluates to a
+# failed command when the variable is empty, and under `set -e` that ends the
+# run immediately after a successful apply. agent_bridge_url is empty whenever
+# the bridge is disabled, so this is reachable, not theoretical.
+if [[ -n "$CDC_URL" ]]; then
+  echo "   CDC service:  $CDC_URL"
+fi
+if [[ -n "$BRIDGE_URL" ]]; then
+  echo "   Agent bridge: $BRIDGE_URL"
+fi
 
 # ------------------------------------------------------------------------------
 # 5. DATA SEEDING (SYNTHETIC TRANSACTIONS)
 # ------------------------------------------------------------------------------
 if [[ "$SKIP_SEED" != true ]]; then
-  echo -e "\n📦 Step 3/5: Seeding customers and order histories into Firestore..."
+  echo -e "\n📦 Step 3/6: Seeding customers and order histories into Firestore..."
   "$PYTHON_EXEC" "$REDWOOD_DIR/generate_retail_dataset.py" \
     --count "$SEED_COUNT" \
     --workers 4 \
@@ -560,7 +614,7 @@ except Exception:
   echo "✅ $ROW_COUNT orders in $BIGQUERY_DATASET.$BIGQUERY_ORDERS_TABLE."
 
 else
-  echo -e "\n⏭️  Step 3/5: Skipping seeding (--skip-seed requested)."
+  echo -e "\n⏭️  Step 3/6: Skipping seeding (--skip-seed requested)."
 fi
 
 # ------------------------------------------------------------------------------
@@ -578,13 +632,31 @@ if [[ "$SKIP_BQML" != true ]]; then
     echo "    Then re-run:"
     echo "      $PYTHON_EXEC $REDWOOD_DIR/run_bigquery_analysis.py --execute --report"
   else
-    echo -e "\n🧠 Step 4/5: Building feature views and training the churn model..."
+    echo -e "\n🧠 Step 4/6: Building feature views and training the churn model..."
     "$PYTHON_EXEC" "$REDWOOD_DIR/run_bigquery_analysis.py" --execute --report
     echo "✅ Churn pipeline completed."
   fi
 else
-  echo -e "\n⏭️  Step 4/5: Skipping churn model training (--skip-bqml requested)."
+  echo -e "\n⏭️  Step 4/6: Skipping churn model training (--skip-bqml requested)."
 fi
+
+# ------------------------------------------------------------------------------
+# 6.5 LOYALTY AGENT DEPLOYMENT
+# ------------------------------------------------------------------------------
+# This runs after Terraform because it stages through the bucket Terraform
+# creates, and after the churn pipeline so there are scores to read the first
+# time a session arrives. The bridge resolves the agent lazily on its first
+# request rather than at startup, so deploying the agent last does not leave
+# the bridge holding a dangling reference.
+if [[ "$SKIP_AGENT_DEPLOY" != true ]]; then
+  echo -e "\n🤖 Step 5/6: Deploying the loyalty agent to Agent Engine..."
+  echo "   This takes several minutes; the runtime builds an image from the agent package."
+  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" "$REDWOOD_DIR/scripts/deploy_agent_engine.py"
+  echo "✅ Loyalty agent deployed."
+else
+  echo -e "\n⏭️  Step 5/6: Skipping agent deployment (--skip-agent-deploy requested)."
+fi
+
 
 # ------------------------------------------------------------------------------
 # 7. DEPLOYMENT DASHBOARD & HEALTH SUMMARY
@@ -598,12 +670,20 @@ echo " Firestore DB:       $FIRESTORE_DATABASE_ID (Native Mode, Collection: $FIR
 echo " BigQuery Table:     $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE"
 echo " BigQuery Model:     $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CHURN_MODEL"
 echo " CDC Service:        ${CDC_URL:-not deployed}"
+echo " Agent Bridge:       ${BRIDGE_URL:-not deployed}"
+echo " Loyalty Agent:      ${AGENT_DISPLAY_NAME:-redwood-loyalty-agent} (Agent Engine, resolved by display name)"
+echo " Daily churn job:    ${CHURN_SCHEDULE:-see BigQuery scheduled queries}"
 echo "-----------------------------------------------------------------"
 echo " 🌐 Google Cloud Console Quick Links:"
 echo " • Cloud Run: https://console.cloud.google.com/run?project=$GCP_PROJECT_ID"
 echo " • Eventarc Triggers: https://console.cloud.google.com/eventarc/triggers?project=$GCP_PROJECT_ID"
+echo " • Agent Engine: https://console.cloud.google.com/vertex-ai/agents/agent-engines?project=$GCP_PROJECT_ID"
 echo " • BigQuery Studio: https://console.cloud.google.com/bigquery?project=$GCP_PROJECT_ID"
 echo " • Firestore Databases: https://console.cloud.google.com/firestore/databases?project=$GCP_PROJECT_ID"
 echo "-----------------------------------------------------------------"
+echo " To exercise the demo, write a customer_sessions document with"
+echo " customerId set and agentProcessingStatus set to PENDING. cust_demo2"
+echo " is scored CRITICAL and receives an offer; cust_demo1 is LOW and does"
+echo " not."
 echo " To clean up all resources later, run: ./teardown.sh"
 echo "================================================================="

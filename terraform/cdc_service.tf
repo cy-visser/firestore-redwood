@@ -281,7 +281,7 @@ resource "google_eventarc_trigger" "firestore_write" {
 }
 
 output "cdc_service_url" {
-  description = "Base URL of the CDC service. POST /admin/backfill to reconcile collections seeded before the triggers existed."
+  description = "Base URL of the CDC service. Reconcile collections seeded before the triggers existed with cdc_service/backfill.py."
   value       = google_cloud_run_v2_service.cdc.uri
 }
 

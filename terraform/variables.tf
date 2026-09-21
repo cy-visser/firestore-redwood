@@ -68,19 +68,6 @@ variable "firestore_collection" {
   default     = "retail"
 }
 
-variable "bigquery_predictions_table_id" {
-  description = "The BigQuery table for customer churn predictions."
-  type        = string
-  default     = "customer_churn_risk"
-}
-
-
-variable "reasoning_model" {
-  description = "The Gemini model for the autonomous agent reasoning engine. Must be available as a publisher model in var.region; verified live in europe-west4 on 2026-09-21."
-  type        = string
-  default     = "gemini-2.5-flash"
-}
-
 variable "demo_principal_ids" {
   description = "IAM service account IDs representing the demo client users. demo1-user is seeded as a healthy/low-churn customer, demo2-user as an at-risk/high-churn customer."
   type        = list(string)
@@ -99,51 +86,15 @@ variable "enable_security_rules" {
   default     = false
 }
 
-variable "enable_agent_engine" {
-  description = "Whether to deploy the Vertex AI Agent Engine (Reasoning Engine) via BYOC container (deprecated in favor of native Agent Runtime packaging)."
-  type        = bool
-  default     = false
-}
+# The container-based Agent Engine variables that used to live here configured
+# the six-engine A2A mesh and were removed with it. The single agent is
+# deployed from scripts/deploy_agent_engine.py, which ships the Python object
+# rather than a container, so there is no image tag, CPU or memory to set from
+# Terraform. Its display name is agent_display_name in agent_bridge.tf, where
+# the bridge that has to agree with it also lives.
+#
+# reasoning_model and bigquery_predictions_table_id were removed for a
+# different reason: no resource ever read either of them. The model is chosen
+# by the REASONING_MODEL environment variable in loyalty_agent/config.py, so a
+# Terraform variable appearing to control it was worse than having none.
 
-
-variable "agent_engine_display_name" {
-  description = "Display name for the Vertex AI Agent Engine."
-  type        = string
-  default     = "redwood-retention-orchestrator"
-}
-
-variable "agent_engine_description" {
-  description = "Description for the Vertex AI Agent Engine."
-  type        = string
-  default     = "Redwood Retail Multi-Agent Retention Platform powered by Vertex AI Agent Runtime and A2A protocol"
-}
-
-variable "agent_image_tag" {
-  description = "Container image tag for the Agent Runtime container image."
-  type        = string
-  default     = "latest"
-}
-
-variable "agent_min_instances" {
-  description = "Minimum number of Agent Runtime instances."
-  type        = number
-  default     = 1
-}
-
-variable "agent_max_instances" {
-  description = "Maximum number of Agent Runtime instances."
-  type        = number
-  default     = 5
-}
-
-variable "agent_cpu" {
-  description = "CPU allocation for the Agent Runtime container."
-  type        = string
-  default     = "2"
-}
-
-variable "agent_memory" {
-  description = "Memory allocation for the Agent Runtime container."
-  type        = string
-  default     = "4Gi"
-}
