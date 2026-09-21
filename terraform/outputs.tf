@@ -134,3 +134,12 @@ output "event_bridge_url" {
   value       = var.enable_event_bridge ? google_cloud_run_v2_service.event_bridge[0].uri : "DISABLED"
 }
 
+# Demo principal service account emails, keyed by account id (restored from d1bf104^).
+# These are the IAM identities the mobile client impersonates for demo1 / demo2.
+output "demo_principals" {
+  description = "Email addresses of the demo IAM service accounts, keyed by account id."
+  value = {
+    for id, sa in google_service_account.demo_principals : id => sa.email
+  }
+}
+

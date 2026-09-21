@@ -103,7 +103,7 @@ locals {
     name             = "Retention Orchestrator Agent"
     description      = "Coordinates multi-agent retention workflows via dynamic A2A discovery and parallel task delegation on Agent Runtime."
     protocol_version = "0.3.0"
-    capabilities     = [
+    capabilities = [
       "autonomous-retention-orchestration",
       "dynamic-a2a-discovery",
       "parallel-fanout-delegation",

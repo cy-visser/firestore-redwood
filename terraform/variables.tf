@@ -1,7 +1,11 @@
 variable "project_id" {
-  description = "The Google Cloud Project ID to deploy resources in."
+  description = "The Google Cloud Project ID to deploy resources in. Supplied via TF_VAR_project_id from .env (GCP_PROJECT_ID); intentionally has no default so a misconfigured environment fails fast instead of targeting the wrong project."
   type        = string
-  default     = "redwood-retail-949ec9"
+
+  validation {
+    condition     = length(var.project_id) > 0
+    error_message = "project_id must be set. Export TF_VAR_project_id or set GCP_PROJECT_ID in .env."
+  }
 }
 
 variable "region" {
@@ -78,9 +82,15 @@ variable "bigquery_predictions_table_id" {
 
 
 variable "reasoning_model" {
-  description = "The Gemini model for the autonomous agent reasoning engine."
+  description = "The Gemini model for the autonomous agent reasoning engine. Must be available as a publisher model in var.region; verified live in europe-west4 on 2026-09-21."
   type        = string
-  default     = "gemini-3.8-flash"
+  default     = "gemini-2.5-flash"
+}
+
+variable "demo_principal_ids" {
+  description = "IAM service account IDs representing the demo client users. demo1-user is seeded as a healthy/low-churn customer, demo2-user as an at-risk/high-churn customer."
+  type        = list(string)
+  default     = ["demo1-user", "demo2-user"]
 }
 
 variable "enable_artifact_registry" {

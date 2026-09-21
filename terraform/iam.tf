@@ -51,6 +51,30 @@ resource "google_project_iam_member" "sa_storage_admin" {
   member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
 }
 
+# ------------------------------------------------------------------------------
+# Demo Principals: dedicated IAM service accounts representing the two mobile
+# client users (demo1 = healthy/low churn risk, demo2 = at-risk/high churn risk).
+# Restored from commit d1bf104^, where they were removed unintentionally.
+# ------------------------------------------------------------------------------
+resource "google_service_account" "demo_principals" {
+  for_each     = toset(var.demo_principal_ids)
+  project      = var.project_id
+  account_id   = each.key
+  display_name = "Redwood Retail Demo Principal ${each.key}"
+
+  depends_on = [
+    google_project_service.services["iam.googleapis.com"]
+  ]
+}
+
+# Demo principals need Firestore read/write to create sessions and read offers.
+resource "google_project_iam_member" "demo_principals_firestore" {
+  for_each = toset(var.demo_principal_ids)
+  project  = var.project_id
+  role     = "roles/datastore.user"
+  member   = "serviceAccount:${google_service_account.demo_principals[each.key].email}"
+}
+
 # Allow Dataflow Service Agent to access and act as the custom worker service account
 resource "google_service_account_iam_member" "dataflow_sa_actas" {
   service_account_id = google_service_account.pipeline_sa.name
