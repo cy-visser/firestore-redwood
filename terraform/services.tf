@@ -15,7 +15,10 @@ locals {
     "run.googleapis.com",
     "artifactregistry.googleapis.com",
     "cloudbuild.googleapis.com",
-    "cloudscheduler.googleapis.com",
+    # Backs BigQuery scheduled queries, which is how the churn pipeline is
+    # re-run daily. The name is historical; a scheduled query is modelled as a
+    # transfer config.
+    "bigquerydatatransfer.googleapis.com",
     # Eventarc carries the Firestore change stream to the CDC service, and
     # routes it over Pub/Sub internally.
     "eventarc.googleapis.com",
