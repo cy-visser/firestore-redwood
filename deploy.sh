@@ -539,20 +539,37 @@ import fastapi, uvicorn, httpx, pytest
   # here because this is the only virtual environment the repository
   # provisions, and splitting the app across two of them is what left one with
   # a web framework and no test runner and the other with the reverse.
-  "$PYTHON_EXEC" -m pip install -q \
-    "google-cloud-firestore>=2.20.0" \
-    "google-cloud-bigquery>=3.25.0" \
-    "google-cloud-bigquery-storage>=2.25.0" \
-    "google-cloud-aiplatform>=1.60.0" \
-    "cloudpickle>=3.0.0" \
-    "python-dotenv>=1.0.0" \
-    "pydantic>=2.0.0" \
-    "protobuf>=4.25.0" \
-    "setuptools" \
-    "fastapi>=0.110.0" \
-    "uvicorn>=0.30.0" \
-    "httpx>=0.27.0" \
+  REDWOOD_PIP_PACKAGES=(
+    "google-cloud-firestore>=2.20.0"
+    "google-cloud-bigquery>=3.25.0"
+    "google-cloud-bigquery-storage>=2.25.0"
+    "google-cloud-aiplatform>=1.60.0"
+    "cloudpickle>=3.0.0"
+    "python-dotenv>=1.0.0"
+    "pydantic>=2.0.0"
+    "protobuf>=4.25.0"
+    "setuptools"
+    "fastapi>=0.110.0"
+    "uvicorn>=0.30.0"
+    "httpx>=0.27.0"
     "pytest>=8.0.0"
+  )
+  # An isolated .venv does not have keyrings.google-artifactregistry-auth
+  # installed, so if the host's pip.conf points at https://*-python.pkg.dev/...
+  # pip receives 401 and prompts "User for us-python.pkg.dev:". Bypass host
+  # pip.conf and install from public PyPI first; if corp firewall blocks direct
+  # pypi.org, fall back to the host index using gcloud's access token.
+  if ! PIP_CONFIG_FILE=/dev/null "$PYTHON_EXEC" -m pip install -q --no-input \
+       --index-url https://pypi.org/simple "${REDWOOD_PIP_PACKAGES[@]}" 2>/dev/null; then
+    CFG_INDEX=$("$PYTHON_EXEC" -m pip config get global.index-url 2>/dev/null || true)
+    if [[ "$CFG_INDEX" == https://*pkg.dev/* ]]; then
+      AR_TOKEN=$(gcloud auth print-access-token 2>/dev/null || true)
+      CFG_INDEX="https://oauth2accesstoken:${AR_TOKEN}@${CFG_INDEX#https://}"
+      "$PYTHON_EXEC" -m pip install -q --no-input --index-url "$CFG_INDEX" "${REDWOOD_PIP_PACKAGES[@]}"
+    else
+      "$PYTHON_EXEC" -m pip install -q --no-input "${REDWOOD_PIP_PACKAGES[@]}"
+    fi
+  fi
 }
 
 # ------------------------------------------------------------------------------
