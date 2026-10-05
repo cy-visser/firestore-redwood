@@ -9,7 +9,7 @@ This Terraform module automates the provisioning of a fresh Google Cloud Project
 Project creation is intentionally decoupled from the core application resources (`../`):
 
 1. **Privilege Separation**: Creating Google Cloud projects and attaching billing accounts requires elevated organizational permissions (`roles/resourcemanager.projectCreator`, `roles/billing.user`) typically tied to an enterprise/sandbox admin account (e.g., `admin@<domain>.altostrat.com`). Application workloads only require project-level `roles/owner` or `roles/editor`.
-2. **Lifecycle Decoupling**: Tearing down workload infrastructure (e.g. recreating Firestore databases or draining Dataflow streaming jobs via `./deploy.sh --teardown`) will **not** accidentally destroy the GCP project, billing linkage, or foundational API setups.
+2. **Lifecycle Decoupling**: Tearing down workload infrastructure (e.g. recreating Firestore databases or removing Cloud Run services via `./deploy.sh --teardown`) will **not** accidentally destroy the GCP project, billing linkage, or foundational API setups.
 3. **Clean Networking Baseline**: Creates the project with `auto_create_network = false`, ensuring the custom VPC and private subnet created by the Redwood workload module can be deployed cleanly without default network collision.
 
 ---

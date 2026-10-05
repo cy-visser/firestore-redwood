@@ -8,3 +8,12 @@ __pycache__/
 *.pyc
 *.md
 .pytest_cache/
+
+# The frontend build stage runs `npm ci` itself, so shipping the local
+# node_modules only makes the source tarball 130 MB and the upload slow --
+# once per image, three times a deploy.
+**/node_modules/
+**/dist/
+
+# Never upload the real configuration.
+.env

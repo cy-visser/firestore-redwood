@@ -73,6 +73,63 @@ resource "google_firestore_index" "customer_sessions_by_customer" {
   ]
 }
 
+# Composite index for the agent's offer cooldown lookup:
+# WHERE customerId == :cid AND createdAt >= :cutoff ORDER BY createdAt DESC
+#
+# This is not served by loyalty_offers_active_by_customer above. Firestore
+# selects an index by field prefix, and that index places status between
+# customerId and createdAt, so it can only answer queries that also constrain
+# status. The cooldown lookup deliberately does not, because it has to see
+# expired and superseded offers as well as active ones.
+resource "google_firestore_index" "loyalty_offers_recent_by_customer" {
+  project    = var.project_id
+  database   = var.firestore_database_id
+  collection = "loyalty_offers"
+
+  fields {
+    field_path = "customerId"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = "createdAt"
+    order      = "DESCENDING"
+  }
+
+  depends_on = [
+    terraform_data.firestore_database
+  ]
+}
+
+# Composite index for the mobile client's order history:
+# WHERE customerId == :cid ORDER BY createdAt DESC
+#
+# The orders feed used to read an arbitrary unordered page of the whole
+# collection and filter it in the browser, which made a just-placed order
+# disappear on refresh. The backend now scopes and orders the query here
+# instead. It degrades rather than fails without this index: list_orders
+# catches the error, reads the customer's orders unordered, sorts them in
+# process and reports orderedByFirestore false.
+resource "google_firestore_index" "orders_by_customer" {
+  project    = var.project_id
+  database   = var.firestore_database_id
+  collection = var.firestore_collection
+
+  fields {
+    field_path = "customerId"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = "createdAt"
+    order      = "DESCENDING"
+  }
+
+  depends_on = [
+    terraform_data.firestore_database
+  ]
+}
+
 # TTL policy on customer_sessions collection (30-day session document purge)
 resource "google_firestore_field" "customer_sessions_ttl" {
   project    = var.project_id
@@ -100,3 +157,27 @@ resource "google_firestore_field" "loyalty_offers_ttl" {
     terraform_data.firestore_database
   ]
 }
+
+# TTL policy on pipeline_traces collection (30-day purge).
+#
+# Traces are the per-step latency breadcrumbs the bridge and the agent write
+# for the console's pipeline panel. They describe one demo run and are of no
+# interest afterwards, so they expire rather than accumulate.
+#
+# Note there is deliberately no Eventarc trigger on this collection. The agent
+# trigger matches customer_sessions/* and the CDC triggers match the orders and
+# customers collections; a trigger here would mean the act of recording a
+# latency re-ran the pipeline being measured.
+resource "google_firestore_field" "pipeline_traces_ttl" {
+  project    = var.project_id
+  database   = var.firestore_database_id
+  collection = "pipeline_traces"
+  field      = "expireAt"
+
+  ttl_config {}
+
+  depends_on = [
+    terraform_data.firestore_database
+  ]
+}
+

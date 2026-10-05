@@ -1,0 +1,18 @@
+# The bridge only parses an event and calls an agent, so this is deliberately
+# short. google-cloud-aiplatform is the heavy one and is needed for
+# vertexai.agent_engines, which is how the deployed agent is resolved and
+# invoked.
+flask>=3.0.0
+gunicorn>=21.2.0
+google-cloud-aiplatform>=1.60.0
+
+# Required by the shared firestore_event decoder: Firestore delivers events as
+# protobuf, and google-events carries the generated message classes.
+protobuf>=4.25.0
+google-events>=0.13.0
+
+# The bridge records its own latency spans to pipeline_traces. It is the only
+# observer of the Eventarc delivery hop and the Agent Engine round trip, so it
+# has to write them somewhere the console can read.
+google-cloud-firestore>=2.16.0
+

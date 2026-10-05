@@ -1,469 +1,250 @@
 #!/usr/bin/env python3
-"""
-High-Performance Retail Dataset Generator for Firestore Enterprise & BigQuery CDC.
-Generates configurable volumes (from 1k to 1M+ documents) of rich retail transaction,
-sentiment, and churn analysis data into Firestore Enterprise in Native Mode.
-"""
+"""Retail dataset generator for Firestore Enterprise Native and BigQuery CDC."""
 
 import os
 import sys
 import time
 import math
-import json
 import random
-import signal
 import argparse
-from datetime import datetime, timezone, timedelta
-from multiprocessing import Manager, Process, Queue
+from datetime import datetime, timezone
+from multiprocessing import Manager, Process
 from queue import Empty
+
 from dotenv import load_dotenv, find_dotenv
-from google.cloud import firestore
 from google.api_core.exceptions import GoogleAPICallError, RetryError
 
 # Load environment configuration from .env if present
 load_dotenv(find_dotenv(usecwd=True))
 
-# Import catalog and synthesis data
 sys.path.insert(0, os.path.dirname(__file__))
-from retail_catalog import (
-    CATALOG_ITEMS, SHIPPING_CITIES, WAREHOUSES, CARRIERS,
-    POSITIVE_FEEDBACK, NEUTRAL_FEEDBACK, NEGATIVE_FEEDBACK, COMPLAINT_REASONS,
-    LOYALTY_TIERS, FEEDBACK_SENTIMENT_RANGES
-)
 from firestore_auth import get_firestore_native_client
+from customer_profiles import (
+    build_customer_roster,
+    roster_summary,
+    reference_now,
+    _stable_seed,
+    HISTORY_MONTHS,
+    LABEL_WINDOW_DAYS,
+)
+from order_factory import build_customer_orders, build_customer_document
 
 DEFAULT_PROJECT = os.getenv("GCP_PROJECT_ID") or os.getenv("GCP_PROJECT")
 DEFAULT_REGION = os.getenv("GCP_REGION")
 DEFAULT_DATABASE = os.getenv("FIRESTORE_DATABASE_ID") or os.getenv("FIRESTORE_DATABASE")
-DEFAULT_COLLECTION = os.getenv("FIRESTORE_COLLECTION")
-DEFAULT_CHUNK_SIZE = 500
+DEFAULT_COLLECTION = os.getenv("FIRESTORE_COLLECTION") or "retail"
+DEFAULT_CUSTOMERS_COLLECTION = os.getenv("FIRESTORE_CUSTOMERS_COLLECTION") or "customers"
+DEFAULT_SEED = 20260921
+DEFAULT_CHUNK_SIZE = 400  # Firestore caps a batch at 500 writes.
 DEFAULT_WORKERS = min(os.cpu_count() or 8, 16)
 
 
+def _commit_with_retry(client, docs, collection, id_field, max_retries=3):
+    """Commit a batch of documents, retrying transient Firestore errors.
 
-def generate_single_order(worker_id, order_index, base_time):
-    """Generate a single richly structured retail order document with 4-pillar ML churn features."""
-    rand_id = f"{random.randint(100000, 999999)}{random.choice(['A', 'B', 'C', 'D', 'E'])}{random.randint(10, 99)}"
-    order_id = f"ORD-26-W{worker_id}-{rand_id}-IDX{order_index:07d}"
-    customer_num = random.randint(1000, 99999)
-    customer_id = f"cust_retail_{customer_num:05d}"
-    
-    # 1. Demographics & Loyalty Tier Distribution
-    loyalty_weights = [t["weight"] for t in LOYALTY_TIERS]
-    loyalty_choice = random.choices(LOYALTY_TIERS, weights=loyalty_weights, k=1)[0]
-    loyalty_tier = loyalty_choice["tier"]
-    is_loyalty_member = loyalty_choice["isMember"]
-    tier_discount_rate = loyalty_choice["discountRate"]
-    account_age_days = random.randint(45, 1800)
-
-    # Customer segment mapping
-    if loyalty_tier == "ENTERPRISE_VIP":
-        customer_segment = "ENTERPRISE_VIP"
-        num_items = random.randint(3, 8)
-        qty_multiplier = random.randint(2, 6)
-    elif loyalty_tier in ["GOLD", "PLATINUM"]:
-        customer_segment = "RETAIL_PRO"
-        num_items = random.randint(2, 5)
-        qty_multiplier = random.randint(1, 3)
-    elif loyalty_tier in ["SILVER", "BRONZE"]:
-        customer_segment = "STANDARD_LOYALTY"
-        num_items = random.randint(1, 3)
-        qty_multiplier = 1
-    else:
-        customer_segment = "CASUAL_SHOPPER"
-        num_items = random.randint(1, 2)
-        qty_multiplier = 1
-
-    # Line Items
-    selected_products = random.sample(CATALOG_ITEMS, min(num_items, len(CATALOG_ITEMS)))
-    line_items = []
-    subtotal = 0.0
-    total_cost = 0.0
-    total_weight = 0.0
-
-    for prod in selected_products:
-        qty = random.randint(1, 3) * qty_multiplier
-        item_total = round(qty * prod["unitPrice"], 2)
-        subtotal += item_total
-        total_cost += round(qty * prod["cost"], 2)
-        total_weight += round(qty * random.uniform(1.2, 14.5), 2)
-        
-        line_items.append({
-            "sku": prod["sku"],
-            "name": prod["name"],
-            "category": prod["category"],
-            "quantity": qty,
-            "unitPrice": prod["unitPrice"],
-            "totalPrice": item_total,
-            "allocatedWarehouse": random.choice(WAREHOUSES)
-        })
-
-    # Financials
-    tax_rate = 0.21
-    tax_amount = round(subtotal * tax_rate, 2)
-    shipping_fee = round(random.choice([0.0, 45.0, 95.0, 150.0, 220.0]), 2)
-    
-    # Discount calculation
-    discount_total = round(subtotal * tier_discount_rate, 2)
-    if discount_total == 0.0 and random.random() < 0.20:
-        discount_total = round(subtotal * 0.05, 2)
-
-    grand_total = round(subtotal - discount_total + tax_amount + shipping_fee, 2)
-    profit_margin = round((grand_total - total_cost - tax_amount) / max(grand_total, 1.0), 3)
-
-    # 2. Correlated Operational, Engagement, Support & Transactional Profiles
-    profile_roll = random.random()
-
-    if profile_roll < 0.22:
-        # Disengaged / High Friction Operational Profile
-        days_since_last_purchase = random.randint(65, 180)
-        total_spend_90d = round(grand_total * random.uniform(0.2, 0.8), 2)
-        orders_count_12m = random.randint(1, 3)
-        avg_order_value = round(grand_total * random.uniform(0.8, 1.2), 2)
-        purchase_frequency_monthly = round(random.uniform(0.05, 0.25), 2)
-
-        login_frequency_monthly = random.randint(0, 3)
-        avg_session_duration_minutes = round(random.uniform(1.0, 4.2), 1)
-        app_engagement_score = round(random.uniform(0.05, 0.30), 2)
-        app_sessions_last_30d = random.randint(0, 3)
-        cart_abandonment_count = random.randint(3, 9)
-        abandoned_cart_value_90d = round(random.uniform(600.0, 5200.0), 2)
-
-        support_tickets_count = random.randint(3, 8)
-        open_support_tickets_count = random.randint(1, 4)
-        complaints_count = random.randint(1, 4)
-        return_frequency = random.randint(2, 6)
-        return_rate_pct = round(random.uniform(15.0, 42.0), 1)
-
-        feedback_text = random.choice(NEGATIVE_FEEDBACK)
-        feedback_rating = random.choice([1, 2])
-        sent_min, sent_max = FEEDBACK_SENTIMENT_RANGES["NEGATIVE"]
-        sentiment_score = round(random.uniform(sent_min, sent_max), 3)
-
-        order_status = random.choice(["PROCESSING", "DELIVERED", "RETURN_REQUESTED", "CANCELLED"])
-        payment_status = random.choice(["SETTLED", "REFUNDED", "DISPUTED"])
-
-    elif profile_roll < 0.50:
-        # Moderate / Inactive Risk Operational Profile
-        days_since_last_purchase = random.randint(30, 68)
-        total_spend_90d = round(grand_total * random.uniform(1.0, 2.2), 2)
-        orders_count_12m = random.randint(4, 9)
-        avg_order_value = round(grand_total * random.uniform(0.9, 1.3), 2)
-        purchase_frequency_monthly = round(random.uniform(0.35, 0.85), 2)
-
-        login_frequency_monthly = random.randint(4, 10)
-        avg_session_duration_minutes = round(random.uniform(4.5, 9.5), 1)
-        app_engagement_score = round(random.uniform(0.32, 0.65), 2)
-        app_sessions_last_30d = random.randint(4, 15)
-        cart_abandonment_count = random.randint(1, 3)
-        abandoned_cart_value_90d = round(random.uniform(200.0, 1800.0), 2)
-
-        support_tickets_count = random.randint(1, 3)
-        open_support_tickets_count = random.choice([0, 1])
-        complaints_count = random.choice([0, 1])
-        return_frequency = random.randint(1, 2)
-        return_rate_pct = round(random.uniform(5.0, 14.0), 1)
-
-        feedback_text = random.choice(NEUTRAL_FEEDBACK)
-        feedback_rating = 3
-        sent_min, sent_max = FEEDBACK_SENTIMENT_RANGES["NEUTRAL"]
-        sentiment_score = round(random.uniform(sent_min, sent_max), 3)
-
-        order_status = random.choice(["DELIVERED", "SHIPPED", "PROCESSING"])
-        payment_status = "SETTLED"
-
-    else:
-        # High Engagement / Healthy Customer Profile
-        days_since_last_purchase = random.randint(1, 26)
-        total_spend_90d = round(grand_total * random.uniform(2.5, 6.5), 2)
-        orders_count_12m = random.randint(8, 28)
-        avg_order_value = round(grand_total * random.uniform(1.0, 1.8), 2)
-        purchase_frequency_monthly = round(random.uniform(1.0, 3.5), 2)
-
-        login_frequency_monthly = random.randint(12, 38)
-        avg_session_duration_minutes = round(random.uniform(9.0, 25.0), 1)
-        app_engagement_score = round(random.uniform(0.68, 0.98), 2)
-        app_sessions_last_30d = random.randint(16, 65)
-        cart_abandonment_count = random.choice([0, 1])
-        abandoned_cart_value_90d = round(random.uniform(0.0, 450.0), 2)
-
-        support_tickets_count = random.choice([0, 1])
-        open_support_tickets_count = 0
-        complaints_count = 0
-        return_frequency = random.choice([0, 1])
-        return_rate_pct = round(random.uniform(0.0, 4.0), 1)
-
-        feedback_text = random.choice(POSITIVE_FEEDBACK)
-        feedback_rating = random.choice([4, 5])
-        sent_min, sent_max = FEEDBACK_SENTIMENT_RANGES["POSITIVE"]
-        sentiment_score = round(random.uniform(sent_min, sent_max), 3)
-
-        order_status = random.choice(["DELIVERED", "SHIPPED"])
-        payment_status = "SETTLED"
-
-    lifetime_spend = round(total_spend_90d * random.uniform(1.6, 5.2) + grand_total, 2)
-
-    # Shipping Address
-    city_data = random.choice(SHIPPING_CITIES)
-    
-    # Timestamps
-    created_at = base_time + timedelta(seconds=order_index * 1.5)
-    updated_at = created_at + timedelta(minutes=random.randint(5, 45))
-    est_delivery = created_at + timedelta(days=random.randint(1, 4))
-
-    doc = {
-        "_id": order_id,
-        "orderId": order_id,
-        "customerId": customer_id,
-        "customerName": f"Enterprise Customer #{customer_num}",
-        "customerEmail": f"client.{customer_num}@enterprise-logistics.eu",
-        "customerSegment": customer_segment,
-        "orderStatus": order_status,
-        "paymentStatus": payment_status,
-        "paymentMethod": random.choice(["INVOICE_NET30", "CREDIT_CARD", "IDEAL", "SEPA_DIRECT_DEBIT"]),
-        "currency": "EUR",
-        "financials": {
-            "subtotal": subtotal,
-            "taxAmount": tax_amount,
-            "shippingFee": shipping_fee,
-            "discountTotal": discount_total,
-            "grandTotal": grand_total,
-            "profitMargin": profit_margin
-        },
-        "transactionalMetrics": {
-            "totalSpend90d": total_spend_90d,
-            "lifetimeSpend": lifetime_spend,
-            "avgOrderValue": avg_order_value,
-            "purchaseFrequencyMonthly": purchase_frequency_monthly,
-            "daysSinceLastPurchase": days_since_last_purchase,
-            "ordersCountLast12m": orders_count_12m
-        },
-        "engagement": {
-            "loginFrequencyMonthly": login_frequency_monthly,
-            "avgSessionDurationMinutes": avg_session_duration_minutes,
-            "appEngagementScore": app_engagement_score,
-            "appSessionsLast30d": app_sessions_last_30d,
-            "cartAbandonmentCount": cart_abandonment_count,
-            "abandonedCartValue90d": abandoned_cart_value_90d
-        },
-        "supportMetrics": {
-            "supportTicketsCount": support_tickets_count,
-            "openSupportTicketsCount": open_support_tickets_count,
-            "complaintsCount": complaints_count,
-            "returnFrequency": return_frequency,
-            "returnRatePercent": return_rate_pct,
-            "sentimentScore": sentiment_score,
-            "hasActiveComplaint": feedback_rating <= 2,
-            "primaryComplaintReason": random.choice(COMPLAINT_REASONS) if feedback_rating <= 2 else None
-        },
-        "accountState": {
-            "loyaltyTier": loyalty_tier,
-            "isLoyaltyMember": is_loyalty_member,
-            "accountAgeDays": account_age_days,
-            "customerSegment": customer_segment
-        },
-        "logistics": {
-            "carrierCode": random.choice(CARRIERS),
-            "serviceLevel": random.choice(["NEXT_DAY_AIR", "STANDARD_FREIGHT", "EXPRESS_PARCEL"]),
-            "originHub": random.choice(WAREHOUSES),
-            "totalWeightKg": round(total_weight, 2),
-            "requireSignature": True
-        },
-        "shippingAddress": {
-            "streetAddress": f"Industrial Park Way {random.randint(10, 800)}",
-            "city": city_data["city"],
-            "province": city_data["province"],
-            "postalCode": city_data["postalCode"],
-            "countryCode": city_data["countryCode"]
-        },
-        "lineItems": line_items,
-        "customerFeedback": {
-            "feedbackText": feedback_text,
-            "rating": feedback_rating,
-            "sentimentScore": sentiment_score,
-            "channel": random.choice(["MOBILE_APP", "CHATBOT", "EMAIL_SURVEY", "WEB_PORTAL"]),
-            "hasActiveComplaint": feedback_rating <= 2,
-            "primaryComplaintReason": random.choice(COMPLAINT_REASONS) if feedback_rating <= 2 else None,
-            "feedbackTimestamp": created_at.isoformat()
-        },
-        "metadata": {
-            "apiVersion": "v2.0",
-            "sourcePlatform": random.choice(["ERP_SAP_CONNECTOR", "CUSTOM_MOBILE_APP", "COMMERCE_PORTAL"]),
-            "clientIpAddress": f"10.{random.randint(10,99)}.{random.randint(1,254)}.{random.randint(1,254)}",
-            "retryCount": 0
-        },
-        "createdAt": created_at.isoformat(),
-        "updatedAt": updated_at.isoformat(),
-        "estimatedDeliveryDate": est_delivery.isoformat()
-    }
-
-    return doc
+    Returns (inserted, failed, error_message_or_None).
+    """
+    for attempt in range(max_retries):
+        try:
+            batch = client.batch()
+            for doc in docs:
+                batch.set(collection.document(doc[id_field]), doc)
+            batch.commit()
+            return len(docs), 0, None
+        except (GoogleAPICallError, RetryError) as err:
+            if attempt < max_retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+            else:
+                return 0, len(docs), f"{type(err).__name__}: {str(err)[:120]}"
+        except Exception as err:  # noqa: BLE001 - surface anything else the same way
+            if attempt < max_retries - 1:
+                time.sleep(2.0)
+            else:
+                return 0, len(docs), f"{type(err).__name__}: {str(err)[:120]}"
+    return 0, len(docs), "exhausted retries"
 
 
-def worker_task(worker_id, total_docs, chunk_size, progress_queue, project_id=DEFAULT_PROJECT, database_id=DEFAULT_DATABASE, region=DEFAULT_REGION, dry_run=False, collection_name=DEFAULT_COLLECTION):
-    """Worker process function: streams chunks of orders into Firestore Native via ADC with error suppression."""
+def worker_task(
+    worker_id,
+    customer_slice,
+    progress_queue,
+    project_id,
+    database_id,
+    collection_name,
+    customers_collection_name,
+    seed,
+    now_iso,
+    dry_run=False,
+):
+    """Generate and write the order history for an assigned slice of customers."""
+    now = datetime.fromisoformat(now_iso)
     client = None
-    collection = None
+    orders_coll = None
+    customers_coll = None
 
     if not dry_run:
         try:
             client = get_firestore_native_client(project_id, database_id)
-            collection = client.collection(collection_name)
-        except Exception as e:
-            if progress_queue:
-                progress_queue.put({
-                    "type": "warning",
-                    "worker_id": worker_id,
-                    "msg": f"Worker {worker_id} connection error: {type(e).__name__}: {str(e)[:120]}"
-                })
-                progress_queue.put({
-                    "type": "progress",
-                    "worker_id": worker_id,
-                    "inserted": 0,
-                    "failed": total_docs
-                })
-                progress_queue.put({
-                    "type": "worker_done",
-                    "worker_id": worker_id,
-                    "inserted": 0,
-                    "failed": total_docs
-                })
-            return 0, total_docs
+            orders_coll = client.collection(collection_name)
+            customers_coll = client.collection(customers_collection_name)
+        except Exception as e:  # noqa: BLE001
+            progress_queue.put({
+                "type": "warning",
+                "msg": f"Worker {worker_id} connection error: {type(e).__name__}: {str(e)[:120]}",
+            })
+            progress_queue.put({"type": "worker_done", "worker_id": worker_id})
+            return
 
-    base_time = datetime(2026, 8, 1, 8, 0, 0, tzinfo=timezone.utc)
-    steps = math.ceil(total_docs / chunk_size)
-    total_inserted = 0
-    total_failed = 0
+    pending_orders = []
+    pending_customers = []
+    inserted = failed = 0
 
-    for step in range(steps):
-        current_chunk_size = min(chunk_size, total_docs - (step * chunk_size))
-        if current_chunk_size <= 0:
-            break
-
-        chunk = []
-        for i in range(current_chunk_size):
-            global_index = (worker_id * 10_000_000) + (step * chunk_size) + i
-            order = generate_single_order(worker_id, global_index, base_time)
-            chunk.append(order)
-
-        chunk_inserted = 0
-        chunk_failed = 0
-
+    def flush(force=False):
+        nonlocal pending_orders, pending_customers, inserted, failed
         if dry_run:
-            chunk_inserted = len(chunk)
-            chunk_failed = 0
-        elif chunk:
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    batch = client.batch()
-                    for order in chunk:
-                        doc_id = order.get("orderId")
-                        doc_ref = collection.document(doc_id)
-                        batch.set(doc_ref, order)
-                    batch.commit()
-                    chunk_inserted += len(chunk)
-                    break
-                except (GoogleAPICallError, RetryError) as gerr:
-                    if attempt < max_retries - 1:
-                        time.sleep(1.5 * (attempt + 1))
-                    else:
-                        chunk_failed += len(chunk)
-                        if progress_queue:
-                            progress_queue.put({
-                                "type": "warning",
-                                "worker_id": worker_id,
-                                "msg": f"Worker {worker_id}: Batch write failed after {max_retries} attempts: {type(gerr).__name__}: {str(gerr)[:100]}"
-                            })
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        time.sleep(2.0)
-                    else:
-                        chunk_failed += len(chunk)
-                        if progress_queue:
-                            progress_queue.put({
-                                "type": "warning",
-                                "worker_id": worker_id,
-                                "msg": f"Worker {worker_id}: Unexpected error: {type(e).__name__}: {str(e)[:100]}"
-                            })
-
-        total_inserted += chunk_inserted
-        total_failed += chunk_failed
-
-        if progress_queue:
+            inserted += len(pending_orders) + len(pending_customers)
             progress_queue.put({
                 "type": "progress",
-                "worker_id": worker_id,
-                "inserted": chunk_inserted,
-                "failed": chunk_failed
+                "inserted": len(pending_orders) + len(pending_customers),
+                "failed": 0,
             })
+            pending_orders, pending_customers = [], []
+            return
 
-    if progress_queue:
-        progress_queue.put({
-            "type": "worker_done",
-            "worker_id": worker_id,
-            "inserted": total_inserted,
-            "failed": total_failed
-        })
+        while pending_orders and (force or len(pending_orders) >= DEFAULT_CHUNK_SIZE):
+            chunk, pending_orders = (
+                pending_orders[:DEFAULT_CHUNK_SIZE],
+                pending_orders[DEFAULT_CHUNK_SIZE:],
+            )
+            ok, bad, err = _commit_with_retry(client, chunk, orders_coll, "orderId")
+            inserted += ok
+            failed += bad
+            if err:
+                progress_queue.put({"type": "warning", "msg": f"Worker {worker_id} orders: {err}"})
+            progress_queue.put({"type": "progress", "inserted": ok, "failed": bad})
 
-    return total_inserted, total_failed
+        while pending_customers and (force or len(pending_customers) >= DEFAULT_CHUNK_SIZE):
+            chunk, pending_customers = (
+                pending_customers[:DEFAULT_CHUNK_SIZE],
+                pending_customers[DEFAULT_CHUNK_SIZE:],
+            )
+            ok, bad, err = _commit_with_retry(client, chunk, customers_coll, "customerId")
+            inserted += ok
+            failed += bad
+            if err:
+                progress_queue.put({"type": "warning", "msg": f"Worker {worker_id} customers: {err}"})
+            progress_queue.put({"type": "progress", "inserted": ok, "failed": bad})
+
+    for customer in customer_slice:
+        # Seeded per customer id, so a customer's orders are identical no matter
+        # which worker happens to generate them.
+        rng = random.Random(_stable_seed(seed, customer.customer_id, "orders"))
+        orders = build_customer_orders(customer, rng)
+        pending_orders.extend(orders)
+        pending_customers.append(build_customer_document(customer, orders, now))
+        flush()
+
+    flush(force=True)
+    progress_queue.put({"type": "worker_done", "worker_id": worker_id})
 
 
-def run_generator(total_count, num_workers, chunk_size, database, collection_name, project_id=DEFAULT_PROJECT, region=DEFAULT_REGION, dry_run=False, drop_existing=False):
-    """Main coordinator: spawns workers, manages inter-process progress queue, and displays live metrics."""
+def _purge_collection(client, coll_ref, label):
+    """Delete every document in a collection, in batches.
+
+    The previous implementation deleted only the first 500 documents, so
+    reseeding silently accumulated stale data.
+    """
+    deleted = 0
+    while True:
+        docs = list(coll_ref.limit(400).stream())
+        if not docs:
+            break
+        batch = client.batch()
+        for doc in docs:
+            batch.delete(doc.reference)
+        batch.commit()
+        deleted += len(docs)
+        print(f"   {label}: deleted {deleted:,}...", end="\r", flush=True)
+    if deleted:
+        print(f"   {label}: deleted {deleted:,} documents." + " " * 20)
+    return deleted
+
+
+def run_generator(
+    customer_count,
+    num_workers,
+    database,
+    collection_name,
+    customers_collection_name=DEFAULT_CUSTOMERS_COLLECTION,
+    project_id=DEFAULT_PROJECT,
+    region=DEFAULT_REGION,
+    seed=DEFAULT_SEED,
+    dry_run=False,
+    drop_existing=False,
+):
+    """Build the customer roster and write it to Firestore in parallel."""
+    now = reference_now()
+    roster = build_customer_roster(
+        customer_count, seed=seed, project_id=project_id, now=now
+    )
+    summary = roster_summary(roster)
+
     print("=================================================================")
-    print(" Redwood Retail: High-Performance Dataset Generation Pipeline    ")
+    print(" Redwood Retail: Customer-Centric Dataset Generation             ")
     print(" Auth Mode: Google Cloud IAM & Application Default Credentials   ")
     print("=================================================================")
-    print(f"Target Database:    {database} (Firestore Enterprise Native)")
-    print(f"Collection:         {collection_name}")
-    print(f"Total Documents:    {total_count:,}")
-    print(f"Parallel Workers:   {num_workers}")
-    print(f"Batch Chunk Size:   {chunk_size:,} docs/batch")
-    print(f"Dry Run Mode:       {dry_run}")
+    print(f"Target Database:     {database} (Firestore Enterprise Native)")
+    print(f"Orders Collection:   {collection_name}")
+    print(f"Customers Coll.:     {customers_collection_name}")
+    print(f"Customers:           {summary['customers']:,}")
+    print(f"Orders:              {summary['orders']:,}")
+    print(f"History Window:      {HISTORY_MONTHS} months, ending {now.date()}")
+    print(f"Label Window:        trailing {LABEL_WINDOW_DAYS} days")
+    print(f"Churned / Retained:  {summary['churned']:,} / {summary['retained']:,} "
+          f"({summary['churn_rate']:.1%} churn)")
+    print(f"Acute friction:      {summary['acute_friction']:,} customers "
+          f"({summary['acute_friction_rate']:.1%}) carry a live grievance the "
+          f"loyalty agent escalates on")
+    print(f"Archetypes:          {summary['by_archetype']}")
+    print(f"Parallel Workers:    {num_workers}")
+    print(f"Random Seed:         {seed} (deterministic)")
+    print(f"Dry Run Mode:        {dry_run}")
     print("=================================================================")
 
     if not dry_run:
         try:
-            test_client = get_firestore_native_client(project_id, database)
-            coll_ref = test_client.collection(collection_name)
+            client = get_firestore_native_client(project_id, database)
             if drop_existing:
-                print(f"Clearing existing collection '{collection_name}'...")
-                docs = coll_ref.limit(500).stream()
-                batch = test_client.batch()
-                deleted = 0
-                for doc in docs:
-                    batch.delete(doc.reference)
-                    deleted += 1
-                if deleted > 0:
-                    batch.commit()
-            print("✅ Successfully verified Firestore Enterprise Native connectivity via ADC.")
-        except Exception as e:
-            print(f"❌ Connection error: {e}")
+                print("Clearing existing collections...")
+                _purge_collection(client, client.collection(collection_name), collection_name)
+                _purge_collection(
+                    client, client.collection(customers_collection_name), customers_collection_name
+                )
+            print("Verified Firestore Enterprise Native connectivity via ADC.")
+        except Exception as e:  # noqa: BLE001
+            print(f"Connection error: {e}")
             sys.exit(1)
 
+    total_docs = summary["orders"] + summary["customers"]
     start_time = time.time()
-    docs_per_worker = math.ceil(total_count / num_workers)
-    
+
+    # Partition customers round-robin so workers get comparable order volumes
+    # even though history length varies a lot between archetypes.
+    slices = [roster[i::num_workers] for i in range(num_workers)]
+    slices = [s for s in slices if s]
+
     manager = Manager()
     progress_queue = manager.Queue()
     workers = []
-    
-    for w_id in range(num_workers):
-        if w_id == num_workers - 1:
-            allocation = total_count - (docs_per_worker * (num_workers - 1))
-        else:
-            allocation = docs_per_worker
 
-        if allocation <= 0:
-            continue
-
+    for w_id, customer_slice in enumerate(slices):
         p = Process(
             target=worker_task,
             args=(
-                w_id, allocation, chunk_size, progress_queue,
-                project_id, database, region, dry_run, collection_name
-            )
+                w_id, customer_slice, progress_queue, project_id, database,
+                collection_name, customers_collection_name, seed,
+                now.isoformat(), dry_run,
+            ),
         )
         p.daemon = True
         workers.append(p)
@@ -472,95 +253,115 @@ def run_generator(total_count, num_workers, chunk_size, database, collection_nam
     for p in workers:
         p.start()
 
-    total_inserted = 0
-    total_failed = 0
+    total_inserted = total_failed = 0
     active_workers = len(workers)
-    last_print_time = 0.0
-    last_completed = 0
+    last_print = 0.0
 
     try:
         while active_workers > 0 or not progress_queue.empty():
             try:
                 msg = progress_queue.get(timeout=0.2)
-                msg_type = msg.get("type")
-
-                if msg_type == "progress":
+                if msg["type"] == "progress":
                     total_inserted += msg.get("inserted", 0)
                     total_failed += msg.get("failed", 0)
-                elif msg_type == "warning":
-                    print(f"⚠️  {msg.get('msg')}")
-                elif msg_type == "worker_done":
+                elif msg["type"] == "warning":
+                    print(f"WARNING: {msg.get('msg')}")
+                elif msg["type"] == "worker_done":
                     active_workers -= 1
-
             except Empty:
                 pass
 
-            now = time.time()
+            now_t = time.time()
             completed = total_inserted + total_failed
-            if completed > 0 and completed != last_completed and (now - last_print_time >= 0.3 or completed >= total_count or active_workers == 0):
-                last_print_time = now
-                last_completed = completed
-                elapsed = max(now - start_time, 0.001)
+            if completed and (now_t - last_print >= 0.3 or active_workers == 0):
+                last_print = now_t
+                elapsed = max(now_t - start_time, 0.001)
                 speed = total_inserted / elapsed
-                pct = (completed / max(total_count, 1)) * 100.0
-                rem_docs = max(total_count - completed, 0)
-                eta = rem_docs / max(speed, 1.0) if speed > 0 else 0.0
-
+                pct = (completed / max(total_docs, 1)) * 100.0
+                eta = max(total_docs - completed, 0) / max(speed, 1.0)
                 print(
-                    f"Progress: [{completed:>8,}/{total_count:,}] ({pct:>5.1f}%) "
+                    f"Progress: [{completed:>8,}/{total_docs:,}] ({pct:>5.1f}%) "
                     f"| Inserted: {total_inserted:>8,} | Failed: {total_failed:>4,} "
-                    f"| Rate: {speed:>7.1f} docs/sec | Elapsed: {elapsed:>5.1f}s | ETA: {eta:>5.1f}s"
+                    f"| Rate: {speed:>7.1f} docs/sec | Elapsed: {elapsed:>5.1f}s "
+                    f"| ETA: {eta:>5.1f}s"
                 )
 
         for p in workers:
-            p.join(timeout=1.0)
+            p.join(timeout=2.0)
 
     except KeyboardInterrupt:
-        print("\n\n⚠️  Interrupted by user (Ctrl+C). Terminating workers gracefully...")
+        print("\n\nInterrupted by user. Terminating workers...")
         for p in workers:
             if p.is_alive():
                 p.terminate()
                 p.join(timeout=1.0)
 
     total_time = max(time.time() - start_time, 0.001)
-    overall_speed = total_inserted / total_time
     print("\n=================================================================")
-    print("🎉 Pipeline Completed!")
+    print("Seeding complete.")
     print("-----------------------------------------------------------------")
-    print(f"Target Database:        {database} (Firestore Enterprise)")
-    print(f"Target Collection:      {collection_name}")
-    print(f"Total Requested:        {total_count:,} documents")
-    print(f"Successfully Inserted:  {total_inserted:,} documents")
-    print(f"Failed / Skipped:       {total_failed:,} documents")
-    print(f"Total Elapsed Time:     {total_time:.2f} seconds")
-    print(f"Average Throughput:     {overall_speed:.1f} docs/sec")
+    print(f"Database:               {database}")
+    print(f"Customers seeded:       {summary['customers']:,}")
+    print(f"Orders seeded:          {summary['orders']:,}")
+    print(f"Documents inserted:     {total_inserted:,}")
+    print(f"Failed / skipped:       {total_failed:,}")
+    print(f"Elapsed:                {total_time:.2f}s "
+          f"({total_inserted / total_time:.1f} docs/sec)")
+    print("-----------------------------------------------------------------")
+    print("Demo personas:")
+    for c in roster:
+        if c.is_demo_persona:
+            state = "RETAINED (low risk)" if c.purchases_in_label_window else "CHURNED (high risk)"
+            print(f"  {c.customer_id:<14} {c.archetype.name:<14} "
+                  f"{len(c.order_dates):>3} orders  last={c.order_dates[-1].date()}  {state}")
+            print(f"  {'':<14} {c.iam_principal}")
     print("=================================================================")
+
+    return total_failed == 0
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate large-scale retail order dataset for Firestore & BigQuery")
-    parser.add_argument("-n", "--count", type=int, default=10000, help="Total number of documents to generate (e.g. 10000, 100000, 1000000)")
-    parser.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS, help="Number of parallel worker processes")
-    parser.add_argument("-c", "--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Batch chunk size for insert_many")
-    parser.add_argument("-p", "--project", type=str, default=DEFAULT_PROJECT, help="Google Cloud project ID")
-    parser.add_argument("-r", "--region", type=str, default=DEFAULT_REGION, help="Google Cloud region")
-    parser.add_argument("-d", "--database", type=str, default=DEFAULT_DATABASE, help="Target Firestore database name")
-    parser.add_argument("--collection", type=str, default=DEFAULT_COLLECTION, help="Target collection name")
-    parser.add_argument("--dry-run", action="store_true", help="Synthesize data in memory without writing to database")
-    parser.add_argument("--drop-existing", action="store_true", help="Drop existing collection before seeding")
+    parser = argparse.ArgumentParser(
+        description="Generate a customer-centric retail dataset for Firestore and BigQuery"
+    )
+    parser.add_argument(
+        "-n", "--count", type=int, default=400,
+        help="Number of synthetic customers to generate. The two demo personas "
+             "are always seeded in addition to this count. Each customer "
+             "produces roughly 4-20 orders depending on archetype.",
+    )
+    parser.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS,
+                        help="Number of parallel worker processes")
+    parser.add_argument("-p", "--project", type=str, default=DEFAULT_PROJECT,
+                        help="Google Cloud project ID")
+    parser.add_argument("-r", "--region", type=str, default=DEFAULT_REGION,
+                        help="Google Cloud region")
+    parser.add_argument("-d", "--database", type=str, default=DEFAULT_DATABASE,
+                        help="Target Firestore database name")
+    parser.add_argument("--collection", type=str, default=DEFAULT_COLLECTION,
+                        help="Target orders collection name")
+    parser.add_argument("--customers-collection", type=str,
+                        default=DEFAULT_CUSTOMERS_COLLECTION,
+                        help="Target customer profiles collection name")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED,
+                        help="Random seed; identical seeds reproduce identical data")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Synthesize data in memory without writing to Firestore")
+    parser.add_argument("--drop-existing", action="store_true",
+                        help="Delete all existing documents in both collections first")
 
     args = parser.parse_args()
 
-    run_generator(
-        total_count=args.count,
+    ok = run_generator(
+        customer_count=args.count,
         num_workers=args.workers,
-        chunk_size=args.chunk_size,
         database=args.database,
         collection_name=args.collection,
+        customers_collection_name=args.customers_collection,
         project_id=args.project,
         region=args.region,
+        seed=args.seed,
         dry_run=args.dry_run,
-        drop_existing=args.drop_existing
+        drop_existing=args.drop_existing,
     )
-
-
+    sys.exit(0 if ok else 1)

@@ -1,0 +1,11 @@
+# Runtime dependencies for the redwood-app container.
+#
+# Pinned separately from deploy.sh's virtual environment install list, which
+# also carries the deploy-time tooling (vertexai, cloudpickle, pytest). The
+# image has no business shipping a test runner or an Agent Engine SDK.
+fastapi>=0.110.0
+uvicorn[standard]>=0.30.0
+httpx>=0.27.0
+google-auth>=2.30.0
+google-cloud-firestore>=2.20.0
+google-cloud-bigquery>=3.25.0

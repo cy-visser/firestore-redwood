@@ -1,184 +1,94 @@
-# Redwood Retail: Real-Time CDC from Firestore Enterprise Native to BigQuery via Cloud Dataflow
+# Redwood Retail
 
-This project implements a production-ready Change Data Capture (CDC) streaming pipeline on Google Cloud. It synchronizes real-time change events from **Firestore Enterprise in Native Mode** into **BigQuery** using a managed **Google Cloud Dataflow** streaming pipeline.
+A demonstration of an autonomous retention loop on Google Cloud.
 
-![Redwood Architecture](docs/images/redwood_bootstrap_architecture.jpg)
+A customer logs in. Within seconds they either receive a personalised loyalty
+offer or they do not, depending on a churn score BigQuery computed from their
+own order history. No part of the path is polled or scheduled; the login itself
+causes the decision.
 
-> [!NOTE]
-> For a detailed technical architecture deep dive, two-phase bootstrap documentation, Dataflow IAM delegation model, and troubleshooting steps, see the **[Architecture, Security & Operational Deployment Guide](docs/architecture_and_deployment_guide.md)**.
+```mermaid
+flowchart LR
+  M["Mobile client"] -->|"login writes<br/>a session"| FS["Firestore<br/>(Enterprise Native)"]
+  FS -->|Eventarc| CDC["Cloud Run<br/>CDC service"]
+  CDC --> BQ["BigQuery<br/>churn model"]
+  FS -->|Eventarc| BR["Cloud Run<br/>bridge"]
+  BR --> AG["Agent Engine<br/>loyalty agent"]
+  BQ -.->|churn score| AG
+  AG -->|"offer"| FS
+  FS -.->|onSnapshot| M
+```
 
----
+## Documentation
 
-## 1. System Overview
+| Document | Contents |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | What runs, how it fits together, and why each choice was made |
+| [docs/demo_flow.md](docs/demo_flow.md) | Deploying, running the demo, and troubleshooting |
+| [COLLABORATION.md](COLLABORATION.md) | Git workflow |
+| [mobile_client/README.md](mobile_client/README.md) | The mobile client |
 
-* **Source Database**: Google Cloud Firestore Enterprise in Native Mode (`FIRESTORE_NATIVE`, Database ID: `redwood`, Region: `europe-west4`, Collection: `retail`).
-* **Streaming Engine**: Google Cloud Dataflow streaming job (`DataflowRunner`) continuously ingesting document changes using native `google-cloud-firestore`.
-* **Target Sink**: Google BigQuery dataset `redwood_retail` with a DAY-partitioned and multi-column clustered table `retail_cdc`.
-* **Security & Authentication**: All applications and pipeline workers authenticate via Google Cloud Application Default Credentials (ADC) and IAM Service Accounts.
-
----
-
-## 2. Prerequisites
-
-Ensure you have the following installed and authenticated:
-
-1. **Google Cloud SDK (`gcloud`)**:
-   ```bash
-   gcloud components update
-   gcloud components install alpha
-   gcloud auth login
-   gcloud auth application-default login
-   gcloud config set project elevate-cyvisser
-   ```
-
-2. **Terraform CLI** ($\ge$ 1.5.0):
-   ```bash
-   terraform -version
-   ```
-
-3. **Python 3.11+ Environment**:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install "apache-beam[gcp]>=2.75.0" "google-cloud-firestore>=2.20.0" "google-cloud-bigquery>=3.25.0" "python-dotenv>=1.0.0"
-   ```
-
-4. **Environment Configuration (`.env`)**:
-   Copy `.env.example` to `.env` and adjust the variables for your Google Cloud project and resources:
-   ```bash
-   cp .env.example .env
-   ```
-   All Python scripts, BigQuery SQL runners, and Dataflow pipelines automatically load configuration from `.env`.
-
----
-
-## 3. Automated Deployment
-
-You can deploy the entire end-to-end architecture (APIs, Firestore Enterprise Native database, VPC network, BigQuery dataset/table, Cloud Dataflow streaming pipeline, synthetic order seeding, and BigQuery ML models) by running:
+## Quick start
 
 ```bash
+cp .env.example .env        # set GCP_PROJECT_ID and GCP_REGION
+gcloud auth application-default login
 ./deploy.sh
+./deploy.sh --verify-demo   # write a live session and check the agent reacts
 ```
 
-### Deployment CLI Options:
-* `./deploy.sh`: Runs full deployment, seeds 250 initial synthetic orders, and trains the BigQuery ML churn model.
-* `./deploy.sh --run-tests`: Executes the automated test suite (23/23 tests) verifying the multi-agent A2A architecture, contracts, and orchestrator.
-* `./deploy.sh --build-agent-image`: Builds and publishes the A2A Multi-Agent platform container to Google Artifact Registry for Agent Runtime.
-* `./deploy.sh --test-agent-runtime`: Executes end-to-end validation: probes A2A discovery (`/.well-known/agent-card.json`) and verifies live Firestore session offer generation.
-* `./deploy.sh --run-agent`: Runs the A2A Multi-Agent platform locally on Agent Runtime with real-time Firestore listeners.
-* `./deploy.sh --create-project`: Bootstraps a fresh Google Cloud project using `terraform/bootstrap` before deploying components.
-* `./deploy.sh --seed-count 1000`: Seeds 1,000 synthetic transaction documents into Firestore.
-* `./deploy.sh --dry-run`: Runs Terraform plan and config verification without altering GCP resources.
-* `./deploy.sh --skip-seed`: Deploys infrastructure without seeding sample orders.
-* `./deploy.sh --skip-bqml`: Deploys infrastructure without training BigQuery ML models.
-* `./deploy.sh --teardown` (or `./teardown.sh`): Cleanly destroys all infrastructure and drains Dataflow jobs.
+`deploy.sh` provisions its own virtual environment. See
+[docs/demo_flow.md](docs/demo_flow.md) for the flags that let you skip the
+expensive steps on a re-run.
 
-> [!TIP]
-> **Mobile Frontend & Agent Runtime Guides**:
-> * For step-by-step instructions on deploying the Autonomous A2A Loyalty Agent on Agent Runtime for Cyrus's mobile app, see the **[Mobile Frontend & Agent Runtime Deployment Guide](docs/mobile_deployment_guide.md)**.
-> * For the Level 400 deep dive on the real-time event-driven gRPC streaming bridge, payload schemas, and division of write responsibilities, see the **[Firestore to Agent Runtime Real-Time RPC Integration Guide](docs/firestore_agent_runtime_rpc_integration.md)**.
+## Layout
 
-#### Automated Provisioning Lifecycle:
-1. **(Optional) Project Bootstrap**: Provisions a new Google Cloud project via `terraform/bootstrap`, attaches billing, enables base APIs, and populates `.env`.
-2. **Prerequisites & .env Loading**: Maps `.env` variables automatically to Terraform (`TF_VAR_*`).
-3. **API Enablement**: Enables `firestore`, `dataflow`, `compute`, `bigquery`, `storage`, `iam`.
-4. **Firestore Enterprise Native Database**: Creates database `redwood` with Point-in-Time Recovery (PITR) and Firestore API Data Access enabled.
-5. **VPC Networking**: Creates VPC `redwood-dataflow-net`, private subnet, Cloud Router, and Cloud NAT.
-6. **IAM Service Account**: Configures `dataflow-redwood-sa` with required Datastore, Dataflow, and BigQuery roles.
-7. **BigQuery Target**: Provisions dataset `redwood_retail` and CDC table `retail_cdc`.
-8. **Cloud Dataflow Pipeline**: Submits the streaming pipeline using `DataflowRunner`.
-9. **Data Seeding & CDC Replicate**: Seeds synthetic e-commerce orders into Firestore via native `WriteBatch`.
-10. **BigQuery ML Training**: Builds the feature view and trains the Logistic Regression churn prediction model.
-
-### Creating a New Project (Altostrat / Sandbox):
-To provision a brand new project before deploying components:
-```bash
-# 1. Configure bootstrap variables with your billing account
-cp terraform/bootstrap/terraform.tfvars.example terraform/bootstrap/terraform.tfvars
-
-# 2. Run deploy with project bootstrap flag
-./deploy.sh --create-project
 ```
-See [`terraform/bootstrap/README.md`](terraform/bootstrap/README.md) for full details on standalone bootstrap execution.
+cdc_service/     Firestore change events to BigQuery, Cloud Run
+agent_bridge/    Eventarc CloudEvent to Agent Engine call, Cloud Run
+churn_service/   The churn pipeline, Cloud Run function
+loyalty_agent/   The retention agent, deployed to Agent Engine
+terraform/       All infrastructure except the agent itself
+scripts/         Agent deployment and live demo verification
+mobile_client/   React frontend and FastAPI backend, Cloud Run
+docs/            Architecture and demo documentation
 
----
-
-## 4. Verification & Monitoring
-
-### 1. Verify Firestore Enterprise Native Database
-```bash
-gcloud alpha firestore databases describe --database=redwood --project=elevate-cyvisser \
-  --format="table(name,databaseEdition,type,firestoreDataAccessMode,realtimeUpdatesMode)"
+bigquery_churn_sentiment_analysis.sql   Feature views, model, scoring
+customer_profiles.py, order_factory.py  Synthetic customer and order generation
+generate_retail_dataset.py              Seeder entry point
+deploy.sh, teardown.sh                  Lifecycle
 ```
 
-### 2. Verify Cloud Dataflow Streaming Job
-```bash
-gcloud dataflow jobs list --region=europe-west4 --project=elevate-cyvisser --status=active
-```
-*Console URL*: Open [https://console.cloud.google.com/dataflow/jobs](https://console.cloud.google.com/dataflow/jobs) to view the real-time execution graph, worker autoscaling, and throughput metrics.
+## Status
 
-### 3. Verify BigQuery CDC Table Schema
-```bash
-bq show elevate-cyvisser:redwood_retail.retail_cdc
-```
+The loop is closed and verified end to end against the live project. The mobile
+client writes the login session itself and watches the outcome over SSE, and
+the price the customer pays comes from the offer the agent issued: there is no
+tier discount anywhere in the system, so `demo1` pays list price and `demo2`
+pays whatever its offer says. The Redwood Console runs beside the phone on
+`/console` for the operator's view, and its **Reset Demo** button restores
+the seeded dataset and warms the agent in about three seconds.
+`scripts/verify_demo_flow.py` still writes sessions directly, which is how the
+pipeline is checked without a browser.
 
----
-
-## 5. Testing Real-Time Replication
-
-### A. Generate Batch Retail Orders
-Execute [`generate_retail_dataset.py`](file:///usr/local/google/home/cyvisser/source/firestore/redwood/generate_retail_dataset.py) to write synthetic e-commerce orders into Firestore Native:
-```bash
-python3 generate_retail_dataset.py --count 100 --workers 4
-```
-
-### B. Query Replicated CDC Records in BigQuery
-Run a query against BigQuery to confirm events were streamed in real time:
-```sql
-SELECT 
-  order_id, 
-  operation_type, 
-  customer_name, 
-  order_status, 
-  payment_status, 
-  grand_total, 
-  currency, 
-  change_timestamp,
-  JSON_VALUE(document_data, "$.paymentMethod") AS payment_method
-FROM `elevate-cyvisser.redwood_retail.retail_cdc`
-ORDER BY change_timestamp DESC
-LIMIT 10;
-```
-
----
-
-## 6. BigQuery ML Customer Churn Prediction & Analytics
-
-The file [`bigquery_churn_sentiment_analysis.sql`](file:///usr/local/google/home/cyvisser/source/firestore/redwood/bigquery_churn_sentiment_analysis.sql) implements an end-to-end Machine Learning pipeline directly inside Google BigQuery using **BigQuery ML (`logistic_reg`)**.
-
-### Running BigQuery ML Pipeline with `.env`:
-```bash
-# 1. Preview / Dry-run rendered SQL statements with .env parameters:
-python3 run_bigquery_analysis.py --dry-run
-
-# 2. Execute all views, models, and predictions against BigQuery:
-python3 run_bigquery_analysis.py --execute
-```
-
----
-
-## 7. Teardown & Cleanup
-
-To destroy all cloud resources, stop billing, and drain Dataflow streaming pipelines:
+Everything the demo does at runtime runs in the cloud. The app and console are
+one Cloud Run service (`redwood-app`) and the churn pipeline is another
+(`redwood-churn`); the console's **Recalculate Churn** button calls the latter
+over HTTP and streams its log back into the Event Log. Neither service is
+public — both are `roles/run.invoker` only — so `deploy.sh` finishes by opening
+a local proxy and printing the URLs to open:
 
 ```bash
-./teardown.sh
+python3 scripts/run_proxy.py --url "${APP_URL}" --port 8080
+# Mobile app:      http://localhost:8080
+# Redwood Console: http://localhost:8080/console
 ```
 
----
+For frontend work there is still a local mode, which builds the frontend and
+runs the backend against the same deployed churn function:
 
-## 8. Security & Authentication Architecture
+```bash
+./mobile_client/start_mobile_app.sh          # phone on :5174, console on :5174/console.html
+ENABLE_DEMO_CONTROLS=0 ./mobile_client/start_mobile_app.sh   # without the operator controls
+```
 
-* **Zero-Secret Design**: No usernames, passwords, or credentials stored on disk.
-* **IAM & Application Default Credentials (ADC)**: All Python applications and Beam worker VMs authenticate with native Google Cloud IAM.
-* **Private Worker Isolation**: Dataflow worker VMs run with private IP addresses (`--no_use_public_ips`) inside `redwood-dataflow-subnet` and route external requests through Cloud NAT.

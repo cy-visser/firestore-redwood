@@ -1,0 +1,343 @@
+"""BigQuery Storage Write API client with CDC (UPSERT/DELETE) support."""
+
+from __future__ import annotations
+
+import logging
+import threading
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from google.api_core import exceptions as gexc
+from google.cloud import bigquery
+from google.cloud.bigquery_storage_v1 import BigQueryWriteClient, types, writer
+from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+
+from schemas import BOOL, FLOAT64, INT64, JSON, STRING, TIMESTAMP, Column, TableSpec
+
+logger = logging.getLogger(__name__)
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+# BigQuery column type -> protobuf wire type.
+_PROTO_TYPE = {
+    STRING: descriptor_pb2.FieldDescriptorProto.TYPE_STRING,
+    JSON: descriptor_pb2.FieldDescriptorProto.TYPE_STRING,
+    INT64: descriptor_pb2.FieldDescriptorProto.TYPE_INT64,
+    TIMESTAMP: descriptor_pb2.FieldDescriptorProto.TYPE_INT64,
+    FLOAT64: descriptor_pb2.FieldDescriptorProto.TYPE_DOUBLE,
+    BOOL: descriptor_pb2.FieldDescriptorProto.TYPE_BOOL,
+}
+
+# BigQuery column type -> SQL type used when creating tables.
+_SQL_TYPE = {
+    STRING: "STRING",
+    JSON: "JSON",
+    INT64: "INT64",
+    TIMESTAMP: "TIMESTAMP",
+    FLOAT64: "FLOAT64",
+    BOOL: "BOOL",
+}
+
+CHANGE_TYPE_COLUMN = "_CHANGE_TYPE"
+CHANGE_SEQUENCE_COLUMN = "_CHANGE_SEQUENCE_NUMBER"
+
+
+def _to_micros(value: datetime) -> int:
+    """Convert a datetime to microseconds since the Unix epoch."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return int((value - _EPOCH).total_seconds() * 1_000_000)
+
+
+def sequence_number(commit_time: datetime) -> str:
+    """Render a commit time as a hex-encoded sequence number."""
+    return format(_to_micros(commit_time), "x")
+
+
+def coerce(value: Any, bq_type: str) -> Optional[Any]:
+    """Convert a decoded Firestore value to the proto representation."""
+    if value is None:
+        return None
+
+    try:
+        if bq_type == STRING:
+            if isinstance(value, datetime):
+                return value.isoformat()
+            if isinstance(value, (dict, list)):
+                import json
+
+                return json.dumps(value, default=str)
+            return str(value)
+
+        if bq_type == JSON:
+            if isinstance(value, str):
+                return value
+            import json
+
+            return json.dumps(value, default=str)
+
+        if bq_type == INT64:
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, datetime):
+                return _to_micros(value)
+            return int(float(value))
+
+        if bq_type == FLOAT64:
+            if isinstance(value, bool):
+                return float(value)
+            return float(value)
+
+        if bq_type == BOOL:
+            if isinstance(value, str):
+                return value.strip().lower() in ("true", "1", "yes", "y")
+            return bool(value)
+
+        if bq_type == TIMESTAMP:
+            if isinstance(value, datetime):
+                return _to_micros(value)
+            if isinstance(value, (int, float)):
+                # Heuristic: values this large are already microseconds.
+                return int(value) if abs(value) > 1e12 else int(value * 1_000_000)
+            if isinstance(value, str):
+                text = value.strip()
+                if text.endswith("Z"):
+                    text = text[:-1] + "+00:00"
+                parsed = datetime.fromisoformat(text)
+                return _to_micros(parsed)
+            return None
+    except (TypeError, ValueError):
+        logger.debug("Dropping unconvertible value %r for %s", value, bq_type)
+        return None
+
+    return None
+
+
+def build_message_class(spec: TableSpec, include_cdc: bool):
+    """Compile a protobuf message matching ``spec`` at runtime."""
+    file_proto = descriptor_pb2.FileDescriptorProto()
+    file_proto.name = f"redwood_{spec.table_id}.proto"
+    file_proto.package = "redwood"
+    file_proto.syntax = "proto2"
+
+    message = file_proto.message_type.add()
+    message.name = f"{spec.table_id.title().replace('_', '')}Row"
+
+    number = 1
+    for column in spec.columns:
+        proto_type = _PROTO_TYPE.get(column.bq_type)
+        if proto_type is None:
+            raise ValueError(
+                f"{spec.table_id}.{column.name}: no proto mapping for {column.bq_type}"
+            )
+        field = message.field.add()
+        field.name = column.name
+        field.number = number
+        field.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+        field.type = proto_type
+        number += 1
+
+    if include_cdc:
+        for pseudo in (CHANGE_TYPE_COLUMN, CHANGE_SEQUENCE_COLUMN):
+            field = message.field.add()
+            field.name = pseudo
+            field.number = number
+            field.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+            field.type = descriptor_pb2.FieldDescriptorProto.TYPE_STRING
+            number += 1
+
+    pool = descriptor_pool.DescriptorPool()
+    file_descriptor = pool.Add(file_proto)
+    descriptor = file_descriptor.message_types_by_name[message.name]
+
+    if hasattr(message_factory, "GetMessageClass"):  # protobuf >= 4.22
+        return message_factory.GetMessageClass(descriptor)
+    return message_factory.MessageFactory(pool).GetPrototype(descriptor)  # pragma: no cover
+
+
+def create_table_ddl(project: str, dataset: str, spec: TableSpec) -> str:
+    """Render ``CREATE TABLE IF NOT EXISTS`` DDL for a table spec."""
+    columns = ",\n  ".join(
+        f"`{c.name}` {_SQL_TYPE[c.bq_type]}"
+        + (f" OPTIONS(description={_quote(c.description)})" if c.description else "")
+        for c in spec.columns
+    )
+
+    clauses = [f"CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{spec.table_id}` (",
+               f"  {columns}"]
+
+    if spec.primary_key:
+        keys = ", ".join(f"`{k}`" for k in spec.primary_key)
+        # NOT ENFORCED is required for BigQuery CDC primary keys.
+        clauses.append(f"  , PRIMARY KEY ({keys}) NOT ENFORCED")
+
+    clauses.append(")")
+
+    if spec.partition_field:
+        clauses.append(f"PARTITION BY DATE(`{spec.partition_field}`)")
+    if spec.clustering:
+        clauses.append("CLUSTER BY " + ", ".join(f"`{c}`" for c in spec.clustering))
+    if spec.description:
+        clauses.append(f"OPTIONS(description={_quote(spec.description)})")
+
+    return "\n".join(clauses)
+
+
+def _quote(text: str) -> str:
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+class TableWriter:
+    """A long-lived append stream for one destination table."""
+
+    def __init__(
+        self,
+        client: BigQueryWriteClient,
+        project: str,
+        dataset: str,
+        spec: TableSpec,
+    ) -> None:
+        self._client = client
+        self._spec = spec
+        self._parent = client.table_path(project, dataset, spec.table_id)
+        self._stream_name = f"{self._parent}/_default"
+        self._message_class = build_message_class(spec, include_cdc=spec.supports_cdc)
+        self._stream: Optional[writer.AppendRowsStream] = None
+        self._lock = threading.Lock()
+
+    @property
+    def spec(self) -> TableSpec:
+        return self._spec
+
+    def _request_template(self) -> types.AppendRowsRequest:
+        descriptor = descriptor_pb2.DescriptorProto()
+        self._message_class.DESCRIPTOR.CopyToProto(descriptor)
+
+        proto_schema = types.ProtoSchema(proto_descriptor=descriptor)
+        template = types.AppendRowsRequest()
+        template.write_stream = self._stream_name
+        template.proto_rows = types.AppendRowsRequest.ProtoData(writer_schema=proto_schema)
+        return template
+
+    def _ensure_stream(self) -> writer.AppendRowsStream:
+        if self._stream is None:
+            self._stream = writer.AppendRowsStream(self._client, self._request_template())
+        return self._stream
+
+    def _reset(self) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.close()
+            except Exception:  # noqa: BLE001 - already broken, nothing to salvage
+                pass
+            self._stream = None
+
+    def build_row(
+        self,
+        values: Dict[str, Any],
+        change_type: Optional[str] = None,
+        change_sequence: Optional[str] = None,
+    ) -> bytes:
+        """Serialise one row, leaving absent values unset so they land as NULL."""
+        message = self._message_class()
+
+        if change_type == "DELETE":
+            keys = set(self._spec.primary_key)
+            payload = {k: v for k, v in values.items() if k in keys}
+        else:
+            payload = values
+
+        for column in self._spec.columns:
+            value = payload.get(column.name)
+            if value is None:
+                continue
+            setattr(message, column.name, value)
+
+        if self._spec.supports_cdc and change_type:
+            setattr(message, CHANGE_TYPE_COLUMN, change_type)
+            if change_sequence:
+                setattr(message, CHANGE_SEQUENCE_COLUMN, change_sequence)
+
+        return message.SerializeToString()
+
+    def append(self, serialized_rows: Sequence[bytes], timeout: float = 30.0) -> None:
+        """Append rows, retrying once on a broken stream."""
+        if not serialized_rows:
+            return
+
+        for attempt in (1, 2):
+            stream: Optional[writer.AppendRowsStream] = None
+            try:
+                with self._lock:
+                    stream = self._ensure_stream()
+                    request = types.AppendRowsRequest()
+                    request.proto_rows = types.AppendRowsRequest.ProtoData(
+                        rows=types.ProtoRows(serialized_rows=list(serialized_rows))
+                    )
+                    future = stream.send(request)
+                future.result(timeout=timeout)
+                return
+            except (gexc.GoogleAPICallError, gexc.RetryError, ValueError, OSError) as err:
+                with self._lock:
+                    if stream is None or self._stream is stream:
+                        self._reset()
+                if attempt == 2:
+                    raise
+                logger.warning(
+                    "Append to %s failed (%s), reopening stream",
+                    self._spec.table_id,
+                    type(err).__name__,
+                )
+
+    def close(self) -> None:
+        with self._lock:
+            self._reset()
+
+
+class CdcSink:
+    """Owns the write client and one :class:`TableWriter` per destination."""
+
+    def __init__(self, project: str, dataset: str) -> None:
+        self._project = project
+        self._dataset = dataset
+        self._client = BigQueryWriteClient()
+        self._writers: Dict[str, TableWriter] = {}
+        self._lock = threading.Lock()
+
+    def writer_for(self, spec: TableSpec) -> TableWriter:
+        with self._lock:
+            existing = self._writers.get(spec.table_id)
+            if existing is None:
+                existing = TableWriter(self._client, self._project, self._dataset, spec)
+                self._writers[spec.table_id] = existing
+            return existing
+
+    def ensure_tables(self, specs: Sequence[TableSpec]) -> List[Tuple[str, str]]:
+        """Create any missing destination tables. Returns (table, status) pairs."""
+        bq = bigquery.Client(project=self._project)
+        results: List[Tuple[str, str]] = []
+        for spec in specs:
+            ddl = create_table_ddl(self._project, self._dataset, spec)
+            try:
+                bq.query(ddl).result()
+                results.append((spec.table_id, "ready"))
+            except Exception as err:  # noqa: BLE001 - report, do not abort startup
+                logger.error("Could not ensure table %s: %s", spec.table_id, err)
+                results.append((spec.table_id, f"error: {err}"))
+        bq.close()
+        return results
+
+    def close(self) -> None:
+        with self._lock:
+            for table_writer in self._writers.values():
+                table_writer.close()
+            self._writers.clear()
+
+
+def extract_row(spec: TableSpec, ctx) -> Dict[str, Any]:
+    """Project a document into the column values for one table."""
+    row: Dict[str, Any] = {}
+    for column in spec.columns:
+        row[column.name] = coerce(column.extract(ctx), column.bq_type)
+    return row

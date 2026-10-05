@@ -1,4 +1,4 @@
-# Dedicated Service Account for Dataflow Pipeline & Applications
+# Dedicated Service Account for the CDC service, churn jobs and the agent.
 resource "google_service_account" "pipeline_sa" {
   project      = var.project_id
   account_id   = var.service_account_id
@@ -30,46 +30,35 @@ resource "google_project_iam_member" "sa_bigquery_job_user" {
   member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
 }
 
-# Service Account Dataflow Worker Role
-resource "google_project_iam_member" "sa_dataflow_worker" {
-  project = var.project_id
-  role    = "roles/dataflow.worker"
-  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
-}
-
-# Service Account Dataflow Admin Role
-resource "google_project_iam_member" "sa_dataflow_admin" {
-  project = var.project_id
-  role    = "roles/dataflow.admin"
-  member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
-}
-
-# Service Account GCS Object Admin Role (for Dataflow staging/temp buckets)
+# Service Account GCS Object Admin Role (build sources, exports)
 resource "google_project_iam_member" "sa_storage_admin" {
   project = var.project_id
   role    = "roles/storage.objectAdmin"
   member  = "serviceAccount:${google_service_account.pipeline_sa.email}"
 }
 
-# Allow Dataflow Service Agent to access and act as the custom worker service account
-resource "google_service_account_iam_member" "dataflow_sa_actas" {
-  service_account_id = google_service_account.pipeline_sa.name
-  role               = "roles/iam.serviceAccountUser"
-  member             = "serviceAccount:service-${data.google_project.project.number}@dataflow-service-producer-prod.iam.gserviceaccount.com"
+# ------------------------------------------------------------------------------
+# Demo Principals: dedicated IAM service accounts representing the two mobile
+# client users (demo1 = healthy/low churn risk, demo2 = at-risk/high churn risk).
+# Restored from commit d1bf104^, where they were removed unintentionally.
+# ------------------------------------------------------------------------------
+resource "google_service_account" "demo_principals" {
+  for_each     = toset(var.demo_principal_ids)
+  project      = var.project_id
+  account_id   = each.key
+  display_name = "Redwood Retail Demo Principal ${each.key}"
 
   depends_on = [
-    google_project_service_identity.dataflow_sa
+    google_project_service.services["iam.googleapis.com"]
   ]
 }
 
-resource "google_service_account_iam_member" "dataflow_sa_service_agent" {
-  service_account_id = google_service_account.pipeline_sa.name
-  role               = "roles/dataflow.serviceAgent"
-  member             = "serviceAccount:service-${data.google_project.project.number}@dataflow-service-producer-prod.iam.gserviceaccount.com"
-
-  depends_on = [
-    google_project_service_identity.dataflow_sa
-  ]
+# Demo principals need Firestore read/write to create sessions and read offers.
+resource "google_project_iam_member" "demo_principals_firestore" {
+  for_each = toset(var.demo_principal_ids)
+  project  = var.project_id
+  role     = "roles/datastore.user"
+  member   = "serviceAccount:${google_service_account.demo_principals[each.key].email}"
 }
 
 # Service Account Vertex AI User Role (for Gemini reasoning in Loyalty Agent)
@@ -128,5 +117,9 @@ resource "google_service_account_iam_member" "re_dedicated_agent_engine_sa_user"
   ]
 }
 
-
+# Note: roles/cloudbuild.builds.builder on the default Compute Engine service
+# account (${project_number}-compute@developer.gserviceaccount.com) is granted
+# by deploy.sh in Step 1 (before Terraform runs) and intentionally omitted here
+# so `teardown.sh` (`terraform destroy`) does not revoke it and trigger a ~60s
+# GCS IAM negative-cache 403 window on the next `./deploy.sh`.
 
