@@ -28,6 +28,8 @@ VERIFY_DEMO=false
 SKIP_IMAGE_BUILD=false
 SKIP_AGENT_DEPLOY=false
 START_PROXY=true
+PROXY_ONLY=false
+VERBOSE=false
 
 usage() {
   cat <<EOF
@@ -45,17 +47,21 @@ Options:
   --skip-bqml              Skip training and evaluating BigQuery ML churn models.
   --skip-image-build       Reuse the container images already in Artifact Registry.
   --skip-agent-deploy      Leave the deployed loyalty agent as it is.
+  --proxy, --tunnel        Open the authenticated local tunnel to the already-deployed
+                           redwood-app without re-running deployment steps.
   --no-proxy               Finish after deploying instead of opening the authenticated proxy
                            to redwood-app. Use for CI and unattended runs.
   --dry-run                Validate configuration and run Terraform plan without modifying GCP resources.
   -t, --teardown, --destroy Cleanly tear down all provisioned GCP infrastructure and stop jobs.
   -y, --auto-approve       Skip confirmation prompts during deployment or teardown.
+  -v, --verbose            Stream full Cloud Build and Terraform output instead of concise progress lines.
   --run-tests              Execute the CDC and loyalty agent self-test suites and exit.
   --verify-demo            Write a session for each demo customer against the deployed
                            stack and check the agent reacts correctly, then exit.
 
 Examples:
   ./deploy.sh                         # Deploy everything, then open the app in a local proxy
+  ./deploy.sh --proxy                 # Reopen the authenticated tunnel to redwood-app
   ./deploy.sh --no-proxy              # Deploy and exit without holding a tunnel
   ./deploy.sh --run-tests             # Execute the self-test suites
   ./deploy.sh --verify-demo           # Check the deployed stack end to end
@@ -97,6 +103,11 @@ while [[ $# -gt 0 ]]; do
       SKIP_AGENT_DEPLOY=true
       shift
       ;;
+    --proxy|--tunnel)
+      PROXY_ONLY=true
+      START_PROXY=true
+      shift
+      ;;
     --no-proxy)
       START_PROXY=false
       shift
@@ -111,6 +122,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -y|--auto-approve)
       AUTO_APPROVE=true
+      shift
+      ;;
+    -v|--verbose)
+      VERBOSE=true
       shift
       ;;
     --run-tests)
@@ -490,7 +505,7 @@ echo "Region:              $GCP_REGION"
 echo "Firestore Database:  $FIRESTORE_DATABASE_ID (Native Mode, collection: $FIRESTORE_COLLECTION)"
 echo "BigQuery Sink:       $BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE (ledger) + $BIGQUERY_ORDERS_TABLE (mirror)"
 echo "Replication:         Eventarc -> Cloud Run -> BigQuery Storage Write API"
-echo "Mode:                $([[ "$TEARDOWN_MODE" == true ]] && echo "TEARDOWN" || ([[ "$DRY_RUN" == true ]] && echo "DRY RUN / PLAN" || echo "FULL DEPLOYMENT"))"
+echo "Mode:                $([[ "$TEARDOWN_MODE" == true ]] && echo "TEARDOWN" || ([[ "$DRY_RUN" == true ]] && echo "DRY RUN / PLAN" || ([[ "$PROXY_ONLY" == true ]] && echo "TUNNEL ONLY" || echo "FULL DEPLOYMENT")))"
 echo "================================================================="
 
 # The gcloud presence check lives in preflight_sdk above, which has already
@@ -582,6 +597,62 @@ import fastapi, uvicorn, httpx, pytest
   fi
 }
 
+launch_proxy() {
+  local step_label="${1:-Step 7/7: }"
+  PROXY_PORT="${PROXY_PORT:-$(find_free_port 8080)}"
+
+  # Backgrounded first and only announced once it is listening. Printing
+  # http://localhost:$PROXY_PORT any earlier is actively harmful here: the IDE
+  # scans terminal output for URLs and immediately binds the port for
+  # auto-forwarding, stealing it from the proxy that is still starting. This is
+  # the same hazard mobile_client/start_mobile_app.sh documents at its uvicorn
+  # launch.
+  echo ""
+  echo "🔌 ${step_label}Opening an authenticated tunnel to redwood-app..."
+  # Exported rather than passed as flags: the tunnel resolves the account to
+  # impersonate through the same helper the backend uses, which reads these.
+  PIPELINE_SERVICE_ACCOUNT="$PIPELINE_SERVICE_ACCOUNT" \
+  GCP_PROJECT_ID="$GCP_PROJECT_ID" \
+    "$PYTHON_EXEC" "$REDWOOD_DIR/scripts/run_proxy.py" \
+      --url "$APP_URL" --port "$PROXY_PORT" &
+  PROXY_PID=$!
+
+  cleanup_proxy() {
+    trap - SIGINT SIGTERM EXIT
+    kill -TERM "$PROXY_PID" 2>/dev/null || true
+    wait "$PROXY_PID" 2>/dev/null || true
+    echo ""
+    echo "[INFO] Tunnel closed. redwood-app is still running in $GCP_REGION."
+    echo "       Reopen the tunnel any time with: ./deploy.sh --proxy"
+  }
+  trap cleanup_proxy SIGINT SIGTERM EXIT
+
+  if ! wait_for_port "$PROXY_PORT" 30; then
+    echo "❌ The proxy did not bind port $PROXY_PORT." >&2
+    echo "   Check that ${ACTIVE_ACCOUNT:-your account} holds roles/run.invoker on redwood-app:" >&2
+    echo "     gcloud run services get-iam-policy redwood-app --region=$GCP_REGION" >&2
+    exit 1
+  fi
+
+  echo ""
+  echo "================================================================="
+  echo " 🌲 REDWOOD RETAIL IS LIVE (served from Cloud Run)"
+  echo "================================================================="
+  echo " Mobile App:       http://localhost:$PROXY_PORT/"
+  echo " Redwood Console:  http://localhost:$PROXY_PORT/console"
+  echo " API Docs:         http://localhost:$PROXY_PORT/docs"
+  echo "-----------------------------------------------------------------"
+  echo " Both are served by redwood-app in $GCP_REGION. This terminal only"
+  echo " holds the authenticated tunnel; Ctrl+C closes it and leaves the"
+  echo " service running."
+  echo ""
+  echo " In the demo, sign in as demo2: it is scored CRITICAL and receives"
+  echo " an offer. demo1 is LOW and does not."
+  echo "================================================================="
+
+  wait "$PROXY_PID"
+}
+
 # ------------------------------------------------------------------------------
 # 1.1 Optional: Automated Test Runner & Agent Run Modes
 # ------------------------------------------------------------------------------
@@ -623,8 +694,61 @@ if [[ "$VERIFY_DEMO" == true ]]; then
   exit 0
 fi
 
+if [[ "$PROXY_ONLY" == true ]]; then
+  APP_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw app_service_url 2>/dev/null || true)
+  if [[ -z "$APP_URL" ]]; then
+    APP_URL=$(gcloud run services describe redwood-app \
+      --region="$GCP_REGION" --project="$GCP_PROJECT_ID" \
+      --format='value(status.url)' 2>/dev/null || true)
+  fi
+  if [[ -z "$APP_URL" ]]; then
+    echo "❌ Could not find a deployed redwood-app service in $GCP_PROJECT_ID ($GCP_REGION)." >&2
+    echo "   Run ./deploy.sh first to provision the stack." >&2
+    exit 1
+  fi
+  launch_proxy ""
+  exit 0
+fi
+
 # Everything from here on runs Terraform against the root state.
 guard_state_project
+
+run_tf_init() {
+  if [[ "$VERBOSE" == true ]]; then
+    terraform -chdir="$TERRAFORM_DIR" init
+    return $?
+  fi
+  local log_file status=0
+  log_file="$(mktemp -t redwood-tf-init-XXXXXX.log)"
+  terraform -chdir="$TERRAFORM_DIR" init -input=false -no-color >"$log_file" 2>&1 || status=$?
+  if [[ $status -ne 0 ]]; then
+    cat "$log_file" >&2
+  fi
+  rm -f "$log_file"
+  return "$status"
+}
+
+# Streams only one-line resource lifecycle transitions and final summary lines
+# unless VERBOSE=true. If Terraform exits non-zero, dumps the full captured log.
+run_tf_apply() {
+  if [[ "$VERBOSE" == true ]]; then
+    terraform -chdir="$TERRAFORM_DIR" "$@"
+    return $?
+  fi
+  local log_file status=0
+  log_file="$(mktemp -t redwood-tf-XXXXXX.log)"
+  terraform -chdir="$TERRAFORM_DIR" "$@" -compact-warnings -input=false -no-color 2>&1 \
+    | tee "$log_file" \
+    | awk '/: (Creating\.\.\.|Creation complete|Modifying\.\.\.|Modifications complete|Destroying\.\.\.|Destruction complete)|^(Apply|Destroy) complete!|^No changes\./ { print "   " $0; fflush() }' \
+    || status=$?
+  if [[ $status -ne 0 ]]; then
+    cat "$log_file" >&2
+  fi
+  rm -f "$log_file"
+  return "$status"
+}
+
+run_tf_init
 
 # ------------------------------------------------------------------------------
 # 2. TEARDOWN LIFECYCLE
@@ -642,7 +766,7 @@ if [[ "$TEARDOWN_MODE" == true ]]; then
   echo -e "\n🧹 Destroying cloud infrastructure via Terraform..."
   MAX_DESTROY_ATTEMPTS=3
   for ((attempt=1; attempt<=MAX_DESTROY_ATTEMPTS; attempt++)); do
-    if terraform -chdir="$TERRAFORM_DIR" destroy -auto-approve; then
+    if run_tf_apply destroy -auto-approve; then
       echo -e "\n🎉 Teardown completed successfully! All cloud resources have been cleaned up."
       exit 0
     else
@@ -663,7 +787,6 @@ fi
 # ------------------------------------------------------------------------------
 if [[ "$DRY_RUN" == true ]]; then
   echo -e "\n🔍 Running Terraform Plan (Dry Run)..."
-  terraform -chdir="$TERRAFORM_DIR" init
   terraform -chdir="$TERRAFORM_DIR" plan
   echo -e "\n✅ Dry run completed. No infrastructure changes were applied."
   exit 0
@@ -683,8 +806,7 @@ APP_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}
 
 ensure_build_prerequisites() {
   echo "   Provisioning APIs, Cloud Build permissions, and Artifact Registry via Terraform..."
-  terraform -chdir="$TERRAFORM_DIR" init
-  terraform -chdir="$TERRAFORM_DIR" apply -auto-approve \
+  run_tf_apply apply -auto-approve \
     -target=google_project_service.services \
     -target=google_project_service_identity.compute_sa \
     -target=google_project_iam_member.compute_sa_cloudbuild_builder \
@@ -695,16 +817,29 @@ submit_build() {
   # GCS caches IAM policy evaluations for ~60s after a fresh grant on
   # ${project_number}-compute@developer.gserviceaccount.com, so allow up to 75s
   # (5 x 15s waits across 6 attempts) before giving up.
-  local max_attempts=6 attempt
+  local max_attempts=6 attempt log_file
+  log_file="$(mktemp -t redwood-build-XXXXXX.log)"
   for ((attempt=1; attempt<=max_attempts; attempt++)); do
-    if gcloud builds submit "$@"; then
-      return 0
+    if [[ "$VERBOSE" == true ]]; then
+      if gcloud builds submit "$@"; then
+        rm -f "$log_file"
+        return 0
+      fi
+    else
+      if gcloud builds submit "$@" >"$log_file" 2>&1; then
+        rm -f "$log_file"
+        return 0
+      fi
     fi
     if [[ $attempt -lt $max_attempts ]]; then
       echo "⚠️  Cloud Build submission failed (attempt $attempt/$max_attempts); waiting 15s for IAM propagation before retrying..."
       sleep 15
     fi
   done
+  if [[ "$VERBOSE" != true && -s "$log_file" ]]; then
+    cat "$log_file" >&2
+  fi
+  rm -f "$log_file"
   return 1
 }
 
@@ -787,8 +922,6 @@ pin_digest "$APP_IMAGE" TF_VAR_app_image_digest
 
 echo -e "\n🚀 Step 2/7: Provisioning Infrastructure via Terraform..."
 
-terraform -chdir="$TERRAFORM_DIR" init
-
 # Migrate existing states off the legacy terraform_data local-exec wrapper
 # without triggering its destroy-time provisioner, and adopt the database into
 # the native google_firestore_database resource if it already exists in GCP.
@@ -796,13 +929,13 @@ terraform -chdir="$TERRAFORM_DIR" state rm terraform_data.firestore_database &>/
 if ! terraform -chdir="$TERRAFORM_DIR" state show google_firestore_database.database &>/dev/null; then
   if gcloud firestore databases describe --database="$FIRESTORE_DATABASE_ID" \
        --project="$GCP_PROJECT_ID" &>/dev/null; then
-    terraform -chdir="$TERRAFORM_DIR" import \
+    terraform -chdir="$TERRAFORM_DIR" import -input=false \
       google_firestore_database.database \
-      "projects/${GCP_PROJECT_ID}/databases/${FIRESTORE_DATABASE_ID}"
+      "projects/${GCP_PROJECT_ID}/databases/${FIRESTORE_DATABASE_ID}" >/dev/null
   fi
 fi
 
-terraform -chdir="$TERRAFORM_DIR" apply -auto-approve
+run_tf_apply apply -auto-approve
 
 CDC_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw cdc_service_url 2>/dev/null || true)
 BRIDGE_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw agent_bridge_url 2>/dev/null || true)
@@ -1065,7 +1198,7 @@ echo "================================================================="
 if [[ "$START_PROXY" != true ]]; then
   echo ""
   echo " Skipping the tunnel (--no-proxy). To open the app later:"
-  echo "   $PYTHON_EXEC scripts/run_proxy.py --url $APP_URL --port 8080"
+  echo "   ./deploy.sh --proxy"
   exit 0
 fi
 
@@ -1075,55 +1208,4 @@ if [[ -z "${APP_URL:-}" ]]; then
   exit 0
 fi
 
-PROXY_PORT="${PROXY_PORT:-$(find_free_port 8080)}"
-
-# Backgrounded first and only announced once it is listening. Printing
-# http://localhost:$PROXY_PORT any earlier is actively harmful here: the IDE
-# scans terminal output for URLs and immediately binds the port for
-# auto-forwarding, stealing it from the proxy that is still starting. This is
-# the same hazard mobile_client/start_mobile_app.sh documents at its uvicorn
-# launch.
-echo ""
-echo "🔌 Step 7/7: Opening an authenticated tunnel to redwood-app..."
-# Exported rather than passed as flags: the tunnel resolves the account to
-# impersonate through the same helper the backend uses, which reads these.
-PIPELINE_SERVICE_ACCOUNT="$PIPELINE_SERVICE_ACCOUNT" \
-GCP_PROJECT_ID="$GCP_PROJECT_ID" \
-  "$PYTHON_EXEC" "$REDWOOD_DIR/scripts/run_proxy.py" \
-    --url "$APP_URL" --port "$PROXY_PORT" &
-PROXY_PID=$!
-
-cleanup_proxy() {
-  trap - SIGINT SIGTERM EXIT
-  kill -TERM "$PROXY_PID" 2>/dev/null || true
-  wait "$PROXY_PID" 2>/dev/null || true
-  echo ""
-  echo "[INFO] Tunnel closed. redwood-app is still running in $GCP_REGION."
-}
-trap cleanup_proxy SIGINT SIGTERM EXIT
-
-if ! wait_for_port "$PROXY_PORT" 30; then
-  echo "❌ The proxy did not bind port $PROXY_PORT." >&2
-  echo "   Check that ${ACTIVE_ACCOUNT:-your account} holds roles/run.invoker on redwood-app:" >&2
-  echo "     gcloud run services get-iam-policy redwood-app --region=$GCP_REGION" >&2
-  exit 1
-fi
-
-echo ""
-echo "================================================================="
-echo " 🌲 REDWOOD RETAIL IS LIVE (served from Cloud Run)"
-echo "================================================================="
-echo " Mobile App:       http://localhost:$PROXY_PORT/"
-echo " Redwood Console:  http://localhost:$PROXY_PORT/console"
-echo " API Docs:         http://localhost:$PROXY_PORT/docs"
-echo "-----------------------------------------------------------------"
-echo " Both are served by redwood-app in $GCP_REGION. This terminal only"
-echo " holds the authenticated tunnel; Ctrl+C closes it and leaves the"
-echo " service running."
-echo ""
-echo " In the demo, sign in as demo2: it is scored CRITICAL and receives"
-echo " an offer. demo1 is LOW and does not."
-echo "================================================================="
-
-wait "$PROXY_PID"
-
+launch_proxy "Step 7/7: "

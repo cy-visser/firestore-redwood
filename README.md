@@ -63,12 +63,13 @@ The power of Firestore in this use case is its native capability of synchronizin
    ./deploy.sh
    ```
 
-7. Open the **Mobile App** and **Redwood Console** URLs printed at the end (`http://localhost:<port>/` and `http://localhost:<port>/console`). Keep the terminal open; `Ctrl+C` closes the tunnel.
+7. Open the **Mobile App** and **Redwood Console** URLs printed at the end (`http://localhost:<port>/` and `http://localhost:<port>/console`). Keep the terminal open; `Ctrl+C` closes the tunnel (run `./deploy.sh --proxy` to reopen it later).
 
 ### Other commands
 
 | Command | Use |
 | :---- | :---- |
+| `./deploy.sh --proxy` | Reopen the local tunnel to `redwood-app` without redeploying |
 | `./deploy.sh --dry-run` | Show the Terraform plan without changing anything |
 | `./deploy.sh --skip-image-build` | Redeploy without rebuilding the container images |
 | `./deploy.sh --skip-seed` | Redeploy without reseeding Firestore |
