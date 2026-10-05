@@ -1,418 +1,248 @@
 # Redwood Retail: Architecture
 
-Redwood Retail is a demonstration of an autonomous retention loop on Google
-Cloud. A customer logs in, and within seconds either receives a personalised
-loyalty offer or does not, depending on a churn score that BigQuery computed
-from that customer's own order history. Nothing in the path is scheduled or
-polled; every step is driven by a database write.
+For context about this solution and for how to deploy and run the demo, see [demo_flow.md](demo_flow.md).
 
-This document describes what runs, how the pieces fit, and why each choice was
-made. For how to deploy it and run the demo, see [demo_flow.md](demo_flow.md).
+## 1. Architecture Overview
 
----
+![Redwood Retail Architecture Overview](architecture_overview.png)
 
-## 1. The system at a glance
+Two independent event paths share the database:
 
-```mermaid
-flowchart TB
-  subgraph FS["Firestore (database: redwood, Enterprise Native)"]
-    O["/retail/{orderId}"]
-    C["/customers/{customerId}"]
-    S["/customer_sessions/{sessionId}"]
-    L["/loyalty_offers/{offerId}"]
-  end
-
-  subgraph BQ["BigQuery (dataset: redwood_retail)"]
-    LEDGER["retail_cdc<br/>append-only ledger"]
-    CUR["retail_current / customers_current<br/>keyed, UPSERT + DELETE"]
-    FEAT["order_facts view<br/>customer_features(as_of) TVF"]
-    MODEL["customer_churn_model<br/>LOGISTIC_REG"]
-    RISK["customer_churn_risk"]
-  end
-
-  O -->|Eventarc| CDC["Cloud Run<br/>redwood-cdc"]
-  C -->|Eventarc| CDC
-  CDC -->|Storage Write API| LEDGER
-  CDC --> CUR
-  CUR --> FEAT --> MODEL --> RISK
-
-  S -->|Eventarc| BR["Cloud Run<br/>redwood-agent-bridge"]
-  BR --> AE["Agent Engine<br/>redwood-loyalty-agent"]
-  RISK -.->|read churn score| AE
-  AE -->|write offer| L
-  AE -.->|write status back| S
-
-  SCHED["BigQuery scheduled query<br/>daily 03:00 UTC"] -.->|refresh| RISK
-```
-
-Two independent event paths share one database:
-
-- **Replication.** Order and customer writes reach BigQuery in seconds.
-- **Retention.** A session write causes the agent to make a decision.
-
-They are deliberately separate. A failure in replication degrades the freshness
-of the churn scores but does not stop the agent from answering a login, and a
-failure in the agent does not stop data reaching the warehouse.
+- **Replication:** Order and customer writes in Firestore stream into BigQuery
+  within seconds via Eventarc and `redwood-cdc`.
+- **Retention:** A login session write in Firestore triggers
+  `redwood-agent-bridge` and `redwood-loyalty-agent` in Vertex AI Agent Engine,
+  which reads `customer_churn_risk` from BigQuery and writes offers back to
+  Firestore.
 
 ---
 
-## 2. Firestore
+## 2. Client
 
-Database `redwood`, Firestore **Enterprise edition in Native mode**, with
+The client in [mobile_client/](../mobile_client) consists of a React frontend
+and a FastAPI backend serving two interfaces:
+
+- **Mobile App (`/`)**: The customer-facing retail storefront where users sign
+  in as one of the demo personas (`demo1` or `demo2`), browse products, receive
+  and claim loyalty offers, place orders, and submit star ratings and complaint
+  feedback.
+- **Redwood Console (`/console`)**: An operator dashboard showing real-time
+  pipeline hop latencies, live Firestore session and offer documents, BigQuery
+  churn scores, and demo controls (**Reset Demo** and **Recalculate Churn**).
+  Served at `/console.html` under the Vite dev server.
+
+Key interactions:
+
+1. **Login session creation:** Signing in calls `POST /api/session/login`, which
+   writes a document to `customer_sessions/{sessionId}` with
+   `agentProcessingStatus: "PENDING"`. That write triggers the retention
+   pipeline.
+2. **Live offer delivery via SSE (Server-Sent Events):** The backend attaches a
+   Firestore `on_snapshot` listener to the customer's session and active offers,
+   pushing updates to the browser over **Server-Sent Events (SSE)**—a persistent,
+   one-way HTTP stream that delivers database changes to the UI the instant the
+   agent writes them, without client polling.
+3. **Order placement and feedback:** Submitting an order (`POST /api/orders/submit`)
+   validates any claimed `offerId` server-side, applies the discount and free
+   express shipping from the `loyalty_offers` document, and writes the order to
+   `retail/{orderId}`. Rating an order updates `customerFeedback` (including
+   `rating`, `complaintReason`, and `feedbackTimestamp`) on that order document.
+
+---
+
+## 3. Firestore
+
+Database `redwood` runs **Firestore Enterprise edition in Native mode** with
 point-in-time recovery enabled.
 
 | Collection | Written by | Purpose |
 |---|---|---|
-| `retail` | seeder, mobile client | Orders, one document per order |
-| `customers` | seeder, mobile client | Customer profile and rollups |
-| `customer_sessions` | mobile client | One document per login |
-| `loyalty_offers` | the agent | Issued offers |
+| `retail` | Seeder, mobile client | Customer orders and embedded `customerFeedback` |
+| `customers` | Seeder, mobile client | Customer profiles and spend rollups |
+| `customer_sessions` | Mobile client, loyalty agent | One document per login (`PENDING` → `PROCESSING` → `PROCESSED` / `SKIPPED`) |
+| `loyalty_offers` | Loyalty agent, mobile client | Personalized retention offers (`ACTIVE`, `CLAIMED`, `REDEEMED`, `SUPERSEDED`) |
+| `pipeline_traces` | CDC service, bridge, loyalty agent | Per-hop execution timestamps and latencies for the Redwood Console |
 
-`customer_sessions` and `loyalty_offers` carry TTL policies (30 and 90 days) so
-demo runs do not accumulate indefinitely.
-
-### Indexes
-
-Four composite indexes are declared in
-[firestore_indexes.tf](../terraform/firestore_indexes.tf). One of them is worth
-calling out, because its absence caused a silent total failure:
-
-```
-loyalty_offers: (customerId ASC, createdAt DESC)
-```
-
-The agent's cooldown check filters on `customerId`, ranges on `createdAt` and
-orders by `createdAt DESC`. An index of `(customerId, status, createdAt)`
-already existed, but **Firestore matches composite indexes by field prefix**,
-so an index with `status` wedged between the two fields in use cannot serve
-that query. The query raised, and the agent treats a failed cooldown lookup as
-*in cooldown*. The result was that no customer could ever receive an offer, and
-nothing was logged. Both indexes are now declared.
+`customer_sessions` and `loyalty_offers` have Firestore TTL policies (30 and 90
+days) on `ttlExpiryAt` so documents from demo runs expire automatically.
 
 ---
 
-## 3. Replication: Firestore to BigQuery
+## 4. Cloud Run and Eventarc (Replication & Routing)
 
-Implemented by [cdc_service/](../cdc_service), deployed to Cloud Run as
-`redwood-cdc` and driven by two Eventarc triggers, one per collection.
+Everything that runs at demo time runs on Cloud Run. Two services are triggered
+by Eventarc from Firestore document changes (`application/protobuf`
+CloudEvents); two are called directly over HTTP.
 
-### Why not Dataflow
+### CDC Replication (`redwood-cdc`)
 
-The original design used a Dataflow streaming job. It was removed. A Dataflow
-job cannot tail Firestore directly, so it needed a Pub/Sub hop in front of it
-to receive the change events, which meant paying for a permanently running
-worker pool to do work that amounts to reshaping a document into a row. Cloud
-Run does the same job, scales to zero, and receives the change event directly
-from Eventarc. The Dataflow path was also not true CDC: it re-read documents
-rather than consuming the change stream, so a delete was invisible to it and
-left a stale row in BigQuery.
+Implemented in [cdc_service/](../cdc_service) and triggered by writes to
+`retail` and `customers`. It decodes the Firestore protobuf payload and streams
+rows into BigQuery using the **BigQuery Storage Write API**:
 
-### Eventarc constraints worth knowing
-
-These are not obvious and each one cost time to discover:
-
-- `event_data_content_type` is **required**, and only `application/protobuf` is
-  accepted for Firestore sources. `application/json` is rejected at trigger
-  creation with a field violation.
-- Delivery is **at-least-once and unordered**. Every keyed table therefore
-  carries `_CHANGE_SEQUENCE_NUMBER`, so a late-arriving older event cannot
-  overwrite a newer one.
-- Named (non-default) Firestore databases only support Cloud Run and 2nd-gen
-  Cloud Functions as trigger destinations.
-- Both the `eventarc` and `firestore` service identities must already exist and
-  the Eventarc agent must hold `roles/eventarc.serviceAgent`. If they do not,
-  trigger creation fails with a message naming neither of them.
-- One trigger per collection. There is no multi-collection matcher.
-- **Firestore emits no change event when a write leaves a document
-  byte-identical.** The seeder is deterministic, so re-running it without
-  `--drop-existing` produces thousands of no-op writes and zero events. This is
-  why `deploy.sh` reconciles BigQuery unconditionally rather than only when the
-  table looks empty.
-
-### Table shapes
-
-| Table | Shape | Why |
+| BigQuery Table | Shape | Purpose |
 |---|---|---|
-| `retail_cdc` | Append-only ledger | Keeps the full change history, including supersedes and deletes |
-| `retail_current` | `PRIMARY KEY (order_id) NOT ENFORCED` | Current state, UPSERT and DELETE applied |
-| `customers_current` | `PRIMARY KEY (customer_id) NOT ENFORCED` | Same, for customers |
+| `retail_cdc` | Append-only ledger | Full audit trail of every order create, update, and delete |
+| `retail_current` | `PRIMARY KEY (order_id) NOT ENFORCED` | Current state of orders using Storage Write `UPSERT` and `DELETE` |
+| `customers_current` | `PRIMARY KEY (customer_id) NOT ENFORCED` | Current state of customer profiles using `UPSERT` and `DELETE` |
 
-The declared primary key is what enables the Storage Write API's CDC mode; the
-UPSERT and DELETE operations are rejected without it.
+Each keyed write includes `_CHANGE_SEQUENCE_NUMBER` so out-of-order Eventarc
+deliveries cannot overwrite a newer state. For initial seeding or full
+reconciliation, [cdc_service/backfill.py](../cdc_service/backfill.py) walks the
+Firestore collections and streams every document through the same Storage Write
+path.
 
-Rows are written with the **BigQuery Storage Write API**. The Python client has
-no `JsonStreamWriter` (that is Java only), so the service builds a **proto2**
-descriptor at runtime from the table schema. proto2 is required rather than
-proto3 because proto3 cannot distinguish a field that was never set from one
-explicitly set to `0.0` or `""`, and that distinction is the difference between
-"this customer has no recorded complaint" and "this customer complained about
-nothing".
+### Agent Bridge (`redwood-agent-bridge`)
 
-### Backfill
+Implemented in [agent_bridge/](../agent_bridge) and triggered by writes to
+`customer_sessions`. Because Vertex AI Agent Engine is not a direct Eventarc
+target, the bridge receives the session CloudEvent, verifies that
+`agentProcessingStatus == "PENDING"` (ignoring subsequent status updates written
+by the agent itself), resolves `redwood-loyalty-agent` by display name, and
+invokes `query(session_id)` on Agent Engine.
 
-[cdc_service/backfill.py](../cdc_service/backfill.py) walks the collections and
-pushes every document through the same writer the event path uses, so a
-reconciliation cannot drift from live replication. It is idempotent: a second
-pass upserts rather than duplicating. Measured at roughly 138 documents per
-second.
+### Churn Function (`redwood-churn`)
 
----
+Implemented in [churn_service/](../churn_service) as a Cloud Run function
+(`functions-framework`), provisioned by
+[churn_service.tf](../terraform/churn_service.tf). `POST`ing to it renders and
+executes [bigquery_churn_sentiment_analysis.sql](../bigquery_churn_sentiment_analysis.sql)
+— baked into the image, so the on-demand run and the daily scheduled query
+cannot drift apart — and **streams the log back** as `text/plain`, one line per
+chunk, which is what fills the console's Event Log while the model retrains.
 
-## 4. Churn modelling
+Two modes: `full` retrains and rescores; `rescore` runs the scoring `MERGE`
+alone against the existing model, which is what a demo reset uses.
 
-All of it is SQL, in
-[bigquery_churn_sentiment_analysis.sql](../bigquery_churn_sentiment_analysis.sql).
-There is no Python in the scoring path; the model is trained, evaluated and
-applied inside BigQuery.
+Because the response streams, the HTTP status is committed before the first
+BigQuery statement runs, so the outcome is reported **in-band** as a final
+`[exit 0]` or `[exit 1]` line. The console branches on that line. Scaling is
+`min 0 / max 2` with concurrency 1: the pipeline is bursty and idempotent, and
+nothing about it needs a warm instance.
 
-```mermaid
-flowchart LR
-  A["retail_current<br/>customers_current"] --> B["order_facts<br/>view"]
-  B --> C["customer_features(as_of)<br/>table function"]
-  B --> D["customer_churn_labels(as_of, horizon)<br/>table function"]
-  C --> E["customer_churn_training_data<br/>as_of = today - 90d"]
-  D --> E
-  E --> F["customer_churn_model<br/>LOGISTIC_REG"]
-  C --> G["ML.PREDICT at CURRENT_DATE"]
-  F --> G
-  G --> H["MERGE into<br/>customer_churn_risk"]
-```
+### App and Console (`redwood-app`)
 
-### Avoiding leakage
+Implemented in [mobile_client/](../mobile_client) and provisioned by
+[mobile_app.tf](../terraform/mobile_app.tf). One container serves both Vite
+bundles and the FastAPI backend: the phone at `/`, the operator's console at
+`/console`, the API under `/api`.
 
-Features are produced by a **table function taking an `as_of` date**, not a
-fixed query. Called with a historical date it yields only what was knowable
-then; called with `CURRENT_DATE()` it yields the live vector. Training and
-inference therefore execute identical code, which removes the usual source of
-train/serve skew.
+Pinned to **exactly one instance** (`min = max = 1`, uvicorn `--workers 1`).
+The console's SSE fan-out, telemetry counters and recent-orders buffer are
+process-local, so a second instance would serve half the console's clients a
+different reality. For the same reason `cpu_idle = false`: Firestore
+`on_snapshot` callbacks arrive on the client library's own threads between
+requests, and under request-scoped CPU those threads are throttled and the
+console goes quiet.
 
-The training cutoff is 90 days ago with a 90-day label horizon, so the horizon
-has actually elapsed. Scoring against a horizon still in progress would label
-active customers as churned purely because the clock had not run out.
-`orders_in_horizon` is explicitly dropped from the feature set, since it counts
-the very purchases the label is defined on.
+Neither `redwood-app` nor `redwood-churn` allows unauthenticated access.
+Access is `roles/run.invoker` granted to named principals, and a browser has no
+way to present a Google ID token, so requests are signed by a local tunnel
+([scripts/run_proxy.py](../scripts/run_proxy.py)) that `deploy.sh` opens as its
+last step.
 
-The model uses `auto_class_weights = TRUE`. Without it, a model on a 29 percent
-base rate can score well by predicting "will not churn" for everyone, which is
-precisely the customer the system exists to catch.
-
-### Reading the evaluation
-
-Evaluation is persisted to `customer_churn_model_evaluation` rather than left
-in job history, so a regression is visible. Current figures:
-
-```
-precision 0.7742   recall 0.8571   accuracy 0.8625
-log_loss  0.3422   roc_auc 0.9106
-```
-
-An AUC near 1.0 on this problem would be evidence of leakage, not of a good
-model. 0.91 against a 29 percent base rate is the expected shape.
-
-### Keeping the score table honest
-
-The final step is a `MERGE` into `customer_churn_risk` including a
-`WHEN NOT MATCHED BY SOURCE THEN DELETE` clause. Without it the table only ever
-grew: it once held 650 rows against 402 live customers, 250 of them scored from
-documents that had since been deleted.
-
-Two customers are legitimately unscored. `cust_retail_000004` and
-`cust_retail_000351` have only CANCELLED orders, which `order_facts` excludes.
-400 scored out of 402 is correct.
-
-### Daily refresh
-
-A **BigQuery scheduled query** re-runs the whole file every day at 03:00 UTC,
-declared in [churn_schedule.tf](../terraform/churn_schedule.tf) and running as
-the pipeline service account. A scheduled query was chosen over Cloud Scheduler
-plus a job runner because the work is a SQL script and BigQuery can run SQL
-scripts on a schedule without any intermediate service to operate.
-
-> [!NOTE]
-> `gcloud beta bq transfer-configs` is not available in current gcloud. Inspect
-> the schedule through the REST API at
-> `https://bigquerydatatransfer.googleapis.com/v1/{config}`.
+That tunnel exists instead of `gcloud run services proxy`, which cannot
+authenticate to an IAM-only service from a developer workstation. With user
+credentials it presents a token whose audience is the gcloud OAuth client
+rather than the service URL, and Cloud Run answers 401; with
+`--impersonate-service-account`, which would produce the right audience, the
+proxy binary refuses the credential type outright. The tunnel reuses
+[idtoken.py](../mobile_client/backend/idtoken.py) — the same impersonation the
+backend uses — and streams responses rather than buffering them, because the
+console is built on SSE.
 
 ---
 
-## 5. The retention agent
+## 5. BigQuery and Churn Model
 
-One agent, in [loyalty_agent/](../loyalty_agent), deployed to **Vertex AI Agent
-Engine** under the display name `redwood-loyalty-agent`.
+All feature engineering, model training, evaluation, and batch scoring run inside
+BigQuery in [bigquery_churn_sentiment_analysis.sql](../bigquery_churn_sentiment_analysis.sql).
 
-### Why one agent
+![BigQuery Churn Pipeline](churn_pipeline.png)
 
-An earlier design had six agents (orchestrator, cooldown, churn, friction,
-synthesis, fulfilment) talking over A2A. Every one of them was a deterministic
-rule except synthesis, which writes the offer copy. The mesh added five network
-hops, five failure modes and roughly 600 lines of Terraform to express a
-sequence of `if` statements. It was collapsed into a single agent that calls
-Gemini once, for the only part that actually needs a model.
+- **Point-in-time feature engineering:** `customer_features(as_of)` computes a
+  customer's feature vector across four pillars (demographics, transactional
+  metrics, app engagement, and customer support/feedback sentiment) as of any
+  given date. Training calls it at `CURRENT_DATE() - 90` with a 90-day churn
+  label horizon (`customer_churn_labels`), while live inference calls the exact
+  same function at `CURRENT_DATE()`.
+- **Model (`customer_churn_model`):** A BigQuery ML `LOGISTIC_REG` model trained
+  with `auto_class_weights = TRUE` to handle class imbalance.
+- **Scoring (`customer_churn_risk`):** `ML.PREDICT` scores every active customer
+  and `MERGE`s the resulting `churn_probability` (`[0.0, 1.0]`),
+  `churn_risk_tier` (`LOW < 0.40 <= MODERATE < 0.60 <= HIGH < 0.80 <= CRITICAL`),
+  and `calculation_timestamp` into `customer_churn_risk`.
+- **Scheduled & on-demand refresh:** A BigQuery scheduled query runs the pipeline
+  daily at 03:00 UTC ([churn_schedule.tf](../terraform/churn_schedule.tf)), and
+  the Redwood Console triggers the same SQL on demand through the
+  `redwood-churn` function — a full retrain from **Recalculate Churn**, or a
+  scoring-only `rescore` as step 3 of **Reset Demo**.
 
-### Decision sequence
+---
 
-```mermaid
-flowchart TD
-  A["session claimed"] --> B{"active offer<br/>already exists?"}
-  B -->|yes| B1["PROCESSED<br/>ACTIVE_OFFER_ALREADY_EXISTS"]
-  B -->|no| C{"within 7-day<br/>cooldown?"}
-  C -->|yes| C1["SKIPPED<br/>COOLDOWN_ACTIVE"]
-  C -->|no| D["read churn from<br/>customer_churn_risk"]
-  D --> E{"acute friction<br/>since last scoring?"}
-  E -->|yes| E1["+0.25 boost"]
-  E -->|no| E2["baseline"]
-  E1 --> F{"probability >= 0.50?"}
-  E2 --> F
-  F -->|no| F1["SKIPPED<br/>LOW_CHURN_RISK"]
-  F -->|yes| G["Gemini writes the offer"]
-  G --> H["clamp to tier ceiling<br/>and margin floor"]
-  H --> I["write loyalty_offers<br/>PROCESSED"]
-```
+## 6. Loyalty Agent in Agent Engine
 
-### Thresholds
+The retention agent in [loyalty_agent/](../loyalty_agent) is deployed to
+**Vertex AI Agent Engine** (`redwood-loyalty-agent`) via `LoyaltyAgentEngine`
+([main.py](../loyalty_agent/main.py)).
 
-All in [config.py](../loyalty_agent/config.py), none hardcoded elsewhere.
+![Loyalty Agent Decision Flow](agent_decision_flow.png)
+
+### How the agent processes a login
+
+1. **Transactional claim & guardrails:** The agent atomically moves the session
+   from `PENDING` to `PROCESSING` in Firestore. It checks `loyalty_offers` to
+   ensure the customer does not already have an `ACTIVE` offer, is not within
+   the 7-day cooldown, and has not exceeded the follow-up offer cap
+   (`offerSequence: 2`, where a redeemed initial offer allows at most one
+   stepped-down follow-up offer).
+2. **BigQuery churn gate:** The agent queries `customer_churn_risk`. Customers
+   scored `HIGH` or `CRITICAL` immediately qualify for an offer.
+3. **Complaint escalation (`ADK LlmAgent`):** When a `LOW` or `MODERATE`
+   customer's most recent order carries a `rating <= 2`, the agent invokes an
+   ADK `LlmAgent` judge ([escalation.py](../loyalty_agent/escalation.py)).
+   Because BigQuery scores in batch, the complaint may or may not be inside
+   `churn_probability` already; the brief states which, comparing
+   `feedbackTimestamp` against `calculation_timestamp` and telling the judge
+   whether the complaint landed before or after the score. That comparison is
+   an input to the judgement, not a gate in front of it — a complaint the model
+   already weighed is a strong reason to decline, and the judge has to say so
+   in its own words rather than the agent dropping the case silently. The judge
+   returns a structured `EscalationVerdict` (`escalate: bool` and a
+   one-sentence `escalationReason`). If approved, `eligibilityTier` becomes
+   `HIGH` while BigQuery's `churnRiskTier` and `churnProbability` stay
+   unchanged.
+4. **Offer synthesis with deterministic bounds:** Gemini generates personalized
+   offer copy and proposes a discount percentage. The agent clamps the discount
+   to the customer's loyalty tier ceiling and margin floor before writing
+   `loyalty_offers/{offerId}` and marking the session `PROCESSED`.
+
+### What a skip records
+
+Every session that ends without an offer carries `skipReason`, and every
+session that reached the escalation path also carries `escalationGate` naming
+the branch it took. Where a sentence is owed it is in `skipDetail`.
+
+| `escalationGate` | `skipReason` | `skipDetail` |
+|---|---|---|
+| `JUDGED` | `ESCALATION_DECLINED` | the judge's own sentence |
+| `NO_COMPLAINT` | `LOW_CHURN_RISK` | none — nothing happened worth narrating |
+| `TIER_NOT_CANDIDATE` | `LOW_CHURN_RISK` | names the allow-list |
+| `JUDGE_UNAVAILABLE` | `LOW_CHURN_RISK` | says the judge could not be reached |
+
+`JUDGE_UNAVAILABLE` is deliberately not `ESCALATION_DECLINED`: an outage is not
+a judgement, and a decision log that conflates the two is worse than one that
+records neither.
+
+### Thresholds ([config.py](../loyalty_agent/config.py))
 
 | Setting | Value |
 |---|---|
-| Offer threshold | 0.50 |
-| Critical threshold | 0.75 |
-| Tiers | LOW < 0.25 ≤ MODERATE < 0.50 ≤ HIGH < 0.75 ≤ CRITICAL |
-| Acute friction boost | +0.25 |
-| Cooldown | 7 days |
-| Offer validity | 14 days |
-| Discount ceilings | ENTERPRISE_VIP 25%, RETAIL_PRO 20%, STANDARD_LOYALTY 15%, CASUAL 12% |
+| Qualifying churn tiers | `HIGH`, `CRITICAL` |
+| Churn tier boundaries | `LOW < 0.40 ≤ MODERATE < 0.60 ≤ HIGH < 0.80 ≤ CRITICAL` |
+| Escalation candidate tiers | `LOW`, `MODERATE` (`ESCALATION_CANDIDATE_TIERS`) |
+| Complaint rating threshold | `≤ 2` stars on the customer's most recent order |
+| Complaint freshness | reported to the judge, not gated on |
+| Offer cooldown & validity | 7-day cooldown, 14-day validity, max 1 follow-up (`offerSequence: 2`) |
+| Discount ceilings by loyalty tier | `ENTERPRISE_VIP` 25%, `RETAIL_PRO` 20%, `STANDARD_LOYALTY` 15%, `CASUAL` 12% |
 | Margin floor | 10% |
-
-The friction boost exists because the batch model scores overnight. A complaint
-raised this morning is invisible to it, and the boost is what lets the agent
-react to today's grievance rather than yesterday's snapshot.
-
-The discount Gemini proposes is always clamped to the tier ceiling and checked
-against the margin floor. The model influences the wording and the size within
-bounds; it cannot set the bounds.
-
-### Why Agent Engine rather than a container
-
-`LoyaltyAgentEngine` in [main.py](../loyalty_agent/main.py) already implements
-the runtime contract (`set_up()`, `query()`, `register_operations()`), so the
-object is handed to the SDK directly. A container would mean writing and
-maintaining an HTTP server whose only job is to call `query()`.
-
-Deployment is [scripts/deploy_agent_engine.py](../scripts/deploy_agent_engine.py).
-Three things about it are load-bearing:
-
-- `extra_packages` must be a **relative** path. The SDK uploads paths with
-  their directory structure intact, so an absolute path buries the package too
-  deep to import.
-- The environment must be passed explicitly. The agent builds its config at
-  import time and refuses to guess a project, and the Agent Engine runtime has
-  no `.env`. When this is missing the API reports only `failed to start and
-  cannot serve traffic`, with the real cause visible solely in Cloud Logging.
-- The engine runs as the **pipeline service account**. The Agent Engine default
-  identity can serve traffic but holds no Firestore or BigQuery access, so the
-  agent would deploy cleanly and fail on its first real session.
-
----
-
-## 6. The bridge
-
-[agent_bridge/](../agent_bridge), Cloud Run service `redwood-agent-bridge`.
-
-Agent Engine cannot be an Eventarc destination, so something must receive the
-CloudEvent and turn it into an agent call. The bridge is that and nothing else;
-all retention logic lives in the agent. It reuses the CDC service's event
-decoder rather than carrying a second protojson implementation that could
-disagree with the first, which is why its Docker build context is the
-repository root.
-
-Three design points:
-
-**Resolution by display name, not id.** The predecessor to this file carried a
-reasoning engine id as a Terraform default. It pointed at a resource in a
-different project and went stale the moment the agent was redeployed. Nothing
-now records an engine id; the bridge lists engines and matches on display name,
-caching the handle for the process lifetime behind a lock. Resolution happens
-on first request rather than at import, because a lookup failure at import
-would hide behind a startup probe timeout.
-
-**The loop guard.** The agent writes its result back to the session document,
-which raises another change event. The bridge forwards only sessions whose
-`agentProcessingStatus` is still `PENDING`, so both the claim and the final
-write-back are delivered and ignored.
-
-**The claim.** Before doing any work, `process_session` moves the session from
-`PENDING` to `PROCESSING` inside a Firestore transaction, stamping
-`processingStartedAt` and an `agentWorkerId` unique to the running instance. A
-session that is already in any other state is left alone and the invocation
-returns without evaluating anything. This is what makes redelivery safe: two
-invocations that both read `PENDING` would otherwise both run the full
-BigQuery and Gemini path, and two sessions for the same customer would both
-pass the cooldown check, because at that moment neither offer exists yet. The
-claim is also the only boundary that separates event delivery from agent work,
-so it is what lets the console report those two spans apart. A session claimed
-but then found unusable — no `customerId` — is released to `SKIPPED` rather
-than stranded, since nothing revisits a document left in `PROCESSING`.
-
-**Failure handling is asymmetric on purpose.** An unparseable event returns 200,
-because retrying will never help. An agent failure returns 500 so Eventarc
-retries, which is safe because of the claim above. Deduplication lives in the
-agent only; a second opinion about what counts as a duplicate is a second thing
-that can disagree.
-
----
-
-## 7. Infrastructure
-
-Everything except the agent itself is Terraform in [terraform/](../terraform).
-
-| File | Contents |
-|---|---|
-| `firestore.tf`, `firestore_indexes.tf`, `security_rules.tf` | Database, indexes, TTLs, rules |
-| `bigquery.tf` | Dataset and CDC tables |
-| `cdc_service.tf` | CDC Cloud Run service and its two triggers |
-| `agent_bridge.tf` | Bridge service and the session trigger |
-| `churn_schedule.tf` | Daily scheduled query |
-| `iam.tf`, `services.tf` | Service accounts, identities, API enablement |
-| `storage.tf`, `artifact_registry.tf` | Staging bucket, image repository |
-| `bootstrap/` | Optional project creation, separate state |
-
-### Image digests, not tags
-
-Both services are deployed by **digest**, never by `:latest`. A mutable tag is
-the same string to Terraform before and after a rebuild, so the plan comes out
-empty and the new image never rolls out. This already happened once: the CDC
-service served stale code while `latest` had moved, and every event failed to
-parse. `deploy.sh` resolves each tag to a digest and exports it as
-`TF_VAR_cdc_image_digest` / `TF_VAR_agent_bridge_image_digest`.
-
-### The service account name
-
-`PIPELINE_SERVICE_ACCOUNT` still has the value `dataflow-redwood-sa`. Renaming
-it would cause Terraform to destroy and recreate the account, dropping every
-IAM grant attached to it. The variable was renamed; the value deliberately was
-not.
-
-> [!WARNING]
-> `terraform plan` and `terraform apply` hang silently when a variable is
-> missing, because they are waiting on an interactive prompt. Always pass
-> `-input=false` and export the full `TF_VAR_*` set, which is what `deploy.sh`
-> does.
-
----
-
-## 8. Known rough edges
-
-- `GET /healthz` on both Cloud Run services returns a Google frontend 404 when
-  called externally, while Cloud Run's own startup probe against the same path
-  succeeds and the services work. Unexplained, not blocking, not worth further
-  time.
-- `gcloud auth print-identity-token --audiences=...` fails for user credentials
-  with "Invalid account type". Tooling that needs to call these services
-  directly has to work around it.
-- `gcloud alpha ai reasoning-engines list` does not exist. Use the REST API or
-  the Python SDK.
-- `mobile_client/tests/test_schema_parity.py` no longer imports. It calls
-  `generate_single_order`, which the seeder rewrite replaced with
-  `order_factory.build_order`. The mobile client is deferred, and the test will
-  be repaired as part of that work.

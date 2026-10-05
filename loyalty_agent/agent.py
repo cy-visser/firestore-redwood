@@ -1,226 +1,37 @@
-"""
-Autonomous loyalty offer agent for Redwood Retail.
-
-A single agent handles one customer login session end to end: resolve the
-session, score churn, read the friction signals, apply the cooldown and risk
-gates, synthesise the offer copy and persist the voucher.
-
-This replaces a six-agent A2A mesh. The mesh modelled each of those steps as an
-independent agent with its own card, discovery entry and task envelope, and
-then ran all of them inside one process anyway, so the protocol was pure
-overhead: a churn lookup travelled through a JSON task request to reach a
-function call in the same interpreter. The steps below are the same steps, in
-the same order, as plain methods.
-"""
-
 from __future__ import annotations
 
-import json
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from google.cloud import bigquery
 from google.cloud.firestore_v1.base_query import FieldFilter
 
+from loyalty_agent import offers, policy
 from loyalty_agent.config import config
-from loyalty_agent.schemas import LoyaltyOffer
+from loyalty_agent.policy import evaluate_churn_tier  # re-exported
 
 logger = logging.getLogger("loyalty_agent.agent")
 
 SESSIONS_COLLECTION = "customer_sessions"
 CUSTOMERS_COLLECTION = "customers"
 OFFERS_COLLECTION = "loyalty_offers"
+ORDERS_COLLECTION = "retail"
 
-# Complaint categories that justify raising a customer's churn score above the
-# model's baseline: they describe something that went wrong recently, which the
-# batch prediction was scored too early to have seen.
-ACUTE_FRICTION_TYPES = {
-    "REFUND_REQUESTED",
-    "LATE_DELIVERY",
-    "DEFECTIVE_COMPONENT",
-    "ESCALATION",
-    "BILLING_DISPUTE",
-    "DAMAGED_SHIPMENT",
-}
+# Firestore collection for latency traces.
+TRACES_COLLECTION = "pipeline_traces"
+TRACE_TTL_DAYS = 30
 
-# Segment names that predate the config ceilings and still appear on seeded
-# customer documents. They resolve to the equivalent configured tier rather
-# than to a second, independently maintained ceiling table.
-SEGMENT_ALIASES = {
-    "PLATINUM": "RETAIL_PRO",
-    "GOLD": "RETAIL_PRO",
-    "SILVER": "STANDARD_LOYALTY",
-    "BRONZE": "STANDARD_LOYALTY",
-}
-
-# Nested maps on a /customers document whose contents the scoring code expects
-# to find at the top level.
-NESTED_PROFILE_SECTIONS = (
-    "engagement",
-    "supportMetrics",
-    "customerFeedback",
-    "transactionalMetrics",
-    "accountState",
-)
-
-# Upper bound on the offers read when evaluating a cooldown. A customer cannot
-# legitimately have many offers inside one cooldown window, so a larger result
-# means something is wrong and reading more of it would not change the verdict.
+# Upper bound on offers scanned for cooldown evaluation.
 COOLDOWN_SCAN_LIMIT = 10
 
-
-def evaluate_churn_tier(prob: float) -> str:
-    """Classifies churn probability into calibrated risk tiers."""
-    if prob >= 0.75:
-        return "CRITICAL"
-    elif prob >= 0.50:
-        return "HIGH"
-    elif prob >= 0.25:
-        return "MODERATE"
-    return "LOW"
-
-
-def evaluate_5pillar_heuristic(customer_data: Dict[str, Any]) -> float:
-    """
-    Cold-start / service fallback 5-pillar heuristic formulation (SDD Section 3.2 C):
-    P_heuristic = (0.30 * S_rating) + (0.25 * S_sentiment) + (0.20 * S_complaint) + (0.15 * S_cart) + (0.10 * S_tickets)
-    """
-    account_age = customer_data.get("accountAgeDays", 365)
-
-    # 1. Feedback Rating (w1 = 0.30): S_rating = (5 - rating) / 4
-    raw_rating = customer_data.get("feedbackRating", customer_data.get("rating", 4))
-    s_rating = max(0.0, min(1.0, (5.0 - float(raw_rating)) / 4.0))
-
-    # 2. Sentiment Score (w2 = 0.25): S_sentiment = (1.0 - sentiment) / 2.0 (sentiment in [-1, 1])
-    raw_sentiment = float(customer_data.get("sentimentScore", 0.5))
-    s_sentiment = max(0.0, min(1.0, (1.0 - raw_sentiment) / 2.0))
-
-    # 3. Complaint Severity (w3 = 0.20)
-    complaints = int(customer_data.get("complaintsCount", 0))
-    reason = str(customer_data.get("primaryComplaintReason") or "").upper()
-    severity_map = {
-        "DEFECTIVE_COMPONENT": 1.00,
-        "BILLING_DISPUTE": 1.00,
-        "DAMAGED_FREIGHT": 0.85,
-        "RMA_DELAY": 0.85,
-        "REFUND_REQUESTED": 0.85,
-        "LATE_DELIVERY": 0.70,
-        "POOR_SUPPORT_RESPONSE": 0.60,
-        "ESCALATION": 0.60
-    }
-    s_complaint = severity_map.get(reason, min(1.0, complaints * 0.50))
-
-    # 4. Cart Abandonment (w4 = 0.15): S_cart = min(1.0, cart_abandonment / 3)
-    cart_count = int(customer_data.get("cartAbandonmentCount", 0))
-    s_cart = min(1.0, cart_count / 3.0)
-
-    # 5. Support Tickets & Returns (w5 = 0.10): S_tickets = min(1.0, (tickets + returns) / 2)
-    tickets = int(customer_data.get("supportTicketsCount", 0))
-    returns = int(customer_data.get("returnFrequency", 0))
-    s_tickets = min(1.0, (tickets + returns) / 2.0)
-
-    p_heuristic = (
-        0.30 * s_rating +
-        0.25 * s_sentiment +
-        0.20 * s_complaint +
-        0.15 * s_cart +
-        0.10 * s_tickets
-    )
-
-    if account_age < 30 and complaints == 0 and s_complaint == 0:
-        return round(min(p_heuristic, 0.15), 4)
-
-    days_since_purchase = int(customer_data.get("daysSinceLastPurchase", 0))
-    if days_since_purchase > 60 and complaints >= 2:
-        return 0.75
-    elif days_since_purchase > 60 or complaints >= 2 or raw_sentiment < 0.25:
-        p_heuristic = max(p_heuristic, 0.75)
-    elif days_since_purchase > 30 or complaints == 1 or raw_sentiment < 0.45:
-        p_heuristic = max(p_heuristic, 0.55)
-
-    return round(max(0.0, min(1.0, p_heuristic)), 4)
-
-
-def flatten_profile(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Lift the nested sections of a /customers document to the top level.
-
-    The seeder groups engagement and support figures into maps, while the
-    scoring code reads flat keys. Without this every such field looked absent
-    and silently scored as its default.
-    """
-    flat: Dict[str, Any] = {}
-    for section in NESTED_PROFILE_SECTIONS:
-        nested = data.get(section)
-        if isinstance(nested, dict):
-            flat.update(nested)
-    # Top-level keys win: they are the explicit value where both exist.
-    flat.update({k: v for k, v in data.items() if k not in NESTED_PROFILE_SECTIONS})
-    return flat
-
-
-def discount_ceiling_for_segment(segment: Optional[str]) -> int:
-    """Return the configured discount ceiling for a customer segment."""
-    key = str(segment or "").upper()
-    key = SEGMENT_ALIASES.get(key, key)
-    ceilings = config.discount_ceilings
-    return int(ceilings.get(key, ceilings.get("DEFAULT", 15)))
-
-
-def apply_discount_guardrails(
-    requested_percent: Any,
-    segment: Optional[str],
-    gross_margin_percent: Optional[float] = None,
-) -> int:
-    """Clamp a discount to the tier ceiling and the margin floor.
-
-    A discount comes straight off gross margin, so where the customer's margin
-    is known the largest defensible giveaway is whatever is left once
-    margin_floor_percent has been reserved. Where it is not known the tier
-    ceiling is the only bound available.
-    """
-    try:
-        requested = int(requested_percent)
-    except (TypeError, ValueError):
-        requested = 0
-
-    allowed = discount_ceiling_for_segment(segment)
-    if gross_margin_percent is not None:
-        headroom = float(gross_margin_percent) - float(config.margin_floor_percent)
-        allowed = min(allowed, int(max(0.0, headroom)))
-
-    return max(0, min(requested, allowed))
-
-
-def _gross_margin_percent(profile: Dict[str, Any]) -> Optional[float]:
-    """Read the customer's gross margin as a percentage, if it is recorded.
-
-    Orders carry profitMargin as a fraction; a profile may carry either that or
-    an explicit percentage.
-    """
-    percent = profile.get("grossMarginPercent")
-    if percent is not None:
-        try:
-            return float(percent)
-        except (TypeError, ValueError):
-            return None
-
-    fraction = profile.get("profitMargin")
-    if fraction is not None:
-        try:
-            return float(fraction) * 100.0
-        except (TypeError, ValueError):
-            return None
-    return None
+_CLAIMABLE_STATUSES = (None, "", "PENDING")
 
 
 class LoyaltyAgent:
-    """Evaluates a customer login session and issues a retention offer.
-
-    All Google Cloud clients are injected so the flow can be exercised offline
-    against fakes; see selftest.py.
-    """
+    """Evaluates a customer login session and issues a retention offer."""
 
     def __init__(
         self,
@@ -232,10 +43,8 @@ class LoyaltyAgent:
         table_id: Optional[str] = None,
         model_name: Optional[str] = None,
         cooldown_days: Optional[int] = None,
-        churn_threshold: Optional[float] = None,
-        acute_friction_boost: Optional[float] = None,
-        offer_validity_days: Optional[int] = None,
-        audit_ttl_days: Optional[int] = None,
+        orders_collection: Optional[str] = None,
+        escalation_judge: Any = None,
     ):
         self.fs = firestore_client
         self.bq = bigquery_client
@@ -245,225 +54,366 @@ class LoyaltyAgent:
         self.dataset_id = dataset_id or config.bigquery_dataset
         self.table_id = table_id or config.churn_predictions_table
         self.model_name = model_name or config.reasoning_model
+        self.orders_collection = orders_collection or ORDERS_COLLECTION
 
-        self.cooldown_days = cooldown_days if cooldown_days is not None else config.cooldown_days
-        self.churn_threshold = churn_threshold if churn_threshold is not None else config.churn_trigger_threshold
-        self.acute_friction_boost = (
-            acute_friction_boost if acute_friction_boost is not None else config.acute_friction_boost
+        self.cooldown_days = (
+            cooldown_days if cooldown_days is not None else config.cooldown_days
         )
-        self.offer_validity_days = (
-            offer_validity_days if offer_validity_days is not None else config.offer_validity_days
-        )
-        self.audit_ttl_days = audit_ttl_days if audit_ttl_days is not None else config.offer_audit_ttl_days
+        self.offer_tiers = tuple(t.upper() for t in config.offer_tiers)
+        self.offer_validity_days = config.offer_validity_days
+        self.audit_ttl_days = config.offer_audit_ttl_days
 
-        # Stamped onto a session when this instance claims it. Agent Engine can
-        # run several instances, so a session stuck in PROCESSING is only
-        # traceable if it records which one took it.
+        # Injected by the self-test; built lazily in production so that a
+        # deployment which never escalates never imports ADK.
+        self._escalation_judge = escalation_judge
+
         self.worker_id = f"agent-{uuid.uuid4().hex[:8]}"
 
     # ------------------------------------------------------------------
     # Entry point
     # ------------------------------------------------------------------
 
-    # States a session can be in when the agent is handed it. Anything outside
-    # this set means another delivery of the same event already took it, or it
-    # has already reached a terminal state, and there is nothing to do.
-    _CLAIMABLE_STATUSES = (None, "", "PENDING")
-
-    def _claim_session(
-        self, sess_ref: Any, session_id: str, now: datetime
-    ) -> tuple[bool, Dict[str, Any]]:
-        """Move a session from PENDING to PROCESSING, exactly once.
-
-        Returns (claimed, session_data). A False return is a normal outcome,
-        not an error: it means some other invocation got there first.
-
-        The transaction matters. Eventarc redelivers, the bridge returns 500 on
-        failure to ask for a retry, and a customer can tap sign in twice. Two
-        invocations that both read PENDING would both run the full evaluation,
-        and because neither offer exists yet both would pass the cooldown check
-        and issue one.
-        """
-        transaction_factory = getattr(self.fs, "transaction", None)
-
-        if transaction_factory is None:
-            # Test doubles and any client without transaction support. This is
-            # a narrower guarantee than the transactional path, since the read
-            # and the write are not atomic, but it still rejects a session that
-            # was claimed before this call started.
-            snap = sess_ref.get()
-            if not snap.exists:
-                logger.warning("Session %s not found in Firestore.", session_id)
-                return False, {}
-            data = snap.to_dict() or {}
-            status = data.get("agentProcessingStatus")
-            if status not in self._CLAIMABLE_STATUSES:
-                logger.info(
-                    "Session %s is already %s; leaving it alone.", session_id, status
-                )
-                return False, data
-            sess_ref.update({
-                "agentProcessingStatus": "PROCESSING",
-                "processingStartedAt": now.isoformat(),
-                "agentWorkerId": self.worker_id,
-            })
-            data["agentProcessingStatus"] = "PROCESSING"
-            return True, data
-
-        from google.cloud import firestore as _firestore
-
-        transaction = transaction_factory()
-        claimed: Dict[str, Any] = {}
-
-        @_firestore.transactional
-        def _claim(txn) -> bool:
-            snap = sess_ref.get(transaction=txn)
-            if not snap.exists:
-                logger.warning("Session %s not found in Firestore.", session_id)
-                return False
-            data = snap.to_dict() or {}
-            claimed.update(data)
-            status = data.get("agentProcessingStatus")
-            if status not in self._CLAIMABLE_STATUSES:
-                logger.info(
-                    "Session %s is already %s; leaving it alone.", session_id, status
-                )
-                return False
-            txn.update(sess_ref, {
-                "agentProcessingStatus": "PROCESSING",
-                "processingStartedAt": now.isoformat(),
-                "agentWorkerId": self.worker_id,
-            })
-            return True
-
-        if not _claim(transaction):
-            return False, claimed
-
-        claimed["agentProcessingStatus"] = "PROCESSING"
-        return True, claimed
-
     def process_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Run the retention evaluation for one session.
-
-        Returns the offer document when one is issued or already active, and
-        None when the session is skipped. Every exit path leaves the session in
-        a terminal state so the mobile client stops waiting.
-        """
+        """Run the retention evaluation for one session."""
         if not self.fs:
             logger.error("Firestore client is not configured on LoyaltyAgent.")
             return None
 
         sess_ref = self.fs.collection(SESSIONS_COLLECTION).document(session_id)
         now = datetime.now(timezone.utc)
+        spans: Dict[str, Any] = {}
 
-        # Claim the session before doing any work. Eventarc delivery is
-        # at-least-once, so the same event can arrive twice and two logins by
-        # the same customer can overlap. Without a claim every delivery ran the
-        # full BigQuery and Gemini path, and two sessions for one customer
-        # could both pass the cooldown check because neither offer existed yet.
-        #
-        # The claim also writes processingStartedAt, which is the only boundary
-        # that separates "Eventarc and the bridge delivered this" from "the
-        # agent is working on it". Without it the two are indistinguishable.
+        claim_started = time.monotonic()
         claimed, sess_data = self._claim_session(sess_ref, session_id, now)
+        spans["agentClaimMs"] = (time.monotonic() - claim_started) * 1000.0
         if not claimed:
             return None
 
         customer_id = sess_data.get("customerId")
         if not customer_id:
-            # The claim already moved the document to PROCESSING. Leaving it
-            # there would strand it, since nothing else ever revisits a session
-            # in that state. Give it a terminal status instead.
             logger.warning("Session %s has no customerId.", session_id)
-            sess_ref.update({
-                "agentProcessingStatus": "SKIPPED",
-                "status": "PROCESSED",
-                "skipReason": "NO_CUSTOMER_ID",
-                "processedAt": now.isoformat()
-            })
+            self._close(sess_ref, session_id, None, spans, now, "NO_CUSTOMER_ID")
             return None
 
+        lookup_started = time.monotonic()
         profile = self._load_profile(customer_id)
-
-        churn = self._lookup_churn(customer_id, profile, sess_data.get("customerData"))
-        friction = self._analyse_friction(customer_id, profile, churn)
-
+        churn = self._lookup_churn(customer_id)
         cooldown = self._check_cooldown(customer_id, now)
+        spans["churnLookupMs"] = (time.monotonic() - lookup_started) * 1000.0
+
+        if churn["status"] != "OK":
+            reason = (
+                "CHURN_LOOKUP_FAILED" if churn["status"] == "LOOKUP_FAILED"
+                else "CUSTOMER_NOT_SCORED"
+            )
+            self._close(sess_ref, session_id, customer_id, spans, now, reason)
+            return None
+
+        context = policy.resolve_customer_context(customer_id, profile, churn)
 
         if cooldown.get("hasActiveOffer"):
             active_offer = cooldown["activeOffer"]
-            sess_ref.update({
-                "agentProcessingStatus": "PROCESSED",
-                "status": "PROCESSED",
-                "offerId": active_offer.get("offerId"),
-                "activeOfferId": active_offer.get("offerId"),
-                "skipReason": "ACTIVE_OFFER_ALREADY_EXISTS",
-                "processedAt": now.isoformat()
-            })
-            logger.info("Session %s: Active offer already exists (%s).", session_id, active_offer.get("offerId"))
+            self._close(
+                sess_ref, session_id, customer_id, spans, now,
+                "ACTIVE_OFFER_ALREADY_EXISTS",
+                offer_id=active_offer.get("offerId"), status="PROCESSED",
+            )
             return active_offer
 
         if cooldown.get("inCooldown"):
-            sess_ref.update({
-                "agentProcessingStatus": "SKIPPED",
-                "status": "PROCESSED",
-                "offerId": None,
-                "activeOfferId": None,
-                "skipReason": "COOLDOWN_ACTIVE",
-                "processedAt": now.isoformat()
-            })
-            logger.info("Session %s: Customer %s is in active cooldown window.", session_id, customer_id)
-            return None
-
-        baseline_prob = float(churn["churnProbability"])
-        if friction["hasAcuteFriction"]:
-            # The batch model scores overnight, so a complaint raised since then
-            # is invisible to it. The boost is what makes the agent react to
-            # today's grievance rather than yesterday's snapshot.
-            churn_prob = round(min(1.0, baseline_prob + self.acute_friction_boost), 4)
-            churn_tier = evaluate_churn_tier(churn_prob)
-            eval_source = "EVENT_AUGMENTED_HYBRID"
-        else:
-            churn_prob = baseline_prob
-            churn_tier = churn["churnTier"]
-            eval_source = churn["evaluationSource"]
-
-        if churn_prob < self.churn_threshold:
-            sess_ref.update({
-                "agentProcessingStatus": "SKIPPED",
-                "status": "PROCESSED",
-                "offerId": None,
-                "activeOfferId": None,
-                "skipReason": "LOW_CHURN_RISK",
-                "processedAt": now.isoformat()
-            })
-            logger.info(
-                "Session %s: Churn probability %.2f below threshold %.2f. Skipped.",
-                session_id, churn_prob, self.churn_threshold
+            self._close(
+                sess_ref, session_id, customer_id, spans, now, "COOLDOWN_ACTIVE"
             )
             return None
 
-        offer_payload = self.synthesize_offer(
+        redeemed_count = int(cooldown.get("redeemedCount") or 0)
+        if redeemed_count > int(config.max_followup_offers):
+            logger.info(
+                "Session %s: %s has redeemed %d offer(s) in the %d-day window; "
+                "the cap is %d follow-up(s).",
+                session_id, customer_id, redeemed_count, self.cooldown_days,
+                config.max_followup_offers,
+            )
+            # Both gates say skip, but they say different things. A customer
+            # who has spent her offers *and* recovered should read as
+            # recovered -- that is the demo's closing beat -- so the churn
+            # reason wins when the model no longer rates her an offer tier.
+            # The judge is not consulted: the cap forbids an offer either way.
+            capped_tier = str(churn.get("churnTier") or "").upper()
+            if capped_tier not in self.offer_tiers:
+                self._close(
+                    sess_ref, session_id, customer_id, spans, now,
+                    "LOW_CHURN_RISK",
+                    detail=(
+                        f"Model rates {customer_id} {capped_tier or 'UNSCORED'}; "
+                        f"the follow-up cap ({config.max_followup_offers}) is "
+                        f"also reached."
+                    ),
+                )
+                return None
+            self._close(
+                sess_ref, session_id, customer_id, spans, now,
+                "FOLLOW_UP_LIMIT_REACHED",
+            )
+            return None
+
+        churn_prob = float(churn["churnProbability"])
+        model_tier = str(churn["churnTier"]).upper()
+        eligibility_tier = model_tier
+        escalation: Optional[Dict[str, Any]] = None
+        friction: Optional[Dict[str, Any]] = None
+
+        if model_tier not in self.offer_tiers:
+            friction, escalation, gate = self._consider_escalation(
+                customer_id, churn, context, model_tier, spans
+            )
+            if not (escalation and escalation.get("escalate")):
+                judged = gate == policy.GATE_JUDGED
+                reason = "ESCALATION_DECLINED" if judged else "LOW_CHURN_RISK"
+                logger.info(
+                    "Session %s: %s is %s (p=%.4f); %s qualify. %s",
+                    session_id, customer_id, model_tier or "UNSCORED", churn_prob,
+                    "/".join(self.offer_tiers), reason,
+                )
+                self._close(
+                    sess_ref, session_id, customer_id, spans, now, reason,
+                    # The judge's own sentence when it reached a verdict, the
+                    # gate's when it never ran, and nothing at all when the
+                    # customer simply has not complained. A skip that cannot
+                    # say which of those happened is the bug this replaces.
+                    detail=(escalation or {}).get("reasoning")
+                    or policy.gate_note(gate, model_tier),
+                    gate=gate,
+                )
+                return None
+
+            # Promotion only. The judge can move a customer onto the offer
+            # path; it cannot set the discount, and it never touches the
+            # probability BigQuery produced.
+            eligibility_tier = "HIGH"
+            spans["escalationGate"] = gate
+            logger.info(
+                "Session %s: %s escalated from %s on a complaint -- %s",
+                session_id, customer_id, model_tier, escalation["reasoning"],
+            )
+
+        step_down = redeemed_count * int(config.followup_step_down_percent)
+
+        generation_started = time.monotonic()
+        offer_payload = offers.synthesize_offer(
+            genai_client=self.genai,
+            model_name=self.model_name,
             customer_id=customer_id,
             churn_probability=churn_prob,
-            churn_tier=churn_tier,
-            complaint=friction["primaryComplaintReason"],
-            segment=friction["customerSegment"],
-            gross_margin_percent=friction["grossMarginPercent"],
+            churn_tier=eligibility_tier,
+            complaint=(friction or {}).get("reason")
+            or context["primaryComplaintReason"],
+            segment=context["customerSegment"],
+            gross_margin_percent=context["grossMarginPercent"],
+            step_down_percent=step_down,
+            spans=spans,
         )
-        offer_payload["churnProbability"] = churn_prob
-        offer_payload["churnRiskTier"] = churn_tier
-        offer_payload["baselineChurnRisk"] = baseline_prob
-        offer_payload["evaluationSource"] = eval_source
-        offer_payload["historicalSpend90d"] = friction["totalSpend90d"]
-        offer_payload["sentimentScore"] = friction["sentimentScore"]
+        spans["offerGenerationMs"] = (time.monotonic() - generation_started) * 1000.0
 
-        offer = self.persist_offer(customer_id, session_id, offer_payload, now)
-        logger.info("Session %s: Offer issued and persisted (%s).", session_id, offer.get("offerId"))
+        offer_payload.update({
+            "churnProbability": churn_prob,
+            "churnRiskTier": model_tier,
+            "eligibilityTier": eligibility_tier,
+            "escalated": escalation is not None and escalation.get("escalate", False),
+            "escalationReason": (escalation or {}).get("reasoning"),
+            "escalationTrigger": _trigger_summary(friction) if escalation else None,
+            "historicalSpend90d": context["totalSpend90d"],
+            "sentimentScore": context["sentimentScore"],
+            "offerSequence": redeemed_count + 1,
+            "supersedesOfferId": (
+                cooldown.get("lastRedeemedOffer") or {}
+            ).get("offerId"),
+        })
+
+        write_started = time.monotonic()
+        offer = offers.persist_offer(
+            self.fs, customer_id, session_id, offer_payload, now,
+            offer_validity_days=self.offer_validity_days,
+            cooldown_days=self.cooldown_days,
+            audit_ttl_days=self.audit_ttl_days,
+        )
+        spans["offerWriteMs"] = (time.monotonic() - write_started) * 1000.0
+
+        logger.info(
+            "Session %s: Offer issued and persisted (%s).",
+            session_id, offer.get("offerId"),
+        )
+        self._write_trace(session_id, customer_id, spans, "OFFER_ISSUED")
         return offer
 
     # ------------------------------------------------------------------
-    # Step 1: customer profile
+    # Session lifecycle
+    # ------------------------------------------------------------------
+
+    def _claim_session(
+        self, sess_ref: Any, session_id: str, now: datetime
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Atomically claim a session from PENDING to PROCESSING."""
+        claim = {
+            "agentProcessingStatus": "PROCESSING",
+            "processingStartedAt": now.isoformat(),
+            "agentWorkerId": self.worker_id,
+        }
+
+        def claimable(snap: Any) -> Optional[Dict[str, Any]]:
+            """The session data if it is ours to take, else None."""
+            if not snap.exists:
+                logger.warning("Session %s not found in Firestore.", session_id)
+                return None
+            data = snap.to_dict() or {}
+            status = data.get("agentProcessingStatus")
+            if status not in _CLAIMABLE_STATUSES:
+                logger.info(
+                    "Session %s is already %s; leaving it alone.",
+                    session_id, status,
+                )
+                return None
+            return data
+
+        transaction_factory = getattr(self.fs, "transaction", None)
+        if transaction_factory is None:
+            data = claimable(sess_ref.get())
+            if data is None:
+                return False, {}
+            sess_ref.update(claim)
+            return True, {**data, "agentProcessingStatus": "PROCESSING"}
+
+        from google.cloud import firestore as _firestore
+
+        claimed: Dict[str, Any] = {}
+
+        @_firestore.transactional
+        def _claim(txn) -> bool:
+            data = claimable(sess_ref.get(transaction=txn))
+            if data is None:
+                claimed.clear()
+                claimed.update(data or {})
+                return False
+            claimed.update(data)
+            txn.update(sess_ref, claim)
+            return True
+
+        if not _claim(transaction_factory()):
+            return False, claimed
+
+        claimed["agentProcessingStatus"] = "PROCESSING"
+        return True, claimed
+
+    def _close(
+        self,
+        sess_ref: Any,
+        session_id: str,
+        customer_id: Optional[str],
+        spans: Dict[str, Any],
+        now: datetime,
+        reason: str,
+        offer_id: Optional[str] = None,
+        status: str = "SKIPPED",
+        detail: Optional[str] = None,
+        gate: Optional[str] = None,
+    ) -> None:
+        """Close a session without issuing, and record why.
+
+        Every exit from ``process_session`` that is not an offer comes through
+        here, so the session document, the log line and the console trace can
+        never disagree about the reason.
+
+        ``detail`` is the sentence a human reads and ``gate`` is the branch a
+        machine reads. Both are written where they exist, because the reason
+        code alone cannot distinguish a customer who never complained from one
+        whose complaint a judge weighed and dismissed.
+        """
+        update = {
+            "agentProcessingStatus": status,
+            "status": "PROCESSED",
+            "offerId": offer_id,
+            "activeOfferId": offer_id,
+            "skipReason": reason,
+            "processedAt": now.isoformat(),
+        }
+        if detail:
+            update["skipDetail"] = detail
+        if gate:
+            update["escalationGate"] = gate
+            spans["escalationGate"] = gate
+        sess_ref.update(update)
+        logger.info("Session %s -> %s (%s).", session_id, reason, customer_id)
+        self._write_trace(session_id, customer_id, spans, reason, detail=detail)
+
+    def mark_session_error(self, session_id: str, message: str) -> None:
+        """Record a processing failure on the session."""
+        if not self.fs:
+            return
+        try:
+            self.fs.collection(SESSIONS_COLLECTION).document(session_id).update({
+                "agentProcessingStatus": "ERROR",
+                "errorMessage": message,
+                "processedAt": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not mark session %s as ERROR: %s", session_id, exc)
+
+    # ------------------------------------------------------------------
+    # Tracing
+    # ------------------------------------------------------------------
+
+    def _write_trace(
+        self,
+        session_id: str,
+        customer_id: Optional[str],
+        spans: Dict[str, Any],
+        outcome: str,
+        detail: Optional[str] = None,
+    ) -> None:
+        """Merge this run's spans into ``pipeline_traces/{session_id}``.
+
+        The bridge writes the two spans it alone can see (Eventarc delivery
+        and the Agent Engine round trip) to the same document, so this merges
+        rather than sets.
+
+        Failures are logged and swallowed. A trace is an observation of the
+        run, and an observation that can fail the run it is observing is worse
+        than no observation: the bridge would see a 500, Eventarc would
+        redeliver, and the agent would be invoked again.
+        """
+        if not self.fs:
+            return
+
+        try:
+            now = datetime.now(timezone.utc)
+            document: Dict[str, Any] = {
+                # cdc_service writes order traces into this same collection.
+                # The console needs to tell the two apart to know which node
+                # each document lights up.
+                "kind": "SESSION",
+                "sessionId": session_id,
+                "customerId": customer_id,
+                "agentOutcome": outcome,
+                "agentDetail": detail,
+                "agentRecordedAt": now,
+                "recordedAt": now,
+                "expireAt": now + timedelta(days=TRACE_TTL_DAYS),
+            }
+            # spans carries model names and outcomes as well as durations, so
+            # only the numbers are rounded.
+            document.update({
+                key: round(value, 2) if isinstance(value, (int, float)) else value
+                for key, value in spans.items()
+            })
+
+            self.fs.collection(TRACES_COLLECTION).document(session_id).set(
+                document, merge=True
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not write trace for session %s: %s", session_id, exc)
+
+    # ------------------------------------------------------------------
+    # Reads
     # ------------------------------------------------------------------
 
     def _load_profile(self, customer_id: str) -> Dict[str, Any]:
@@ -472,72 +422,23 @@ class LoyaltyAgent:
             return {}
         try:
             snap = self.fs.collection(CUSTOMERS_COLLECTION).document(customer_id).get()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Customer profile read failed for %s: %s", customer_id, exc)
             return {}
         if not snap.exists:
             return {}
-        return flatten_profile(snap.to_dict() or {})
+        return policy.flatten_profile(snap.to_dict() or {})
 
-    # ------------------------------------------------------------------
-    # Step 2: churn lookup
-    # ------------------------------------------------------------------
+    def _lookup_churn(self, customer_id: str) -> Dict[str, Any]:
+        """Read this customer's score from the BigQuery model output.
 
-    def _lookup_churn(
-        self,
-        customer_id: str,
-        profile: Dict[str, Any],
-        session_customer_data: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Score churn from the BigQuery model output, else from the heuristic.
-
-        There is deliberately no Firestore cache tier in front of this. A
-        cached baselineChurnRisk on the customer document would shadow the
-        model output, and the seeder omits the field for exactly that reason,
-        so reading it here would only ever serve a stale number written by
-        something other than the model.
-        """
-        row = self._query_churn_row(customer_id)
-        if row is not None:
-            prob = _row_value(row, "churn_probability")
-            if prob is not None:
-                prob = float(prob)
-                tier = _row_value(row, "churn_risk_tier")
-                return {
-                    "customerId": customer_id,
-                    "churnProbability": prob,
-                    "churnTier": str(tier).upper() if tier else evaluate_churn_tier(prob),
-                    "evaluationSource": "BIGQUERY_BATCH",
-                    "totalSpend90d": _row_value(row, "total_spend_90d"),
-                    "sentimentScore": _row_value(row, "sentiment_score"),
-                    "customerSegment": _row_value(row, "customer_segment"),
-                }
-
-        customer_data = dict(profile)
-        if session_customer_data:
-            customer_data.update(session_customer_data)
-        heuristic_prob = evaluate_5pillar_heuristic(customer_data)
-        return {
-            "customerId": customer_id,
-            "churnProbability": heuristic_prob,
-            "churnTier": evaluate_churn_tier(heuristic_prob),
-            "evaluationSource": "HEURISTIC_FALLBACK",
-            "totalSpend90d": None,
-            "sentimentScore": None,
-            "customerSegment": None,
-        }
-
-    def _query_churn_row(self, customer_id: str) -> Optional[Any]:
-        """Fetch the customer's row from the churn predictions table.
-
-        The customer id is bound as a query parameter rather than interpolated
-        into the SQL text, the table is fully qualified so the result does not
-        depend on the client's default project, and the row count is bounded:
-        the table is a MERGE target keyed on customer_id today, but an append
-        of a second scoring run would otherwise turn this into a full scan.
+        Always returns a dict carrying a ``status``. ``LOOKUP_FAILED`` and
+        ``NOT_SCORED`` are kept apart because they mean different things: the
+        first is an outage worth alerting on, the second is a customer the
+        nightly run has never seen. Neither produces a substitute score.
         """
         if not self.bq:
-            return None
+            return {"status": "LOOKUP_FAILED"}
 
         sql = (
             "SELECT customer_id, churn_probability, churn_risk_tier, "
@@ -556,100 +457,71 @@ class LoyaltyAgent:
 
         try:
             rows = list(self.bq.query(sql, job_config=job_config).result())
-        except Exception as exc:
-            logger.warning(
-                "BigQuery churn lookup failed for %s (%s). Falling back to 5-pillar heuristic.",
-                customer_id, exc
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "BigQuery churn lookup failed for %s: %s. No offer will be "
+                "issued; the agent does not substitute its own score.",
+                customer_id, exc,
             )
-            return None
+            return {"status": "LOOKUP_FAILED"}
 
-        return rows[0] if rows else None
+        if not rows:
+            logger.info("No churn score on file for %s.", customer_id)
+            return {"status": "NOT_SCORED"}
 
-    # ------------------------------------------------------------------
-    # Step 3: friction signals
-    # ------------------------------------------------------------------
+        row = rows[0]
+        prob = _row_value(row, "churn_probability")
+        if prob is None:
+            return {"status": "NOT_SCORED"}
 
-    def _analyse_friction(
-        self,
-        customer_id: str,
-        profile: Dict[str, Any],
-        churn: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Derive segment, spend, sentiment and acute grievance from the profile.
-
-        Where the profile is silent, the churn model's own feature values stand
-        in: they were computed from the same customer's order history.
-        """
-        segment = str(
-            profile.get("customerSegment")
-            or profile.get("loyaltyTier")
-            or churn.get("customerSegment")
-            or "STANDARD_LOYALTY"
-        ).upper()
-
-        complaint = (
-            profile.get("primaryComplaintReason")
-            or profile.get("recentFrictionEvent")
-            or profile.get("recent_friction_event")
-        )
-        recent_friction = profile.get("recentFrictionEvent") or profile.get("recent_friction_event")
-
-        spend = profile.get("totalSpend90d", profile.get("historicalSpend90d"))
-        if spend is None:
-            spend = churn.get("totalSpend90d")
-        spend = float(spend) if spend is not None else 0.0
-
-        sentiment = profile.get("sentimentScore")
-        if sentiment is None:
-            sentiment = churn.get("sentimentScore")
-        sentiment = float(sentiment) if sentiment is not None else 0.5
-
-        has_acute = bool(
-            (complaint and str(complaint).upper() in ACUTE_FRICTION_TYPES) or
-            (recent_friction and str(recent_friction).upper() in ACUTE_FRICTION_TYPES)
-        )
-
+        prob = float(prob)
+        tier = _row_value(row, "churn_risk_tier")
         return {
+            "status": "OK",
             "customerId": customer_id,
-            "customerName": profile.get("customerName") or profile.get("name"),
-            "customerEmail": profile.get("customerEmail") or profile.get("email"),
-            "customerSegment": segment,
-            "primaryComplaintReason": complaint,
-            "recentFrictionEvent": recent_friction,
-            "totalSpend90d": spend,
-            "sentimentScore": sentiment,
-            "accountAgeDays": profile.get("accountAgeDays", 365),
-            "discountCapPercent": discount_ceiling_for_segment(segment),
-            "grossMarginPercent": _gross_margin_percent(profile),
-            "hasAcuteFriction": has_acute,
+            "churnProbability": prob,
+            "churnTier": str(tier).upper() if tier else evaluate_churn_tier(prob),
+            # When the score was calculated. The escalation path compares
+            # friction against this to decide whether the model could
+            # possibly have seen it.
+            "scoredAt": policy.parse_timestamp(
+                _row_value(row, "calculation_timestamp")
+            ),
+            "totalSpend90d": _row_value(row, "total_spend_90d"),
+            "sentimentScore": _row_value(row, "sentiment_score"),
+            "customerSegment": _row_value(row, "customer_segment"),
         }
 
-    # ------------------------------------------------------------------
-    # Step 4: cooldown
-    # ------------------------------------------------------------------
+    def _latest_order(self, customer_id: str) -> Optional[Dict[str, Any]]:
+        """The customer's most recent order, or None.
+
+        Reads orders rather than /customers because the mobile client never
+        writes back to the profile: the complaint fields seeded there are
+        frozen, and reacting to them would fire on every login forever. Uses
+        the existing ``orders_by_customer`` composite index.
+        """
+        if not self.fs:
+            return None
+        try:
+            query = (
+                self.fs.collection(self.orders_collection)
+                .where(filter=FieldFilter("customerId", "==", customer_id))
+                .order_by("createdAt", direction="DESCENDING")
+                .limit(1)
+            )
+            for doc in query.stream():
+                return doc.to_dict() or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Latest order lookup failed for %s: %s", customer_id, exc)
+        return None
 
     def _check_cooldown(self, customer_id: str, now: datetime) -> Dict[str, Any]:
-        """Report whether the customer already holds, or recently held, an offer.
-
-        Only offers created inside the cooldown window are read. The previous
-        implementation streamed every offer the customer had ever received to
-        answer a question about the last seven days, and an offer left in
-        status ACTIVE from months ago suppressed the customer permanently.
-        """
-        ineligible = {
-            "hasActiveOffer": False,
-            "activeOffer": None,
-            "inCooldown": False,
-            "cooldownUntil": None,
-        }
+        """Classify the customer's recent offers. See policy.classify_recent_offers."""
         if not self.fs:
-            return ineligible
+            return policy.no_recent_offers()
 
-        cutoff = now - timedelta(days=self.cooldown_days)
+        cutoff = policy.cooldown_cutoff(now, self.cooldown_days)
         try:
-            # createdAt is stored as an ISO-8601 UTC string, so a string range
-            # filter orders chronologically as long as every writer uses the
-            # same format, which persist_offer below does.
             query = (
                 self.fs.collection(OFFERS_COLLECTION)
                 .where(filter=FieldFilter("customerId", "==", customer_id))
@@ -657,253 +529,96 @@ class LoyaltyAgent:
                 .order_by("createdAt", direction="DESCENDING")
                 .limit(COOLDOWN_SCAN_LIMIT)
             )
-            recent = [doc.to_dict() or {} for doc in query.stream()]
-        except Exception as exc:
-            # Failing open would spam the customer; failing closed would only
-            # delay an offer until the next login.
-            logger.warning("Cooldown lookup failed for %s (%s). Treating as in cooldown.", customer_id, exc)
-            return {**ineligible, "inCooldown": True}
-
-        for offer in recent:
-            if offer.get("status") == "ACTIVE":
-                return {
-                    "hasActiveOffer": True,
-                    "activeOffer": offer,
-                    "inCooldown": False,
-                    "cooldownUntil": offer.get("cooldownUntil"),
-                }
-
-        for offer in recent:
-            cooldown_str = offer.get("cooldownUntil") or offer.get("validUntil")
-            if not cooldown_str:
-                continue
-            try:
-                cooldown_dt = datetime.fromisoformat(cooldown_str)
-            except (ValueError, TypeError):
-                continue
-            if cooldown_dt > now:
-                return {
-                    "hasActiveOffer": False,
-                    "activeOffer": None,
-                    "inCooldown": True,
-                    "cooldownUntil": cooldown_str,
-                }
-
-        return ineligible
-
-    # ------------------------------------------------------------------
-    # Step 5: offer synthesis
-    # ------------------------------------------------------------------
-
-    def generate_deterministic_offer(
-        self,
-        customer_id: str,
-        churn_tier: str,
-        complaint: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Rule engine used when Vertex AI is unreachable or quota exhausted."""
-        is_critical = (churn_tier == "CRITICAL")
-        discount = 25 if is_critical else 15
-        perks = ["FREE_EXPRESS_SHIPPING"] if is_critical else ["FREE_SHIPPING"]
-        apology = "We apologize for any past shipping inconveniences." if complaint else None
-        suffix = customer_id[-4:] if len(customer_id) >= 4 else customer_id
-
-        return {
-            "title": "Special Customer Loyalty Incentive",
-            "description": "We appreciate your ongoing business and want to offer you an exclusive discount.",
-            "discountPercent": discount,
-            "promoCode": f"RETENTION-DET-{churn_tier}-{suffix}",
-            "freeExpressShipping": is_critical,
-            "perks": perks,
-            "personalizedApology": apology,
-            "generationSource": "DETERMINISTIC_RULES",
-        }
-
-    def synthesize_offer(
-        self,
-        customer_id: str,
-        churn_probability: float,
-        churn_tier: str,
-        complaint: Optional[str] = None,
-        segment: Optional[str] = None,
-        gross_margin_percent: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        """Compose the offer copy, preferring Gemini and falling back to rules.
-
-        generationSource records which path actually ran. It used to always say
-        DETERMINISTIC_RULES because the Gemini call was written against an API
-        that does not exist and threw on every invocation.
-        """
-        ceiling = discount_ceiling_for_segment(segment)
-        payload = self._generate_with_gemini(
-            customer_id, churn_probability, churn_tier, complaint, ceiling
-        )
-        if payload is None:
-            payload = self.generate_deterministic_offer(customer_id, churn_tier, complaint)
-
-        discount = apply_discount_guardrails(
-            payload.get("discountPercent", payload.get("discountPercentage", 15)),
-            segment,
-            gross_margin_percent,
-        )
-        payload["discountPercent"] = discount
-        payload["discountPercentage"] = discount
-        return payload
-
-    def _generate_with_gemini(
-        self,
-        customer_id: str,
-        churn_probability: float,
-        churn_tier: str,
-        complaint: Optional[str],
-        discount_ceiling: int,
-    ) -> Optional[Dict[str, Any]]:
-        """Ask Gemini for the offer copy, or None if it cannot be obtained."""
-        if not self.genai:
-            return None
-
-        prompt = (
-            "You write retention offers for a retailer. Reply with a single JSON "
-            "object and nothing else, with keys: title (string), description "
-            "(string, at most two sentences, addressed to the customer), "
-            "promoCode (string, uppercase, no spaces), discountPercent "
-            "(integer), freeExpressShipping (boolean), perks (array of strings), "
-            "personalizedApology (string or null; only when a complaint is given).\n"
-            f"Customer: {customer_id}\n"
-            f"Churn probability: {churn_probability}\n"
-            f"Churn tier: {churn_tier}\n"
-            f"Open complaint: {complaint or 'none'}\n"
-            f"Maximum discount percent: {discount_ceiling}"
-        )
-
-        try:
-            response = self.genai.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config={"response_mime_type": "application/json"},
-            )
-            payload = json.loads(response.text)
-            if not isinstance(payload, dict):
-                raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
-        except Exception as exc:
+            recent: List[Dict[str, Any]] = [
+                doc.to_dict() or {} for doc in query.stream()
+            ]
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Gemini generation failed for %s (%s). Falling back to deterministic rules.",
-                customer_id, exc
+                "Cooldown lookup failed for %s (%s). Treating as in cooldown.",
+                customer_id, exc,
             )
-            return None
+            return {**policy.no_recent_offers(), "inCooldown": True}
 
-        payload["generationSource"] = "GEMINI_AI"
-        return payload
+        return policy.classify_recent_offers(recent, now)
 
     # ------------------------------------------------------------------
-    # Step 6: persistence
+    # Escalation
     # ------------------------------------------------------------------
 
-    def persist_offer(
+    def _consider_escalation(
         self,
         customer_id: str,
-        session_id: str,
-        offer_payload: Dict[str, Any],
-        now: Optional[datetime] = None,
-    ) -> Dict[str, Any]:
-        """Validate the offer, write it, and move the session to PROCESSED.
+        churn: Dict[str, Any],
+        context: Dict[str, Any],
+        model_tier: str,
+        spans: Dict[str, Any],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], str]:
+        """Decide whether to ask the judge, then ask it.
 
-        The field names below are the mobile client's contract; LoyaltyOffer
-        validation is what stops a malformed payload reaching it.
+        Returns ``(complaint, verdict, gate)``, where ``gate`` names the branch
+        taken so the session document can say which one it was.
+
+        One deterministic gate stands in front of the model: the tier must be
+        one the operator allows to be promoted. The freshness of the complaint
+        used to be a second gate, and is now a fact in the brief instead --
+        the judge is told how the complaint sits against
+        ``calculation_timestamp`` and has to say in its own words whether the
+        score already accounts for it. That costs a model call on complaints
+        the old code discarded silently, and buys a decision that is visible
+        and arguable rather than one that left no trace.
         """
-        now = now or datetime.now(timezone.utc)
-        valid_until = now + timedelta(days=self.offer_validity_days)
-        cooldown_until = now + timedelta(days=self.cooldown_days)
-        ttl_expiry = now + timedelta(days=self.audit_ttl_days)
+        if model_tier not in config.escalation_candidate_tiers:
+            return None, None, policy.GATE_TIER_NOT_CANDIDATE
 
-        offer_id = offer_payload.get("offerId") or f"off_{session_id}_retention"
+        complaint = policy.latest_complaint(
+            self._latest_order(customer_id), churn.get("scoredAt")
+        )
+        if not complaint:
+            return None, None, policy.GATE_NO_COMPLAINT
 
-        title = offer_payload.get("title") or offer_payload.get("headline", "Special Customer Loyalty Incentive")
-        desc = offer_payload.get("description") or offer_payload.get("messageBody", "Exclusive discount on your next order.")
-        discount = offer_payload.get("discountPercent") or offer_payload.get("discountPercentage", 15)
-        promo = offer_payload.get("promoCode") or offer_payload.get("voucherCode", f"RETENTION-{customer_id[-4:]}")
-        perks: List[str] = offer_payload.get("perks", [])
-        free_shipping = offer_payload.get("freeExpressShipping", "FREE_EXPRESS_SHIPPING" in perks)
-        churn_prob = offer_payload.get("churnProbability") or offer_payload.get("churnScore", 0.75)
-        churn_tier = offer_payload.get("churnRiskTier") or offer_payload.get("churnTier", "HIGH")
-        source = offer_payload.get("generationSource", "DETERMINISTIC_RULES")
-        apology = offer_payload.get("personalizedApology")
-        baseline = float(offer_payload.get("baselineChurnRisk", churn_prob))
-        eval_source = offer_payload.get("evaluationSource", "HEURISTIC_FALLBACK")
+        logger.info(
+            "Customer %s is %s but rated order %s %d star(s) (%s); asking the "
+            "escalation judge. Complaint is %s the score.",
+            customer_id, model_tier, complaint.get("orderId"),
+            complaint["rating"], complaint.get("reason") or "no reason given",
+            "older than" if complaint.get("alreadyScored") else "newer than",
+        )
+        verdict = self._judge().decide(churn, complaint, context, spans)
+        if not verdict.get("available", True):
+            return complaint, verdict, policy.GATE_JUDGE_UNAVAILABLE
+        return complaint, verdict, policy.GATE_JUDGED
 
-        offer_doc = {
-            "offerId": offer_id,
-            "customerId": customer_id,
-            "sessionId": session_id,
-            "churnProbability": float(churn_prob),
-            "churnScore": float(churn_prob),
-            "churnRiskTier": churn_tier,
-            "churnTier": churn_tier,
-            "title": title,
-            "headline": title,
-            "description": desc,
-            "messageBody": desc,
-            "promoCode": promo,
-            "voucherCode": promo,
-            "discountPercent": int(discount),
-            "discountPercentage": int(discount),
-            "freeExpressShipping": bool(free_shipping),
-            "perks": perks,
-            "personalizedApology": apology,
-            "generationSource": source,
-            "baselineChurnRisk": baseline,
-            "evaluationSource": eval_source,
-            "status": "ACTIVE",
-            "createdAt": now.isoformat(),
-            "validUntil": valid_until.isoformat(),
-            "expiresAt": valid_until.isoformat(),
-            "cooldownUntil": cooldown_until.isoformat(),
-            "claimedAt": None,
-            "ttlExpiryAt": ttl_expiry.isoformat(),
-            "metadata": {
-                "mlModelVersion": "redwood_churn_v1",
-                "retentionAction": f"DISPATCH_{churn_tier}_OFFER",
-                "historicalSpend90d": offer_payload.get("historicalSpend90d", 0.0),
-                "supportSentimentScore": offer_payload.get("sentimentScore", 0.5),
-                "baselineChurnRisk": baseline,
-                "evaluationSource": eval_source,
-            }
-        }
+    def _judge(self):
+        """The escalation judge, built on first use."""
+        if self._escalation_judge is None:
+            from loyalty_agent.escalation import EscalationJudge
 
-        validated_payload = LoyaltyOffer.model_validate(offer_doc).model_dump()
+            self._escalation_judge = EscalationJudge(model_name=self.model_name)
+        return self._escalation_judge
 
-        if self.fs:
-            self.fs.collection(OFFERS_COLLECTION).document(offer_id).set(validated_payload)
-            try:
-                self.fs.collection(SESSIONS_COLLECTION).document(session_id).set({
-                    "agentProcessingStatus": "PROCESSED",
-                    "status": "PROCESSED",
-                    "offerId": offer_id,
-                    "activeOfferId": offer_id,
-                    "processedAt": now.isoformat(),
-                    "skipReason": None
-                }, merge=True)
-            except Exception as exc:
-                logger.warning("Could not update session %s in Firestore: %s", session_id, exc)
 
-        return validated_payload
+def _trigger_summary(friction: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The evidence behind an escalation, in a form Firestore can store.
 
-    # ------------------------------------------------------------------
-    # Failure path
-    # ------------------------------------------------------------------
-
-    def mark_session_error(self, session_id: str, message: str) -> None:
-        """Record a processing failure on the session."""
-        if not self.fs:
-            return
-        try:
-            self.fs.collection(SESSIONS_COLLECTION).document(session_id).update({
-                "agentProcessingStatus": "ERROR",
-                "errorMessage": message,
-                "processedAt": datetime.now(timezone.utc).isoformat(),
-            })
-        except Exception as exc:
-            logger.warning("Could not mark session %s as ERROR: %s", session_id, exc)
+    ``alreadyScored`` is kept because it is the fact the judge was asked to
+    weigh: an escalation granted despite the model having already seen the
+    complaint is a different decision from one granted because it could not
+    have, and the offer document should not flatten the two.
+    """
+    if not friction:
+        return None
+    submitted = friction.get("submittedAt")
+    scored = friction.get("scoredAt")
+    gap_hours = friction.get("gapHours")
+    return {
+        "orderId": friction.get("orderId"),
+        "rating": friction.get("rating"),
+        "reason": friction.get("reason"),
+        "submittedAt": submitted.isoformat() if submitted else None,
+        "scoredAt": scored.isoformat() if scored else None,
+        "gapHours": round(gap_hours, 2) if gap_hours is not None else None,
+        "alreadyScored": friction.get("alreadyScored"),
+    }
 
 
 def _row_value(row: Any, key: str) -> Any:
@@ -912,6 +627,6 @@ def _row_value(row: Any, key: str) -> Any:
     if value is None and hasattr(row, "get"):
         try:
             value = row.get(key)
-        except Exception:
+        except Exception:  # noqa: BLE001
             value = None
     return value

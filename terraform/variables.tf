@@ -68,6 +68,12 @@ variable "firestore_collection" {
   default     = "retail"
 }
 
+variable "trace_document_id_prefix" {
+  description = "Only replicated documents whose id starts with this prefix get a latency trace written for the console. Defaults to the mobile app's order id prefix so a backfill of the seeded dataset does not write a trace per document. Set to \"\" to disable order tracing."
+  type        = string
+  default     = "ORD-26-MOB-"
+}
+
 variable "demo_principal_ids" {
   description = "IAM service account IDs representing the demo client users. demo1-user is seeded as a healthy/low-churn customer, demo2-user as an at-risk/high-churn customer."
   type        = list(string)

@@ -1,16 +1,21 @@
 # ==============================================================================
 # Daily churn recalculation.
 #
-# The churn pipeline is already a self-contained multi-statement SQL script, so
-# running it on a schedule needs nothing but BigQuery. A Cloud Scheduler job
-# calling a Cloud Run job that shells out to run_bigquery_analysis.py would add
-# a container, a service account hop and a second place for the SQL to drift,
-# to accomplish the same thing.
+# The on-demand path now goes through the redwood-churn Cloud Run function
+# (churn_service.tf), which the Redwood Console calls when a presenter presses
+# Recalculate. This schedule deliberately does not.
 #
-# The query text is the same file deploy.sh runs. Both render the same five
-# placeholders, so the scheduled run and the deploy-time run cannot diverge:
-# there is one copy of the SQL and it is this one. Terraform's templatefile
-# uses the same ${...} syntax the script already used, which is why no
+# The churn pipeline is a self-contained multi-statement SQL script, so running
+# it on a timer needs nothing but BigQuery. Routing the daily run through the
+# function as well would add a Cloud Scheduler job, an invoker identity and a
+# cold start to accomplish exactly what the Data Transfer Service already does,
+# and it would make a nightly refresh depend on a container being deployed.
+#
+# What the two paths do share is the SQL. The query text below is the same file
+# churn_service/Dockerfile bakes into the function image, and both render the
+# same placeholders, so the scheduled run and the on-demand run cannot diverge:
+# there is one copy of the pipeline and it is this one. Terraform's templatefile
+# uses the same ${...} syntax the renderer already used, which is why no
 # translation step is needed here.
 # ==============================================================================
 

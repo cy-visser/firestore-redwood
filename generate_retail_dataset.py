@@ -1,24 +1,5 @@
 #!/usr/bin/env python3
-"""
-Retail dataset generator for Firestore Enterprise Native and BigQuery CDC.
-
-Seeds a reproducible population of customers, each with a real multi-order
-history, into Firestore. Two collections are written:
-
-  /retail/{orderId}        - the order stream replicated to BigQuery
-  /customers/{customerId}  - customer profiles read by the loyalty agent
-
-The unit of work is the *customer*, not the document. Previously the generator
-emitted N independent orders with randomly rolled customer ids, which meant no
-customer had a history, demo customers were not addressable, and churn could
-only be faked with a rule. Seeding whole customers instead lets churn be
-derived from observed purchase behaviour; see customer_profiles.py for the
-feature/label windowing.
-
-The demo personas (demo1-user, demo2-user) are always seeded, regardless of
---count, and are pinned to the IAM service accounts declared in
-terraform/iam.tf.
-"""
+"""Retail dataset generator for Firestore Enterprise Native and BigQuery CDC."""
 
 import os
 import sys
@@ -221,6 +202,9 @@ def run_generator(
     print(f"Label Window:        trailing {LABEL_WINDOW_DAYS} days")
     print(f"Churned / Retained:  {summary['churned']:,} / {summary['retained']:,} "
           f"({summary['churn_rate']:.1%} churn)")
+    print(f"Acute friction:      {summary['acute_friction']:,} customers "
+          f"({summary['acute_friction_rate']:.1%}) carry a live grievance the "
+          f"loyalty agent escalates on")
     print(f"Archetypes:          {summary['by_archetype']}")
     print(f"Parallel Workers:    {num_workers}")
     print(f"Random Seed:         {seed} (deterministic)")

@@ -2,20 +2,26 @@ import React from "react";
 import {
   ShieldCheck,
   Activity,
-  Lock
+  Lock,
+  LogOut
 } from "lucide-react";
-import { PrincipalProfile } from "../types/retail";
+import { CustomerSession, LoyaltyOffer, PrincipalProfile } from "../types/retail";
 
 interface ProfileTabProps {
   activePrincipalId: string;
   principal: PrincipalProfile;
-  onSwitchPrincipal: (id: string) => void;
+  session: CustomerSession;
+  /** The agent's current offer, if any. There is no tier discount any more. */
+  offer: LoyaltyOffer | null;
+  onSignOut: () => void;
 }
 
 export const ProfileTab: React.FC<ProfileTabProps> = ({
   activePrincipalId,
   principal,
-  onSwitchPrincipal,
+  session,
+  offer,
+  onSignOut,
 }) => {
   const isDemo1 = activePrincipalId === "demo1";
 
@@ -48,9 +54,9 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
 
         <div className="grid grid-cols-3 gap-2 pt-3 border-t border-white/15 text-center font-mono">
           <div>
-            <span className="text-[10px] text-white/70 block">Tier Discount</span>
+            <span className="text-[10px] text-white/70 block">Active Offer</span>
             <span className="text-sm font-bold text-white">
-              {Math.round((principal?.discountRate || 0) * 100)}% OFF
+              {offer ? `${offer.discountPercent}% OFF` : "None"}
             </span>
           </div>
           <div>
@@ -68,20 +74,48 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
         </div>
       </div>
 
-      {/* Switch Demo Principal Quick Action */}
-      <div className="bg-slateDark-850 border border-slate-800 rounded-2xl p-3 flex items-center justify-between">
-        <div>
-          <p className="text-xs font-bold text-white">Switch IAM Principal</p>
-          <p className="text-[10px] text-slate-400 font-mono">
-            Currently acting as {activePrincipalId}
-          </p>
+      {/* Session state and sign out.
+          Switching identity in place is gone: identity is now established by
+          writing a login session, so changing it means ending this one. */}
+      <div className="bg-slateDark-850 border border-slate-800 rounded-2xl p-3 space-y-2.5">
+        <div className="flex items-center justify-between">
+          <div className="min-w-0">
+            <p className="text-xs font-bold text-white">Signed in as {activePrincipalId}</p>
+            <p className="text-[10px] text-slate-400 font-mono truncate">
+              {session.customerId}
+            </p>
+          </div>
+          <button
+            onClick={onSignOut}
+            className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-brand-400 border border-slate-700 text-xs font-mono font-semibold transition-all flex items-center gap-1.5 shrink-0"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+            Sign out
+          </button>
         </div>
-        <button
-          onClick={() => onSwitchPrincipal(isDemo1 ? "demo2" : "demo1")}
-          className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-brand-400 border border-slate-700 text-xs font-mono font-semibold transition-all"
-        >
-          Switch to {isDemo1 ? "demo2" : "demo1"}
-        </button>
+
+        <div className="bg-slate-900/80 p-2.5 rounded-xl border border-slate-800 space-y-1 text-[11px] font-mono text-slate-400">
+          <div className="flex justify-between gap-2">
+            <span>sessionId:</span>
+            <span className="text-slate-200 truncate">{session.sessionId}</span>
+          </div>
+          <div className="flex justify-between gap-2">
+            <span>agentProcessingStatus:</span>
+            <span className="text-slate-200">{session.agentProcessingStatus}</span>
+          </div>
+          {session.skipReason && (
+            <div className="flex justify-between gap-2">
+              <span>skipReason:</span>
+              <span className="text-amber-300">{session.skipReason}</span>
+            </div>
+          )}
+          {session.offerId && (
+            <div className="flex justify-between gap-2">
+              <span>offerId:</span>
+              <span className="text-brand-300 truncate">{session.offerId}</span>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Cloud Security & IAM Role Info */}

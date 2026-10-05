@@ -45,9 +45,15 @@ variable "cdc_min_instances" {
 }
 
 variable "cdc_max_instances" {
-  description = "Maximum CDC service instances."
+  description = "Maximum CDC service instances. A re-seed rewrites every order document at once, so the ceiling has to absorb a burst of a few thousand events rather than just steady-state demo traffic."
   type        = number
-  default     = 10
+  default     = 50
+}
+
+variable "cdc_concurrency" {
+  description = "Requests each CDC instance accepts at once. Kept well below the Cloud Run default of 80: appends to a table are handed to the BigQuery stream one at a time, so a high limit only queues requests inside an instance, which reads to the autoscaler as spare capacity and produces 'no available instance' aborts instead of more instances."
+  type        = number
+  default     = 8
 }
 
 locals {
@@ -129,6 +135,8 @@ resource "google_cloud_run_v2_service" "cdc" {
       max_instance_count = var.cdc_max_instances
     }
 
+    max_instance_request_concurrency = var.cdc_concurrency
+
     # Eventarc redelivers on 5xx, so a request that outlives this is retried
     # rather than lost.
     timeout = "120s"
@@ -175,6 +183,18 @@ resource "google_cloud_run_v2_service" "cdc" {
         name  = "BIGQUERY_CDC_TABLE"
         value = google_bigquery_table.orders_cdc.table_id
       }
+      # Latency traces for the console. Only documents whose id carries this
+      # prefix are traced -- orders placed from the mobile app -- so a
+      # backfill of the seeded dataset does not write a trace per document.
+      # Set to "" to turn order tracing off without rebuilding the image.
+      env {
+        name  = "FIRESTORE_TRACES_COLLECTION"
+        value = "pipeline_traces"
+      }
+      env {
+        name  = "TRACE_DOCUMENT_ID_PREFIX"
+        value = var.trace_document_id_prefix
+      }
       env {
         name  = "PYTHONUNBUFFERED"
         value = "1"
@@ -204,6 +224,11 @@ resource "google_cloud_run_v2_service" "cdc" {
     google_project_iam_member.sa_bigquery_editor,
     google_project_iam_member.sa_bigquery_job_user,
     google_bigquery_table.orders_cdc,
+    # Terraform now owns the mirror tables as well, so the service must come up
+    # after them; otherwise its startup CREATE TABLE IF NOT EXISTS races the
+    # apply that is creating the same tables.
+    google_bigquery_table.orders_current,
+    google_bigquery_table.customers_current,
   ]
 }
 

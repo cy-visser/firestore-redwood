@@ -1,12 +1,4 @@
-"""
-Offline checks for the CDC mapping layer.
-
-These exercise decoding, coercion, proto construction and DDL rendering with no
-BigQuery or Firestore connection, so a broken column mapping fails here in
-milliseconds rather than after a container build and deploy.
-
-Run with:  .venv/bin/python cdc_service/selftest.py
-"""
+"""Offline checks for the CDC mapping layer."""
 
 from __future__ import annotations
 
@@ -362,6 +354,57 @@ def test_delete_row_is_key_only() -> None:
     check("delete tagged", getattr(parsed, CHANGE_TYPE_COLUMN), "DELETE")
 
 
+def test_appends_overlap() -> None:
+    """Appends to one table must be able to be in flight simultaneously.
+
+    The writer lock is meant to cover handing a request to the stream, not
+    waiting for BigQuery to answer. Widening it back over ``future.result``
+    would serialise a table down to one round trip at a time, which throttled
+    the whole service to roughly two events a second and left a re-seed backlog
+    draining for the better part of an hour. The barrier below only releases
+    once all three appends are waiting at once, so that regression shows up
+    here as a timeout rather than in production as a slow queue.
+    """
+    print("\n[append pipelining]")
+
+    import threading
+
+    from bq_cdc_writer import TableWriter
+
+    barrier = threading.Barrier(3, timeout=5)
+
+    class _Future:
+        def result(self, timeout=None):
+            barrier.wait()
+
+    class _Stream:
+        def send(self, request):
+            return _Future()
+
+    table_writer = TableWriter.__new__(TableWriter)
+    table_writer._spec = ORDERS_CURRENT
+    table_writer._lock = threading.Lock()
+    table_writer._stream = _Stream()
+    table_writer._message_class = build_message_class(ORDERS_CURRENT, include_cdc=True)
+
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            table_writer.append([b"row"])
+        except BaseException as err:  # noqa: BLE001 - reported through `errors`
+            errors.append(err)
+
+    threads = [threading.Thread(target=run) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    check_true("three appends in flight at once", not errors)
+    check_true("no appender left hanging", not any(t.is_alive() for t in threads))
+
+
 def test_protobuf_wire_format() -> None:
     """The real wire format must decode to the same values as the JSON fixture.
 
@@ -427,6 +470,151 @@ def test_protobuf_wire_format() -> None:
     check("empty body yields empty dict", parse_event_body(b"", None), {})
 
 
+class _FakeDocument:
+    def __init__(self) -> None:
+        self.data: dict = {}
+        self.writes = 0
+
+    def set(self, document: dict, merge: bool = False) -> None:
+        self.writes += 1
+        if merge:
+            self.data.update(document)
+        else:
+            self.data = dict(document)
+
+
+class _FakeCollection:
+    def __init__(self) -> None:
+        self.documents: dict[str, _FakeDocument] = {}
+
+    def document(self, document_id: str) -> _FakeDocument:
+        return self.documents.setdefault(document_id, _FakeDocument())
+
+
+class _FakeFirestore:
+    """Just enough of the Firestore client for the trace write path."""
+
+    def __init__(self) -> None:
+        self.collections: dict[str, _FakeCollection] = {}
+
+    def collection(self, name: str) -> _FakeCollection:
+        return self.collections.setdefault(name, _FakeCollection())
+
+    def trace(self, document_id: str):
+        """The trace body written under ``document_id``, or None."""
+        collection = self.collections.get("pipeline_traces")
+        if collection is None:
+            return None
+        document = collection.documents.get(document_id)
+        return document.data if document else None
+
+
+def _load_cdc_main():
+    """Import ``main`` with the BigQuery sink stubbed out.
+
+    ``main`` builds a :class:`CdcSink` at import time and that constructor
+    opens a BigQuery Storage Write client, which wants credentials this
+    offline test does not have. Patch the name on ``bq_cdc_writer`` before
+    ``main`` binds it, then restore the real class so nothing else is
+    affected.
+    """
+    import bq_cdc_writer
+
+    class _StubSink:
+        def __init__(self, project: str, dataset: str) -> None:
+            self.project = project
+            self.dataset = dataset
+
+    original = bq_cdc_writer.CdcSink
+    bq_cdc_writer.CdcSink = _StubSink
+    os.environ.setdefault("GCP_PROJECT_ID", "redwood-selftest")
+    os.environ.setdefault("BIGQUERY_DATASET", "redwood_selftest")
+    os.environ["ENSURE_TABLES"] = "false"
+    try:
+        import main as cdc_main
+    finally:
+        bq_cdc_writer.CdcSink = original
+    return cdc_main
+
+
+def order_event(document_id: str, operation: str = "created"):
+    """A sample event re-keyed onto ``document_id``."""
+    payload = json.loads(json.dumps(sample_event(operation)))
+    for key in ("value", "oldValue"):
+        if key in payload:
+            payload[key]["name"] = (
+                "projects/demo/databases/redwood/documents/retail/" + document_id
+            )
+            payload[key]["fields"]["orderId"]["stringValue"] = document_id
+    return parse_document_event(
+        payload,
+        "evt-order",
+        "google.cloud.firestore.document.v1.created",
+        datetime(2026, 8, 31, 10, 15, 0, tzinfo=timezone.utc),
+    )
+
+
+def test_order_trace() -> None:
+    print("\n[order trace]")
+    cdc_main = _load_cdc_main()
+    fake = _FakeFirestore()
+    original_get_firestore = cdc_main.get_firestore
+    cdc_main.get_firestore = lambda: fake
+
+    try:
+        event_time = datetime(2026, 8, 31, 10, 15, 0, tzinfo=timezone.utc)
+        received_at = datetime(2026, 8, 31, 10, 15, 0, 250000, tzinfo=timezone.utc)
+
+        traced = order_event("ORD-26-MOB-0042")
+        cdc_main._write_order_trace(
+            traced,
+            "evt-mob",
+            event_time,
+            received_at,
+            118.4,
+            {"retail_cdc": "APPENDED", "retail_current": "APPENDED"},
+        )
+
+        trace = fake.trace("order_ORD-26-MOB-0042")
+        check_true("mobile order writes a trace", trace is not None)
+        check("trace is tagged as an order", trace["kind"], "ORDER")
+        check("trace carries the order id", trace["orderId"], "ORD-26-MOB-0042")
+        check("trace carries the customer id", trace["customerId"], "cust_demo1")
+        check("eventarc delivery measured", trace["cdcDeliveryMs"], 250.0)
+        check("bigquery append measured", trace["bqWriteMs"], 118.4)
+        check("total is delivery plus append", trace["bqTotalMs"], 368.4)
+        check(
+            "destination tables recorded",
+            trace["bqTables"],
+            ["retail_cdc", "retail_current"],
+        )
+
+        # Eventarc stamps ce-time on a different machine's clock. Skew must
+        # never surface as a negative latency in the console.
+        cdc_main._write_order_trace(
+            traced, "evt-mob", received_at, event_time, 5.0, {}
+        )
+        check(
+            "clock skew clamps delivery to zero",
+            fake.trace("order_ORD-26-MOB-0042")["cdcDeliveryMs"],
+            0.0,
+        )
+
+        # The seeded history replays through this same endpoint on a backfill.
+        # Tracing all of it would bury the order the presenter just placed.
+        seeded = order_event("ORD-2609-DEMO1-0017")
+        cdc_main._write_order_trace(
+            seeded, "evt-seed", event_time, received_at, 90.0, {}
+        )
+        check(
+            "seeded order is not traced",
+            fake.trace("order_ORD-2609-DEMO1-0017"),
+            None,
+        )
+    finally:
+        cdc_main.get_firestore = original_get_firestore
+
+
 def main() -> int:
     print("=" * 62)
     print(" Redwood CDC mapping self-test")
@@ -441,6 +629,8 @@ def main() -> int:
     test_ddl()
     test_sequence_numbers()
     test_delete_row_is_key_only()
+    test_appends_overlap()
+    test_order_trace()
 
     print("\n" + "=" * 62)
     if FAILURES:

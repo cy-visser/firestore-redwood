@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   ShoppingBag,
   Store,
@@ -12,13 +12,19 @@ import { CatalogTab } from "./components/CatalogTab";
 import { CartTab } from "./components/CartTab";
 import { OrdersTab } from "./components/OrdersTab";
 import { ProfileTab } from "./components/ProfileTab";
-import { JSONInspectorModal } from "./components/JSONInspectorModal";
+import { LoginScreen } from "./components/LoginScreen";
+import { OfferSheet } from "./components/OfferSheet";
+import { useEventStream } from "./hooks/useEventStream";
 import {
   CatalogItem,
   CartItem,
   PrincipalProfile,
   ShippingCity,
-  OrderDocument
+  OrderDocument,
+  CustomerSession,
+  LoyaltyOffer,
+  SnapshotEvent,
+  TERMINAL_STATUSES
 } from "./types/retail";
 
 export const App: React.FC = () => {
@@ -36,12 +42,20 @@ export const App: React.FC = () => {
   const [firestoreConnected, setFirestoreConnected] = useState<boolean>(false);
   const [isLoadingOrders, setIsLoadingOrders] = useState<boolean>(false);
 
-  // Inspector Modal State
-  const [inspectorOrder, setInspectorOrder] = useState<OrderDocument | null>(null);
-  const [inspectorTitle, setInspectorTitle] = useState<string>("Firestore Order JSON Document");
+  // Login session and the agent's verdict on it.
+  const [session, setSession] = useState<CustomerSession | null>(null);
+  const [offer, setOffer] = useState<LoyaltyOffer | null>(null);
+  const [offerSheetOpen, setOfferSheetOpen] = useState<boolean>(false);
+  const [loginError, setLoginError] = useState<string | null>(null);
 
   // Notification Toast
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // Browser-clock stopwatch for the login. Held in refs because these are
+  // measurements, not state: nothing renders from them, and turning them into
+  // state would re-render the app on every tick of the thing being measured.
+  const loginClickAt = useRef<number | null>(null);
+  const outcomeReported = useRef<boolean>(false);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -76,9 +90,6 @@ export const App: React.FC = () => {
           setCities(catData.cities || []);
           setComplaintReasons(catData.complaintReasons || []);
         }
-
-        // Load initial orders
-        loadOrders();
       } catch (err) {
         console.error("Failed to load initial data:", err);
       }
@@ -87,10 +98,17 @@ export const App: React.FC = () => {
     fetchData();
   }, []);
 
-  const loadOrders = async () => {
+  // The orders feed is one customer's, filtered and ordered by Firestore. It
+  // used to be fetched before login as an unfiltered page of the whole seeded
+  // collection and narrowed in the browser, which is why an order placed
+  // seconds earlier was usually not in it.
+  const loadOrders = useCallback(async () => {
+    if (!session) return;
     setIsLoadingOrders(true);
     try {
-      const res = await fetch("/api/orders?limit=40");
+      const res = await fetch(
+        `/api/orders?principalId=${encodeURIComponent(activePrincipalId)}&limit=40`
+      );
       if (res.ok) {
         const data = await res.json();
         setOrders(data.orders || []);
@@ -100,7 +118,121 @@ export const App: React.FC = () => {
     } finally {
       setIsLoadingOrders(false);
     }
+  }, [session, activePrincipalId]);
+
+  useEffect(() => {
+    void loadOrders();
+  }, [loadOrders]);
+
+  // ------------------------------------------------------------------
+  // Login and the agent's verdict
+  // ------------------------------------------------------------------
+
+  const agentStatus = session?.agentProcessingStatus ?? null;
+  const agentSettled =
+    agentStatus !== null && TERMINAL_STATUSES.includes(agentStatus);
+
+  const handleSignIn = async (principalId: string) => {
+    setLoginError(null);
+    outcomeReported.current = false;
+    loginClickAt.current = performance.now();
+
+    try {
+      const res = await fetch("/api/session/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ principalId })
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: "Login failed" }));
+        throw new Error(err.detail || "Login failed");
+      }
+
+      const data = await res.json();
+      const ackMs = performance.now() - (loginClickAt.current ?? 0);
+
+      setActivePrincipalId(principalId);
+      setSession(data.session as CustomerSession);
+      setOffer(null);
+      setActiveTab("catalog");
+
+      // One clock, start to finish: the click and the response were both
+      // timed here. Reported rather than displayed, because the console is
+      // where the presenter reads it from.
+      void reportTelemetry(data.sessionId, { clientAckMs: Math.round(ackMs) });
+
+      if (data.reused) {
+        showToast("Reusing the session already in flight");
+      }
+    } catch (e) {
+      setLoginError(e instanceof Error ? e.message : "Login failed");
+    }
   };
+
+  const handleSignOut = () => {
+    setSession(null);
+    setOffer(null);
+    setOfferSheetOpen(false);
+    setLoginError(null);
+    outcomeReported.current = false;
+    setActiveTab("catalog");
+  };
+
+  const reportTelemetry = async (
+    sessionId: string,
+    measurements: Record<string, number | string>
+  ) => {
+    try {
+      await fetch(`/api/telemetry/${sessionId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(measurements)
+      });
+    } catch {
+      // Telemetry is decoration on the console. Losing it must never affect
+      // the customer-facing flow.
+    }
+  };
+
+  // Live view of this session. The handlers are recreated on every render,
+  // which is why useEventStream holds them in a ref rather than in its
+  // dependency list: rebuilding the connection on each event would drop the
+  // changes committed while it reconnected.
+  const handleSessionEvent = useCallback((payload: SnapshotEvent<CustomerSession>) => {
+    if (!payload?.data) return;
+    setSession((prev) => ({ ...(prev ?? {}), ...payload.data }));
+  }, []);
+
+  const handleOfferEvent = useCallback((payload: SnapshotEvent<LoyaltyOffer>) => {
+    if (!payload?.data) return;
+    const incoming = payload.data;
+    setOffer(incoming);
+    // Only an offer that has not been redeemed yet interrupts the customer.
+    // A REDEEMED update arriving because they just claimed it must not
+    // reopen the sheet they closed.
+    if (incoming.status === "ACTIVE") {
+      setOfferSheetOpen(true);
+    }
+  }, []);
+
+  useEventStream(
+    session ? `/api/stream/session/${session.sessionId}` : null,
+    { session: handleSessionEvent, offer: handleOfferEvent }
+  );
+
+  // Report the end-to-end browser timing once, when the agent settles.
+  useEffect(() => {
+    if (!session || !agentSettled || outcomeReported.current) return;
+    if (loginClickAt.current === null) return;
+
+    outcomeReported.current = true;
+    const visibleMs = Math.round(performance.now() - loginClickAt.current);
+    void reportTelemetry(session.sessionId, {
+      offerVisibleMs: visibleMs,
+      outcome: session.offerId ? "OFFER" : session.skipReason || "NO_OFFER"
+    });
+  }, [session, agentSettled]);
 
   // Cart operations
   const handleAddToCart = (item: CatalogItem, qty: number = 1) => {
@@ -169,56 +301,75 @@ export const App: React.FC = () => {
     setCart([]);
     setOrders((prev) => [newOrder, ...prev]);
     setActiveTab("orders");
+
+    // An offer is spendable until it is attached to an order, and this order
+    // just attached it. Reflecting that here stops the cart from continuing to
+    // advertise a discount the next order will not get.
+    if (newOrder.loyaltyOffer?.offerApplied) {
+      setOffer((prev) =>
+        prev && prev.offerId === newOrder.loyaltyOffer?.offerId
+          ? { ...prev, status: "REDEEMED", orderId: newOrder.orderId }
+          : prev
+      );
+      setOfferSheetOpen(false);
+      showToast(
+        `Order ${newOrder.orderId} placed with ${newOrder.loyaltyOffer.discountPercent}% agent offer`
+      );
+      return;
+    }
+
     showToast(`Order ${newOrder.orderId} committed to Firestore!`);
   };
 
-  // Inspect JSON Preview
-  const handleInspectCartJSON = async () => {
-    if (cart.length === 0) return;
-    try {
-      const cityObj = cities.find((c) => c.city === profiles[activePrincipalId]?.defaultAddress?.city) || cities[0];
-      const previewPayload = {
-        principalId: activePrincipalId,
-        items: cart,
-        shippingAddress: cityObj,
-        paymentMethod: "INVOICE_NET30",
-        serviceLevel: "NEXT_DAY_AIR",
-        feedbackRating: activePrincipalId === "demo1" ? 5 : 3
-      };
+  const handleClaimOffer = async (offerId: string) => {
+    const res = await fetch(`/api/offers/${offerId}/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
 
-      const res = await fetch("/api/orders/preview", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(previewPayload)
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        setInspectorTitle("Cart Preview JSON Document");
-        setInspectorOrder(data.order);
-      }
-    } catch (e) {
-      console.error("Failed to generate preview:", e);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Could not claim offer" }));
+      throw new Error(err.detail || "Could not claim offer");
     }
+
+    const data = await res.json();
+    setOffer(data.offer as LoyaltyOffer);
+    showToast("Offer redeemed");
   };
 
-  const handleInspectOrderJSON = (order: OrderDocument) => {
-    setInspectorTitle(`Firestore Document: ${order.orderId}`);
-    setInspectorOrder(order);
-  };
+  // The offer the cart should be priced against: the one the agent issued for
+  // this session, until an order has spent it. Only the id is ever sent; the
+  // backend reads the discount off the document itself.
+  const spendableOffer =
+    offer && !offer.orderId && offer.status !== "EXPIRED" ? offer : null;
+
+  if (!session) {
+    return (
+      <DeviceFrame>
+        <div className="w-full h-full flex flex-col bg-slateDark-900 overflow-hidden relative font-sans">
+          <LoginScreen
+            profiles={profiles}
+            firestoreConnected={firestoreConnected}
+            onSignIn={handleSignIn}
+            error={loginError}
+          />
+        </div>
+      </DeviceFrame>
+    );
+  }
 
   return (
     <DeviceFrame>
       <div className="w-full h-full flex flex-col bg-slateDark-900 overflow-hidden relative font-sans">
-        {/* Top Header with IAM Principal Switcher */}
+        {/* Top Header: who is signed in, and what the agent decided */}
         <Header
           activePrincipalId={activePrincipalId}
-          onSelectPrincipal={(id) => {
-            setActivePrincipalId(id);
-            showToast(`Switched active user to IAM Principal: ${id}`);
-          }}
           profiles={profiles}
-          firestoreConnected={firestoreConnected}
+          session={session}
+          offer={offer}
+          onSignOut={handleSignOut}
+          onShowOffer={offer ? () => setOfferSheetOpen(true) : undefined}
         />
 
         {/* Tab Content Body */}
@@ -238,12 +389,12 @@ export const App: React.FC = () => {
               cart={cart}
               activePrincipalId={activePrincipalId}
               principal={profiles[activePrincipalId]}
+              offer={spendableOffer}
               cities={cities}
               complaintReasons={complaintReasons}
               onUpdateQuantity={handleUpdateQuantity}
               onRemoveItem={handleRemoveItem}
               onClearCart={handleClearCart}
-              onInspectJSON={handleInspectCartJSON}
               onSubmitOrder={handleSubmitOrder}
               onOrderSuccess={handleOrderSuccess}
             />
@@ -253,9 +404,9 @@ export const App: React.FC = () => {
             <OrdersTab
               orders={orders}
               activePrincipalId={activePrincipalId}
+              customerId={session.customerId}
               onRefresh={loadOrders}
               isLoading={isLoadingOrders}
-              onInspectOrderJSON={handleInspectOrderJSON}
             />
           )}
 
@@ -263,10 +414,9 @@ export const App: React.FC = () => {
             <ProfileTab
               activePrincipalId={activePrincipalId}
               principal={profiles[activePrincipalId]}
-              onSwitchPrincipal={(id) => {
-                setActivePrincipalId(id);
-                showToast(`Switched active user to: ${id}`);
-              }}
+              session={session}
+              offer={offer}
+              onSignOut={handleSignOut}
             />
           )}
         </div>
@@ -341,12 +491,12 @@ export const App: React.FC = () => {
           </button>
         </nav>
 
-        {/* Live JSON Inspector Modal */}
-        {inspectorOrder && (
-          <JSONInspectorModal
-            order={inspectorOrder}
-            title={inspectorTitle}
-            onClose={() => setInspectorOrder(null)}
+        {/* Retention offer, slid up over the running app */}
+        {offer && offerSheetOpen && (
+          <OfferSheet
+            offer={offer}
+            onClose={() => setOfferSheetOpen(false)}
+            onClaim={handleClaimOffer}
           />
         )}
       </div>

@@ -1,10 +1,4 @@
-"""
-Runtime wiring for the Redwood Retail loyalty offer agent.
-
-Builds the Google Cloud clients the agent needs and exposes a single query
-entrypoint over it. The client construction is kept here rather than in
-agent.py so the agent itself stays injectable and testable offline.
-"""
+"""Runtime wiring for the Redwood Retail loyalty offer agent."""
 
 import json
 import logging
@@ -62,18 +56,13 @@ class LoyaltyAgentEngine:
 
         logger.info("Initializing loyalty agent in project %s (%s)...", self.project_id, self.region)
 
-        # A caller may have handed us a client already; reuse it so the agent
-        # and the caller cannot end up pointed at different databases.
         if self.fs_client is None:
             self.fs_client = firestore.Client(project=self.project_id, database=self.firestore_database)
         if self.bq_client is None:
             self.bq_client = bigquery.Client(project=self.project_id, location=self.region)
 
         try:
-            # Vertex AI mode is not the default for genai.Client: without it the
-            # client expects a Gemini Developer API key, which this service does
-            # not have, so every generation failed and the agent silently served
-            # deterministic copy.
+            # Initialise Gemini client with Vertex AI backend.
             self.genai_client = genai.Client(
                 vertexai=True,
                 project=self.project_id,

@@ -1,40 +1,4 @@
-"""
-Decoding for Firestore document events delivered over Eventarc.
-
-Eventarc delivers ``google.cloud.firestore.document.v1.*`` events whose payload
-is a ``DocumentEventData`` message. Firestore sources accept only
-``application/protobuf``: setting ``application/json`` on the trigger is
-rejected at creation time with a ``trigger.event_data_content_type`` field
-violation, so the binary encoding is not a choice.
-
-The body is parsed with the generated message and then converted to its
-protojson form, which is the shape the rest of this module works in. Going via
-the dict rather than reading protobuf fields directly keeps the decoding rules
-in one place, lets the self-test build fixtures by hand without constructing
-protobufs, and means a body that does arrive as JSON is handled by the same
-path.
-
-The normalised shape looks like::
-
-    {
-      "oldValue": { ... Document ... },
-      "value":    { ... Document ... },
-      "updateMask": {"fieldPaths": ["a", "b"]}
-    }
-
-with a Document being::
-
-    {
-      "name": "projects/P/databases/D/documents/retail/ORD-1",
-      "fields": {"orderId": {"stringValue": "ORD-1"}, ...},
-      "createTime": "2026-09-21T09:00:00.000000Z",
-      "updateTime": "2026-09-21T09:00:00.000000Z"
-    }
-
-On a delete, ``value`` is absent/empty and ``oldValue`` holds the last known
-state. On a create, ``oldValue`` is absent. Both are empty for the rare case
-where Firestore reports a no-op write.
-"""
+"""Decoding for Firestore document events delivered over Eventarc."""
 
 from __future__ import annotations
 
@@ -46,15 +10,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Event types Eventarc emits for Firestore. The ``.withAuthContext`` variants
-# carry the same payload under an extra wrapper, which we do not subscribe to.
+# Event types Eventarc emits for Firestore.
 EVENT_CREATED = "google.cloud.firestore.document.v1.created"
 EVENT_UPDATED = "google.cloud.firestore.document.v1.updated"
 EVENT_DELETED = "google.cloud.firestore.document.v1.deleted"
 EVENT_WRITTEN = "google.cloud.firestore.document.v1.written"
 
-# Maps a CloudEvent type to the CDC operation we record. ``written`` is
-# ambiguous by itself, so it is resolved from the presence of value/oldValue.
+# Maps a CloudEvent type to the CDC operation we record.
 _OPERATION_BY_EVENT = {
     EVENT_CREATED: "insert",
     EVENT_UPDATED: "update",
@@ -63,12 +25,7 @@ _OPERATION_BY_EVENT = {
 
 
 def parse_event_body(body: bytes, content_type: Optional[str]) -> Dict[str, Any]:
-    """Normalise a raw Eventarc request body into the protojson dict shape.
-
-    Handles both wire formats. Content type is only a hint: a body that starts
-    with ``{`` is treated as JSON regardless of what the header claims, because
-    a mislabelled body is easier to recover from than to diagnose.
-    """
+    """Normalise a raw Eventarc request body into the protojson dict shape."""
     if not body:
         return {}
 
@@ -81,18 +38,14 @@ def parse_event_body(body: bytes, content_type: Optional[str]) -> Dict[str, Any]
         except (UnicodeDecodeError, json.JSONDecodeError):
             if looks_like_json:
                 raise
-            # Header said JSON but the bytes are not; fall through to protobuf.
+            # Header said JSON but bytes are not; fall through to protobuf.
 
     from google.events.cloud import firestore_v1
     from google.protobuf.json_format import MessageToDict
 
     event_data = firestore_v1.DocumentEventData()
-    # The proto-plus wrapper does not expose ParseFromString, so go through the
-    # underlying protobuf message.
     type(event_data).pb(event_data).ParseFromString(body)
 
-    # MessageToDict produces exactly the protojson encoding: lowerCamelCase
-    # keys, int64 rendered as strings, timestamps as RFC 3339 strings.
     return MessageToDict(
         type(event_data).pb(event_data),
         preserving_proto_field_name=False,
@@ -126,14 +79,8 @@ def _parse_timestamp(raw: Optional[str]) -> Optional[datetime]:
 
 
 def decode_value(value: Any) -> Any:
-    """Unwrap a single Firestore ``Value`` union into a plain Python value.
-
-    Integers arrive as strings in protojson because int64 is not safely
-    representable in JSON, so they are cast back here. Timestamps are returned
-    as ``datetime`` rather than strings so downstream typing stays honest.
-    """
+    """Unwrap a single Firestore Value union into a plain Python value."""
     if not isinstance(value, dict):
-        # Already plain; tolerate it so the decoder is idempotent.
         return value
 
     if "nullValue" in value:
@@ -172,23 +119,18 @@ def decode_value(value: Any) -> Any:
     if "mapValue" in value:
         return decode_fields((value["mapValue"] or {}).get("fields", {}))
 
-    # Unknown union member: keep it rather than silently dropping data.
     return value
 
 
 def decode_fields(fields: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Unwrap a Firestore ``fields`` map into a plain dict."""
+    """Unwrap a Firestore fields map into a plain dict."""
     if not fields:
         return {}
     return {key: decode_value(val) for key, val in fields.items()}
 
 
 def split_document_name(name: str) -> Tuple[str, str, List[str]]:
-    """Split a Firestore resource name into (database, collection, path parts).
-
-    ``projects/P/databases/D/documents/retail/ORD-1`` yields
-    ``("D", "retail", ["retail", "ORD-1"])``.
-    """
+    """Split a Firestore resource name into (database, collection, path parts)."""
     if not name:
         return "", "", []
     parts = name.split("/")
@@ -253,11 +195,7 @@ class DocumentEvent:
 
     @property
     def effective_data(self) -> Dict[str, Any]:
-        """The document body to key on.
-
-        Deletes carry no ``value``, so the last known state is used to resolve
-        identifiers such as ``customerId``.
-        """
+        """The document body to key on, using old_data for deletes."""
         return self.old_data if self.is_delete else self.data
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
@@ -273,7 +211,7 @@ def parse_document_event(
     event_type: str,
     event_time: Optional[datetime] = None,
 ) -> DocumentEvent:
-    """Turn a raw ``DocumentEventData`` protojson body into a ``DocumentEvent``."""
+    """Turn a raw DocumentEventData protojson body into a DocumentEvent."""
     value = payload.get("value") or {}
     old_value = payload.get("oldValue") or {}
 
@@ -282,7 +220,7 @@ def parse_document_event(
 
     operation = _OPERATION_BY_EVENT.get(event_type)
     if operation is None:
-        # ``written`` (or an unrecognised type): infer from which side is present.
+        # written or unrecognised event type: infer from present values.
         if value and not old_value:
             operation = "insert"
         elif old_value and not value:
@@ -295,9 +233,6 @@ def parse_document_event(
     document_id = path_parts[-1] if path_parts else ""
     document_path = "/".join(path_parts)
 
-    # Prefer Firestore's own commit time over the CloudEvent envelope time: it
-    # is the authoritative ordering signal and is what _CHANGE_SEQUENCE_NUMBER
-    # is derived from.
     commit_time = _parse_timestamp(value.get("updateTime")) or _parse_timestamp(
         old_value.get("updateTime")
     )

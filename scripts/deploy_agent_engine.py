@@ -1,28 +1,5 @@
 #!/usr/bin/env python3
-"""
-Deploy the loyalty agent to Vertex AI Agent Engine.
-
-Agent Engine is given the LoyaltyAgentEngine object from loyalty_agent.main
-directly rather than a container. That class already implements the contract
-the runtime expects, set_up() to build clients and query() to evaluate one
-session, so there is nothing to adapt. The container route would mean writing
-and maintaining an HTTP server whose only job is to call query().
-
-Deployment is keyed on display name. A previous version of this stack recorded
-the deployed engine id in Terraform as a literal default, which went stale the
-moment the engine was redeployed and pointed at a resource in a different
-project. Nothing here or in the bridge records an engine id: both resolve the
-engine by display name at run time, so a redeploy cannot leave a dangling
-reference behind.
-
-Re-running this updates the existing engine in place rather than creating a
-second one with the same name.
-
-Usage:
-    python scripts/deploy_agent_engine.py
-    python scripts/deploy_agent_engine.py --display-name redwood-loyalty-agent
-    python scripts/deploy_agent_engine.py --dry-run
-"""
+"""Deploy the loyalty agent to Vertex AI Agent Engine."""
 
 from __future__ import annotations
 
@@ -46,6 +23,10 @@ AGENT_REQUIREMENTS = [
     "google-cloud-firestore>=2.14.0",
     "google-cloud-bigquery>=3.14.0",
     "google-genai>=1.0.0",
+    # The escalation judge. ADK is imported lazily and only on the path where
+    # a candidate-tier customer has complained, but the runtime still needs it
+    # installed.
+    "google-adk>=1.0.0",
     "pydantic>=2.0.0",
 ]
 
@@ -163,7 +144,19 @@ def main() -> int:
         "FIRESTORE_DATABASE_ID": os.getenv("FIRESTORE_DATABASE_ID", "redwood"),
         "BIGQUERY_DATASET": os.getenv("BIGQUERY_DATASET", "redwood_retail"),
         "REASONING_MODEL": os.getenv("REASONING_MODEL", "gemini-2.5-flash"),
+        # config.py reads this at import time, so it has to be part of the
+        # deployed runtime environment: setting it only in .env would change
+        # nothing about how the agent behaves in Agent Engine.
+        "ESCALATION_CANDIDATE_TIERS": os.getenv(
+            "ESCALATION_CANDIDATE_TIERS", "MODERATE,LOW"
+        ),
+        # Not set here: GOOGLE_GENAI_USE_VERTEXAI and friends, which the ADK
+        # judge needs to talk to Vertex rather than ask for an API key. Agent
+        # Engine reserves GOOGLE_CLOUD_PROJECT and rejects the deployment
+        # outright if it appears in this map, so escalation.build_judge sets
+        # all three itself. See the comment there.
     }
+
 
     # Run as the pipeline account. The default Agent Engine service agent can
     # serve traffic but has no Firestore or BigQuery access, so the agent would

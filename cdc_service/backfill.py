@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
-"""
-Reconcile a Firestore collection into BigQuery.
-
-Eventarc only delivers changes that happen after a trigger exists, so anything
-seeded beforehand is invisible to the CDC service. There is a second, less
-obvious gap: Firestore raises no change event when a write leaves the document
-byte-identical, and the dataset generator is deterministic, so re-running it
-over an existing collection produces thousands of no-op writes and not one
-event. Either way the fix is the same, and this is it.
-
-This runs as a local CLI rather than as an endpoint on the service. An HTTP
-backfill would have to stream a whole collection inside a single request, and
-a few thousand documents comfortably outlives the Cloud Run request timeout,
-so the endpoint would fail precisely on the collections big enough to need it.
-
-Writes go through the same schema mapping and the same UPSERT path as live
-events, so running this repeatedly is harmless and cannot produce a row that a
-live event would not have produced. Rows are sequenced on each document's own
-update time, so a backfill racing a live event cannot overwrite newer data
-with older.
-
-Usage:
-    python cdc_service/backfill.py --collection retail
-    python cdc_service/backfill.py --all
-"""
+"""Reconcile a Firestore collection into BigQuery via the Storage Write API."""
 
 from __future__ import annotations
 
@@ -44,14 +20,12 @@ load_dotenv(find_dotenv(usecwd=True))
 from bq_cdc_writer import CdcSink, extract_row, sequence_number  # noqa: E402
 from schemas import ColumnContext, build_routes  # noqa: E402
 
-# Rows per append. The Storage Write API caps a single AppendRows request at
-# 10 MB; batching this way is what makes a backfill minutes rather than hours,
-# since each append otherwise costs a full round trip.
+# Rows per AppendRows batch request.
 BATCH_ROWS = 200
 
 
 def _snapshot_time(snapshot, fallback: datetime) -> datetime:
-    """The document's own update time, so backfilled rows sequence correctly."""
+    """Extract update time from snapshot, falling back if absent."""
     value = getattr(snapshot, "update_time", None)
     if value is None:
         return fallback
@@ -83,7 +57,6 @@ def backfill_collection(
     now = datetime.now(timezone.utc)
     started = time.time()
 
-    # Accumulate per table so each append carries a full batch.
     pending: Dict[str, List[bytes]] = {spec.table_id: [] for spec in route.tables}
     processed = 0
     failed = 0

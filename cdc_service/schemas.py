@@ -1,28 +1,4 @@
-"""
-Table definitions and Firestore-to-BigQuery column mapping for the CDC service.
-
-Two shapes of table are produced per replicated collection:
-
-``<collection>_cdc``
-    An append-only ledger. One row per change event, carrying the operation
-    type, the commit timestamp and the full document as JSON. Nothing is ever
-    updated or removed, so it doubles as an audit trail and lets you replay
-    history.
-
-``<collection>_current``
-    A mirror of live state, maintained through the BigQuery Storage Write API's
-    CDC support: each row is sent with a ``_CHANGE_TYPE`` of ``UPSERT`` or
-    ``DELETE`` against a non-enforced primary key. This is the table analytics
-    should read, because it answers "what is true now" without a
-    ``QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY ts DESC) = 1`` over
-    the whole ledger.
-
-Columns on the ``_current`` tables are typed rather than JSON. The previous
-pipeline landed everything in a single JSON column and the churn feature view
-dug fields back out with ``COALESCE(SAFE_CAST(JSON_VALUE(...)), default)``,
-which silently substituted defaults whenever the document shape drifted. Typed
-columns make that drift a load error instead of a wrong number.
-"""
+"""Table definitions and Firestore-to-BigQuery column mapping for the CDC service."""
 
 from __future__ import annotations
 
@@ -30,8 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-# BigQuery types we emit. Kept narrow on purpose; the proto builder in
-# bq_cdc_writer.py must know how to encode every one of these.
+# BigQuery types emitted to Storage Write API.
 STRING = "STRING"
 INT64 = "INT64"
 FLOAT64 = "FLOAT64"
@@ -58,9 +33,7 @@ class Column:
 
     name: str
     bq_type: str
-    #: Dotted path into the decoded document. Ignored when ``derive`` is set.
     source: Optional[str] = None
-    #: Computes the value from the whole event instead of a single field.
     derive: Optional[Callable[["ColumnContext"], Any]] = None
     description: str = ""
 
@@ -89,8 +62,6 @@ class TableSpec:
 
     table_id: str
     columns: Sequence[Column]
-    #: Non-enforced primary key. Required for CDC UPSERT/DELETE; empty means
-    #: the table is append-only and no ``_CHANGE_TYPE`` is sent.
     primary_key: Sequence[str] = field(default_factory=tuple)
     partition_field: Optional[str] = None
     clustering: Sequence[str] = field(default_factory=tuple)
@@ -100,10 +71,6 @@ class TableSpec:
     def supports_cdc(self) -> bool:
         return bool(self.primary_key)
 
-
-# ---------------------------------------------------------------------------
-# Shared derivations
-# ---------------------------------------------------------------------------
 
 def _op(ctx: ColumnContext) -> str:
     return ctx.operation
@@ -121,11 +88,7 @@ def _raw(ctx: ColumnContext) -> str:
     return ctx.raw_json
 
 
-# ---------------------------------------------------------------------------
-# retail_cdc: append-only ledger (schema preserved from the Dataflow pipeline
-# so existing queries and dashboards keep working)
-# ---------------------------------------------------------------------------
-
+# retail_cdc: append-only ledger
 ORDERS_CDC_COLUMNS: List[Column] = [
     Column("order_id", STRING, derive=_doc_id, description="Unique order identifier"),
     Column("operation_type", STRING, derive=_op,
@@ -146,10 +109,7 @@ ORDERS_CDC_COLUMNS: List[Column] = [
            description="Full raw document payload"),
 ]
 
-# ---------------------------------------------------------------------------
 # retail_current: typed mirror of live order state, keyed by order_id
-# ---------------------------------------------------------------------------
-
 ORDERS_CURRENT_COLUMNS: List[Column] = [
     Column("order_id", STRING, derive=_doc_id),
     Column("customer_id", STRING, "customerId"),
@@ -169,9 +129,7 @@ ORDERS_CURRENT_COLUMNS: List[Column] = [
     Column("grand_total", FLOAT64, "financials.grandTotal"),
     Column("profit_margin", FLOAT64, "financials.profitMargin"),
 
-    # Transactional history as observed at order time. These are retained for
-    # convenience, but the churn feature view recomputes them from raw rows so
-    # that features and labels can be windowed independently.
+    # Transactional history
     Column("total_spend_90d", FLOAT64, "transactionalMetrics.totalSpend90d"),
     Column("lifetime_spend", FLOAT64, "transactionalMetrics.lifetimeSpend"),
     Column("avg_order_value", FLOAT64, "transactionalMetrics.avgOrderValue"),
@@ -217,10 +175,7 @@ ORDERS_CURRENT_COLUMNS: List[Column] = [
     Column("change_timestamp", TIMESTAMP, derive=_change_ts),
 ]
 
-# ---------------------------------------------------------------------------
 # customers_current: typed mirror of customer profiles, keyed by customer_id
-# ---------------------------------------------------------------------------
-
 CUSTOMERS_CURRENT_COLUMNS: List[Column] = [
     Column("customer_id", STRING, derive=_doc_id),
     Column("customer_name", STRING, "customerName"),
@@ -246,6 +201,15 @@ CUSTOMERS_CURRENT_COLUMNS: List[Column] = [
     Column("is_demo_persona", BOOL, "isDemoPersona"),
     Column("updated_at", TIMESTAMP, "updatedAt"),
     Column("change_timestamp", TIMESTAMP, derive=_change_ts),
+
+    # Satisfaction and acute friction metrics
+    Column("total_spend_90d", FLOAT64, "totalSpend90d"),
+    Column("return_frequency", INT64, "supportMetrics.returnFrequency"),
+    Column("sentiment_score", FLOAT64, "supportMetrics.sentimentScore"),
+    Column("has_active_complaint", BOOL, "supportMetrics.hasActiveComplaint"),
+    Column("primary_complaint_reason", STRING, "supportMetrics.primaryComplaintReason"),
+    Column("recent_friction_event", STRING, "supportMetrics.recentFrictionEvent"),
+    Column("feedback_rating", INT64, "customerFeedback.rating"),
 ]
 
 
@@ -262,11 +226,7 @@ def build_routes(
     orders_cdc_table: str,
     customers_collection: str,
 ) -> Dict[str, CollectionRoute]:
-    """Build the collection-to-table routing table.
-
-    Names come from configuration rather than constants so the same image can
-    be pointed at a different database or dataset without a rebuild.
-    """
+    """Build the collection-to-table routing table."""
     orders_cdc = TableSpec(
         table_id=orders_cdc_table,
         columns=ORDERS_CDC_COLUMNS,

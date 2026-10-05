@@ -1,39 +1,4 @@
-"""
-Customer roster and order-history generation for the Redwood Retail dataset.
-
-Why this module exists
-----------------------
-The original seeder produced exactly one order per customer, with a randomly
-rolled `customer_id` and a randomly rolled "risk profile" per order. Every
-so-called historical metric (``totalSpend90d``, ``daysSinceLastPurchase``, ...)
-was a synthetic number written into that single order rather than something
-derived from real purchase history. Two consequences followed:
-
-1. Demo customers were not addressable or reproducible, because ids and risk
-   profiles were re-rolled on every run.
-2. The churn label was a deterministic rule over six fields that were also fed
-   to the model as features, so BigQuery ML simply relearned the rule and
-   reported near-perfect accuracy.
-
-This module replaces that with a stable roster of customers, each owning a real
-multi-order history spread over ``HISTORY_MONTHS`` and anchored to end at the
-current date. Churn can then be defined as a genuine forward-looking outcome:
-features are computed from orders on or before a cutoff, and the label is
-simply whether the customer purchased during the window after that cutoff.
-Nothing that produces a feature can observe the label window.
-
-Timeline
---------
-    |<-------- feature window --------->|<-- label window -->|
-    now - HISTORY_MONTHS              cutoff                now
-                                (now - LABEL_WINDOW_DAYS)
-
-Archetypes drive both purchasing behaviour and engagement/support signals, so
-features correlate with churn the way they do in reality, but the label is
-decided purely by observed purchases after the cutoff. Deliberate noise
-(loyal customers who leave, dormant customers who return) keeps the learning
-problem non-trivial.
-"""
+"""Customer roster and order-history generation for the Redwood Retail dataset."""
 
 from __future__ import annotations
 
@@ -43,14 +8,29 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-# Feature/label split. Keep in sync with the BigQuery feature view, which
-# recomputes this split independently at query time.
+from retail_catalog import COMPLAINT_REASONS, FEEDBACK_SENTIMENT_RANGES
+
+# Feature/label split matching BigQuery feature view.
 HISTORY_MONTHS = 18
 LABEL_WINDOW_DAYS = 90
 
-# Spend aggregation window used for the totalSpend90d feature, measured
-# backwards from the cutoff (never from "now", which would leak).
+# Spend aggregation window for totalSpend90d.
 SPEND_WINDOW_DAYS = 90
+
+# Acute grievances matching ACUTE_FRICTION_TYPES in loyalty_agent/agent.py.
+ACUTE_FRICTION_EVENTS = (
+    "REFUND_REQUESTED",
+    "LATE_DELIVERY",
+    "DEFECTIVE_COMPONENT",
+    "ESCALATION",
+    "BILLING_DISPUTE",
+    "DAMAGED_SHIPMENT",
+)
+
+# Non-acute complaints.
+MINOR_COMPLAINT_REASONS = tuple(
+    reason for reason in COMPLAINT_REASONS if reason not in ACUTE_FRICTION_EVENTS
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +62,10 @@ class Archetype:
     complaints_range: tuple
     return_rate_range: tuple
     feedback_rating_weights: Dict[int, float]
+    # Share of the cohort carrying a live grievance from ACUTE_FRICTION_EVENTS.
+    # Friction is a behavioural trait like the rest of this template, so it is
+    # declared per archetype rather than rolled uniformly across the roster.
+    acute_friction_probability: float
     loyalty_tiers: List[str]
     # If set, orders taper in value across the feature window, modelling a
     # customer whose relationship is visibly deteriorating before they leave.
@@ -106,6 +90,7 @@ ARCHETYPES: List[Archetype] = [
         complaints_range=(0, 1),
         return_rate_range=(0.0, 4.0),
         feedback_rating_weights={5: 0.62, 4: 0.28, 3: 0.08, 2: 0.015, 1: 0.005},
+        acute_friction_probability=0.01,
         loyalty_tiers=["ENTERPRISE_VIP", "PLATINUM", "GOLD"],
     ),
     Archetype(
@@ -123,6 +108,7 @@ ARCHETYPES: List[Archetype] = [
         complaints_range=(0, 1),
         return_rate_range=(0.0, 8.0),
         feedback_rating_weights={5: 0.40, 4: 0.36, 3: 0.17, 2: 0.05, 1: 0.02},
+        acute_friction_probability=0.03,
         loyalty_tiers=["GOLD", "SILVER"],
     ),
     Archetype(
@@ -141,6 +127,7 @@ ARCHETYPES: List[Archetype] = [
         complaints_range=(0, 2),
         return_rate_range=(2.0, 12.0),
         feedback_rating_weights={5: 0.24, 4: 0.30, 3: 0.28, 2: 0.13, 1: 0.05},
+        acute_friction_probability=0.10,
         loyalty_tiers=["SILVER", "BRONZE"],
     ),
     Archetype(
@@ -158,6 +145,7 @@ ARCHETYPES: List[Archetype] = [
         complaints_range=(1, 4),
         return_rate_range=(8.0, 22.0),
         feedback_rating_weights={5: 0.06, 4: 0.12, 3: 0.24, 2: 0.34, 1: 0.24},
+        acute_friction_probability=0.40,
         loyalty_tiers=["SILVER", "BRONZE", "NONE"],
         declining=True,
     ),
@@ -178,6 +166,9 @@ ARCHETYPES: List[Archetype] = [
         complaints_range=(0, 3),
         return_rate_range=(5.0, 25.0),
         feedback_rating_weights={5: 0.10, 4: 0.14, 3: 0.26, 2: 0.30, 1: 0.20},
+        # Lower than lapsing despite the worse ratings: a dormant customer has
+        # largely stopped transacting, so there is less left to go wrong.
+        acute_friction_probability=0.22,
         loyalty_tiers=["BRONZE", "NONE"],
         declining=True,
     ),
@@ -209,6 +200,14 @@ class DemoPersona:
     city: str
     country_code: str
     baseline_orders: int
+    # Satisfaction and grievance, pinned for the same reason the label is: the
+    # demo asserts that demo1 draws no escalation and demo2 does, and a sampled
+    # friction event would make that true only on some runs.
+    feedback_rating: int
+    sentiment_score: float
+    has_active_complaint: bool
+    primary_complaint_reason: Optional[str]
+    recent_friction_event: Optional[str]
 
 
 DEMO_PERSONAS: List[DemoPersona] = [
@@ -223,6 +222,11 @@ DEMO_PERSONAS: List[DemoPersona] = [
         city="Amsterdam",
         country_code="NL",
         baseline_orders=14,
+        feedback_rating=5,
+        sentiment_score=0.92,
+        has_active_complaint=False,
+        primary_complaint_reason=None,
+        recent_friction_event=None,
     ),
     DemoPersona(
         principal_id="demo2-user",
@@ -235,6 +239,16 @@ DEMO_PERSONAS: List[DemoPersona] = [
         city="Munich",
         country_code="DE",
         baseline_orders=7,
+        feedback_rating=1,
+        sentiment_score=-0.72,
+        has_active_complaint=True,
+        # Both fields are set, and to different events, because the agent reads
+        # them as two separate signals: the standing complaint on the account is
+        # the repeated late delivery, the thing that happened last is the refund
+        # it led to. Either one alone would fire the acute path; together they
+        # match the five support tickets this persona already carries.
+        primary_complaint_reason="LATE_DELIVERY",
+        recent_friction_event="REFUND_REQUESTED",
     ),
 ]
 
@@ -273,6 +287,14 @@ class Customer:
     purchases_in_label_window: bool = False
     iam_principal: Optional[str] = None
     is_demo_persona: bool = False
+    # Satisfaction and grievance, filled in by assign_friction_profile. The
+    # defaults describe a contented customer, so a roster built without that
+    # call still produces a coherent document rather than nulls.
+    feedback_rating: int = 4
+    sentiment_score: float = 0.5
+    has_active_complaint: bool = False
+    primary_complaint_reason: Optional[str] = None
+    recent_friction_event: Optional[str] = None
     order_dates: List[datetime] = field(default_factory=list)
 
 
@@ -393,6 +415,66 @@ def build_customer(
     )
 
 
+def _rating_sentiment(rating: int, rng: random.Random) -> float:
+    """Map a feedback rating onto the catalog's sentiment band.
+
+    Duplicated from order_factory._rating_to_sentiment rather than shared:
+    order_factory imports this module, so the helper cannot move there without
+    creating an import cycle. The bands themselves come from retail_catalog, so
+    an order and its customer cannot end up describing different moods.
+    """
+    if rating >= 4:
+        lo, hi = FEEDBACK_SENTIMENT_RANGES["POSITIVE"]
+    elif rating == 3:
+        lo, hi = FEEDBACK_SENTIMENT_RANGES["NEUTRAL"]
+    else:
+        lo, hi = FEEDBACK_SENTIMENT_RANGES["NEGATIVE"]
+    return round(rng.uniform(lo, hi), 3)
+
+
+def assign_friction_profile(
+    customer: Customer,
+    rng: random.Random,
+    *,
+    persona: Optional[DemoPersona] = None,
+) -> Customer:
+    """Attach the satisfaction and grievance signals the loyalty agent reads.
+
+    ``rng`` must be a stream of its own, seeded from the customer id. Drawing
+    these from the roster RNG would shift every subsequent order date, which
+    would move the demo personas' order history and with it the LOW/CRITICAL
+    outcome the demo depends on.
+    """
+    if persona is not None:
+        customer.feedback_rating = persona.feedback_rating
+        customer.sentiment_score = persona.sentiment_score
+        customer.has_active_complaint = persona.has_active_complaint
+        customer.primary_complaint_reason = persona.primary_complaint_reason
+        customer.recent_friction_event = persona.recent_friction_event
+        return customer
+
+    rating = _weighted_rating(rng, customer.archetype.feedback_rating_weights)
+
+    if rng.random() < customer.archetype.acute_friction_probability:
+        event = rng.choice(ACUTE_FRICTION_EVENTS)
+        customer.recent_friction_event = event
+        customer.primary_complaint_reason = event
+        customer.has_active_complaint = True
+        # The rest of the document has to agree with the event: a customer
+        # escalating a damaged shipment cannot also be rating the service four
+        # stars, and the agent would then read a contradiction.
+        rating = min(rating, 2)
+    elif rating <= 2 and customer.complaints_count > 0:
+        # Unhappy, but over something routine. Drawing from the minor reasons
+        # keeps this population out of the agent's acute path.
+        customer.primary_complaint_reason = rng.choice(MINOR_COMPLAINT_REASONS)
+        customer.has_active_complaint = True
+
+    customer.feedback_rating = rating
+    customer.sentiment_score = _rating_sentiment(rating, rng)
+    return customer
+
+
 def generate_order_dates(
     customer: Customer,
     rng: random.Random,
@@ -470,17 +552,30 @@ def build_customer_roster(
     now = reference_now(now)
     customers: List[Customer] = []
 
+    # Friction is drawn from its own RNG stream, keyed "friction", for the same
+    # reason orders are keyed "orders" in generate_retail_dataset.py: adding
+    # draws to an existing stream would renumber everything after them, and
+    # here that would have moved every order date in the roster.
     if include_demo_personas:
         for persona in DEMO_PERSONAS:
             rng = random.Random(_stable_seed(seed, persona.customer_id))
             customer = build_customer(0, rng, persona=persona, project_id=project_id)
             generate_order_dates(customer, rng, now, persona=persona)
+            assign_friction_profile(
+                customer,
+                random.Random(_stable_seed(seed, persona.customer_id, "friction")),
+                persona=persona,
+            )
             customers.append(customer)
 
     for index in range(1, max(count, 0) + 1):
         rng = random.Random(_stable_seed(seed, index))
         customer = build_customer(index, rng, project_id=project_id)
         generate_order_dates(customer, rng, now)
+        assign_friction_profile(
+            customer,
+            random.Random(_stable_seed(seed, customer.customer_id, "friction")),
+        )
         customers.append(customer)
 
     return customers
@@ -490,6 +585,11 @@ def roster_summary(customers: List[Customer]) -> Dict[str, Any]:
     """Summarise a roster for logging and for post-seed sanity assertions."""
     total_orders = sum(len(c.order_dates) for c in customers)
     churned = sum(1 for c in customers if not c.purchases_in_label_window)
+    acute_friction = sum(
+        1 for c in customers
+        if (c.recent_friction_event or c.primary_complaint_reason)
+        in ACUTE_FRICTION_EVENTS
+    )
     by_archetype: Dict[str, int] = {}
     for c in customers:
         by_archetype[c.archetype.name] = by_archetype.get(c.archetype.name, 0) + 1
@@ -501,4 +601,8 @@ def roster_summary(customers: List[Customer]) -> Dict[str, Any]:
         "retained": len(customers) - churned,
         "churn_rate": round(churned / max(len(customers), 1), 3),
         "by_archetype": by_archetype,
+        # Reported because the agent's escalation path is only reachable for
+        # this population; a reseed that produces zero here has broken it.
+        "acute_friction": acute_friction,
+        "acute_friction_rate": round(acute_friction / max(len(customers), 1), 3),
     }

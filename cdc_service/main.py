@@ -1,30 +1,4 @@
-"""
-Redwood Retail CDC service.
-
-Receives Firestore document change events from Eventarc and replicates them
-into BigQuery through the Storage Write API. This replaces the Dataflow
-streaming job, which could not actually tail Firestore: the Beam Python SDK has
-no Firestore connector, Datastream does not list Firestore as a source, and the
-MongoDB-compatible change streams that would have worked are unavailable
-because the ``redwood`` database is Enterprise *Native* mode, which is mutually
-exclusive with MongoDB compatibility. The old job was therefore polling, with
-all the latency and cost that implies, and could not observe deletes at all.
-
-Eventarc gives us the real change stream. The trade is that delivery is
-at-least-once and unordered, so every write here has to be idempotent: the
-ledger is append-only and de-duplicable by event id, and the mirror tables are
-keyed and sequenced so a late duplicate cannot resurrect an old version.
-
-Endpoints
-    ``POST /``                 CloudEvent sink for Eventarc.
-    ``GET  /healthz``          Liveness and readiness.
-
-Reconciling a collection that predates its trigger is a separate concern and
-lives in ``backfill.py``, which runs as a CLI. It cannot be an endpoint here: a
-whole collection streamed inside one request outlives the Cloud Run request
-timeout on exactly the collections large enough to need it.
-"""
-
+"""Redwood Retail CDC service entrypoint for Eventarc CloudEvents."""
 
 from __future__ import annotations
 
@@ -32,7 +6,9 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, request
@@ -53,14 +29,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger("redwood.cdc")
 
+# Firestore collection the console reads latency traces from. The agent bridge
+# and the loyalty agent write session traces here; this service writes the
+# order replication leg.
+TRACES_COLLECTION = os.getenv("FIRESTORE_TRACES_COLLECTION", "pipeline_traces")
+TRACE_TTL_DAYS = 30
+
+# Only documents whose id starts with this prefix are traced, which in
+# practice means orders placed from the mobile app. Tracing every replicated
+# document would write 400 trace records during a backfill of the seeded
+# dataset and bury the one the presenter just created. Set empty to disable.
+TRACE_DOCUMENT_ID_PREFIX = os.getenv("TRACE_DOCUMENT_ID_PREFIX", "ORD-26-MOB-")
+
+_firestore = None
+_firestore_lock = threading.Lock()
+
+
+def get_firestore():
+    """Get or create the Firestore client used for trace recording."""
+    global _firestore
+    if _firestore is not None:
+        return _firestore
+
+    with _firestore_lock:
+        if _firestore is None:
+            from google.cloud import firestore
+
+            _firestore = firestore.Client(
+                project=config.project_id, database=config.database_id
+            )
+        return _firestore
+
 
 class Config:
-    """Runtime configuration, entirely from the environment.
-
-    Nothing here has a project- or dataset-specific default. The same image is
-    deployed to any project by changing environment variables, which is why the
-    service refuses to start rather than falling back to a guess.
-    """
+    """Runtime configuration loaded from environment variables."""
 
     def __init__(self) -> None:
         self.project_id = os.getenv("GCP_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
@@ -152,8 +154,6 @@ def _write_event(event: DocumentEvent) -> Dict[str, str]:
     change_type = "DELETE" if event.is_delete else "UPSERT"
     sequence = sequence_number(event.event_time)
 
-    # The ledger has no primary key, so a delete lands there as an ordinary row
-    # tagged operation_type='delete'; only the keyed mirrors remove anything.
     outcome: Dict[str, str] = {}
     for spec in route.tables:
         table_writer = sink.writer_for(spec)
@@ -182,14 +182,66 @@ def healthz():
     ), 200
 
 
+def _write_order_trace(
+    event: DocumentEvent,
+    event_id: str,
+    event_time: Optional[datetime],
+    received_at: datetime,
+    bq_write_ms: float,
+    written: Dict[str, str],
+) -> None:
+    """Record how long an order took to reach BigQuery, for the console.
+
+    Two spans, both owned by this service and both on its own clock: the
+    Eventarc delivery hop (ce-time to arrival here, approximate for the same
+    reason the agent bridge marks its own) and the Storage Write API append.
+
+    Written to ``pipeline_traces``, which no Eventarc trigger watches -- the
+    CDC triggers are scoped by path pattern to the orders and customers
+    collections, so this cannot feed back into itself.
+
+    Failures are logged and swallowed. Raising here would return a 500 to
+    Eventarc, which would redeliver the order and append the BigQuery row a
+    second time; a missing measurement is much cheaper than a duplicated row.
+    """
+    if not TRACE_DOCUMENT_ID_PREFIX:
+        return
+    if not event.document_id.startswith(TRACE_DOCUMENT_ID_PREFIX):
+        return
+
+    delivery_ms: Optional[float] = None
+    if event_time is not None:
+        delivery_ms = max(0.0, (received_at - event_time).total_seconds() * 1000.0)
+
+    try:
+        document = {
+            "kind": "ORDER",
+            "orderId": event.document_id,
+            "customerId": (event.effective_data or {}).get("customerId"),
+            "eventId": event_id,
+            "eventTime": event_time,
+            "cdcReceivedAt": received_at,
+            "cdcDeliveryMs": round(delivery_ms, 2) if delivery_ms is not None else None,
+            "bqWriteMs": round(bq_write_ms, 2),
+            "bqTotalMs": round((delivery_ms or 0.0) + bq_write_ms, 2),
+            "bqTables": sorted(written),
+            "operation": event.operation,
+            "recordedAt": received_at,
+            "expireAt": received_at + timedelta(days=TRACE_TTL_DAYS),
+        }
+        get_firestore().collection(TRACES_COLLECTION).document(
+            f"order_{event.document_id}"
+        ).set(document, merge=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not write order trace for %s: %s", event.document_id, exc
+        )
+
+
 @app.post("/")
 def receive_event():
-    """Eventarc sink.
-
-    Returns 2xx for anything that must not be retried. Eventarc retries on 5xx,
-    so malformed payloads and unroutable collections are acknowledged rather
-    than looped forever; only genuine write failures are surfaced as errors.
-    """
+    """Eventarc CloudEvent receiver endpoint."""
+    received_at = datetime.now(timezone.utc)
     event_id, event_type, event_time = _cloud_event_headers()
 
     if not event_type:
@@ -212,18 +264,27 @@ def receive_event():
         logger.debug("No route for collection %r; ignoring", event.collection)
         return jsonify(status="ignored", collection=event.collection), 200
 
+    # Around the BigQuery append alone. Decoding the event above is this
+    # service's own work and is not what "replicated into BigQuery" means.
+    write_started = time.monotonic()
     try:
         written = _write_event(event)
     except Exception as err:  # noqa: BLE001 - retryable, let Eventarc redeliver
         logger.exception("BigQuery write failed for %s", event.document_path)
         return jsonify(status="error", reason=str(err)), 500
+    bq_write_ms = (time.monotonic() - write_started) * 1000.0
+
+    _write_order_trace(
+        event, event_id, event_time, received_at, bq_write_ms, written
+    )
 
     logger.info(
-        "%s %s/%s -> %s",
+        "%s %s/%s -> %s in %.0fms",
         event.operation,
         event.collection,
         event.document_id,
         ",".join(f"{k}:{v}" for k, v in written.items()),
+        bq_write_ms,
     )
     return jsonify(
         status="ok",
@@ -231,6 +292,7 @@ def receive_event():
         collection=event.collection,
         document_id=event.document_id,
         written=written,
+        bqWriteMs=round(bq_write_ms, 2),
     ), 200
 
 

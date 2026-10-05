@@ -27,6 +27,7 @@ RUN_TESTS=false
 VERIFY_DEMO=false
 SKIP_IMAGE_BUILD=false
 SKIP_AGENT_DEPLOY=false
+START_PROXY=true
 
 usage() {
   cat <<EOF
@@ -44,6 +45,8 @@ Options:
   --skip-bqml              Skip training and evaluating BigQuery ML churn models.
   --skip-image-build       Reuse the container images already in Artifact Registry.
   --skip-agent-deploy      Leave the deployed loyalty agent as it is.
+  --no-proxy               Finish after deploying instead of opening the authenticated proxy
+                           to redwood-app. Use for CI and unattended runs.
   --dry-run                Validate configuration and run Terraform plan without modifying GCP resources.
   -t, --teardown, --destroy Cleanly tear down all provisioned GCP infrastructure and stop jobs.
   -y, --auto-approve       Skip confirmation prompts during deployment or teardown.
@@ -52,7 +55,8 @@ Options:
                            stack and check the agent reacts correctly, then exit.
 
 Examples:
-  ./deploy.sh                         # Deploy everything, seed 400 customers, train the churn model
+  ./deploy.sh                         # Deploy everything, then open the app in a local proxy
+  ./deploy.sh --no-proxy              # Deploy and exit without holding a tunnel
   ./deploy.sh --run-tests             # Execute the self-test suites
   ./deploy.sh --verify-demo           # Check the deployed stack end to end
   ./deploy.sh --create-project        # Bootstrap a new GCP project first, then deploy components
@@ -93,6 +97,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_AGENT_DEPLOY=true
       shift
       ;;
+    --no-proxy)
+      START_PROXY=false
+      shift
+      ;;
     --dry-run)
       DRY_RUN=true
       shift
@@ -124,6 +132,170 @@ done
 echo "================================================================="
 echo " 🌲 REDWOOD RETAIL: End-to-End Automated Deployment Manager"
 echo "================================================================="
+
+# ------------------------------------------------------------------------------
+# 0. PREFLIGHT: SDK and credentials
+# ------------------------------------------------------------------------------
+# Nothing in this deployment runs locally any more -- the app, the churn
+# pipeline and the agent all execute in Google Cloud -- so every step past here
+# needs three things that are easy to confuse with each other:
+#
+#   1. the gcloud CLI itself,
+#   2. a *user* login, which is what gcloud commands and `gcloud run services
+#      proxy` authenticate with,
+#   3. Application Default Credentials, which is what Terraform, the seeders
+#      and the Python client libraries authenticate with.
+#
+# (2) and (3) are independent. `gcloud auth login` does not create ADC, and a
+# workstation can be perfectly logged in while Terraform cannot authenticate at
+# all. Checking them separately is the difference between "run this one
+# command" and twenty minutes of confusion several steps later.
+
+# Offer to run a fix rather than merely naming it.
+offer() {
+  local prompt="$1"; shift
+  echo "   Fix: $*"
+  # Not run unattended: every command this is used for opens a browser and
+  # blocks, which in CI means a hang rather than a failure.
+  if [[ "$AUTO_APPROVE" == true ]] || [[ ! -t 0 ]]; then
+    echo "   (Not run automatically: it needs an interactive browser sign-in.)"
+    return 1
+  fi
+  read -r -p "   $prompt [Y/n] " reply
+  [[ -z "$reply" || "$reply" =~ ^[Yy] ]] || return 1
+  "$@"
+}
+
+# Checks that do not need a project id, so the --create-project bootstrap below
+# gets them too.
+preflight_sdk() {
+  echo -e "\n🔑 Step 0/7: Checking the Cloud SDK and your credentials..."
+
+  if ! command -v gcloud &>/dev/null; then
+    echo "❌ The gcloud CLI is not installed, or is not on PATH." >&2
+    echo "   Install it:        https://cloud.google.com/sdk/docs/install" >&2
+    echo "   On Debian/Ubuntu:  sudo apt-get install google-cloud-cli" >&2
+    exit 1
+  fi
+  echo "   ✅ gcloud $(gcloud version --format='value("Google Cloud SDK")' 2>/dev/null | head -1)"
+
+  # `gcloud auth list` prints nothing filterable when the credential store is
+  # empty, hence the emptiness test rather than a status code.
+  ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE \
+    --format='value(account)' 2>/dev/null | head -1)
+  if [[ -z "$ACTIVE_ACCOUNT" ]]; then
+    echo "⚠️  No active gcloud account."
+    offer "Sign in now?" gcloud auth login || {
+      echo "❌ A logged-in account is required." >&2
+      exit 1
+    }
+    ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE \
+      --format='value(account)' 2>/dev/null | head -1)
+  fi
+  echo "   ✅ Signed in as $ACTIVE_ACCOUNT"
+
+  # Minting a token is the only check that proves the credential is present
+  # *and* still valid. The file existing proves neither, and an expired refresh
+  # token is the usual failure on a workstation that has been idle a week.
+  if ! gcloud auth application-default print-access-token &>/dev/null; then
+    echo "⚠️  Application Default Credentials are missing or expired."
+    echo "   ADC is a separate credential from the login above: Terraform and"
+    echo "   the Python client libraries use ADC, not your gcloud session."
+    offer "Create them now?" gcloud auth application-default login || {
+      echo "❌ Working Application Default Credentials are required." >&2
+      exit 1
+    }
+  fi
+  echo "   ✅ Application Default Credentials are valid"
+
+  # The last step of this script opens a tunnel so a browser can reach the
+  # IAM-only app. It is scripts/run_proxy.py rather than `gcloud run services
+  # proxy`, which cannot authenticate to an IAM-only service; see the comment
+  # at step 7. Its only prerequisites are the script itself and the virtual
+  # environment this script provisions, so all that is worth checking here is
+  # that the script has not gone missing.
+  if [[ "$START_PROXY" == true && ! -f "$REDWOOD_DIR/scripts/run_proxy.py" ]]; then
+    echo "⚠️  scripts/run_proxy.py is missing, so the app cannot be opened locally."
+    echo "   Deploy will still complete; re-run with --no-proxy to silence this."
+  fi
+}
+
+# Checks that need GCP_PROJECT_ID, so these run after .env is sourced.
+preflight_project() {
+  # Without a quota project the client libraries send requests with no billing
+  # project attached, and BigQuery answers with a "user without a project"
+  # error that names nothing useful. gcloud has no read-side command for this,
+  # so the credential file is read directly.
+  local adc_file adc_quota_project
+  adc_file="${GOOGLE_APPLICATION_CREDENTIALS:-$HOME/.config/gcloud/application_default_credentials.json}"
+  adc_quota_project=$(python3 -c "
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get('quota_project_id', ''))
+except Exception:
+    print('')
+" "$adc_file" 2>/dev/null || true)
+
+  if [[ "$adc_quota_project" != "$GCP_PROJECT_ID" ]]; then
+    echo "⚠️  ADC quota project is '${adc_quota_project:-unset}', not '$GCP_PROJECT_ID'."
+    offer "Set it now?" gcloud auth application-default \
+      set-quota-project "$GCP_PROJECT_ID" || true
+  fi
+
+  # The active project, so `gcloud run services proxy` and the identity-token
+  # call at the end do not each need an explicit --project.
+  local configured_project
+  configured_project=$(gcloud config get-value project 2>/dev/null)
+  if [[ "$configured_project" != "$GCP_PROJECT_ID" ]]; then
+    echo "⚠️  gcloud's active project is '${configured_project:-unset}', but .env says '$GCP_PROJECT_ID'."
+    offer "Switch it?" gcloud config set project "$GCP_PROJECT_ID" || true
+  fi
+
+  # Cheaper to fail here than inside a Terraform apply.
+  if ! gcloud projects describe "$GCP_PROJECT_ID" &>/dev/null; then
+    echo "❌ Project '$GCP_PROJECT_ID' is not visible to ${ACTIVE_ACCOUNT:-your account}." >&2
+    echo "   Check GCP_PROJECT_ID in .env, or run ./deploy.sh --create-project." >&2
+    exit 1
+  fi
+  echo "   ✅ Project $GCP_PROJECT_ID is reachable"
+}
+
+# Bind a socket to find a port nothing holds, and poll until something answers
+# on it. Both are needed by the proxy launch at the end, and both are lifted
+# from mobile_client/start_mobile_app.sh rather than reinvented.
+find_free_port() {
+  python3 -c "
+import socket, sys
+port = int(sys.argv[1])
+while port < 65535:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(('127.0.0.1', port))
+        except OSError:
+            port += 1
+            continue
+        print(port)
+        break
+else:
+    sys.exit('no free port from ' + sys.argv[1])
+" "$1"
+}
+
+wait_for_port() {
+  python3 -c "
+import socket, sys, time
+port, deadline = int(sys.argv[1]), float(sys.argv[2])
+end = time.time() + deadline
+while time.time() < end:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if s.connect_ex(('127.0.0.1', port)) == 0:
+            sys.exit(0)
+    time.sleep(0.2)
+sys.exit(1)
+" "$1" "$2"
+}
+
+preflight_sdk
 
 # ------------------------------------------------------------------------------
 # 0. Optional: Project Bootstrap Lifecycle
@@ -242,6 +414,23 @@ export TF_VAR_service_account_id="$PIPELINE_SERVICE_ACCOUNT"
 export TF_VAR_firestore_customers_collection="$FIRESTORE_CUSTOMERS_COLLECTION"
 export TF_VAR_artifact_repository_id="$ARTIFACT_REPOSITORY"
 
+# redwood-app and redwood-churn are IAM-only, so somebody has to be allowed to
+# call them or the deploy finishes with an app nobody can open. The account
+# running this is the obvious candidate, and making it automatic is what stops
+# a first deploy ending in a 403 from the proxy. APP_INVOKER_MEMBERS in .env
+# overrides, for granting a whole team at once.
+if [[ -n "${APP_INVOKER_MEMBERS:-}" ]]; then
+  export TF_VAR_app_invoker_members="$APP_INVOKER_MEMBERS"
+elif [[ -n "${ACTIVE_ACCOUNT:-}" ]]; then
+  # Service accounts and users are different member prefixes, and getting it
+  # wrong is a Terraform error rather than a silent no-op.
+  if [[ "$ACTIVE_ACCOUNT" == *".gserviceaccount.com" ]]; then
+    export TF_VAR_app_invoker_members="[\"serviceAccount:${ACTIVE_ACCOUNT}\"]"
+  else
+    export TF_VAR_app_invoker_members="[\"user:${ACTIVE_ACCOUNT}\"]"
+  fi
+fi
+
 echo "Project ID:          $GCP_PROJECT_ID"
 echo "Region:              $GCP_REGION"
 echo "Firestore Database:  $FIRESTORE_DATABASE_ID (Native Mode, collection: $FIRESTORE_COLLECTION)"
@@ -250,11 +439,10 @@ echo "Replication:         Eventarc -> Cloud Run -> BigQuery Storage Write API"
 echo "Mode:                $([[ "$TEARDOWN_MODE" == true ]] && echo "TEARDOWN" || ([[ "$DRY_RUN" == true ]] && echo "DRY RUN / PLAN" || echo "FULL DEPLOYMENT"))"
 echo "================================================================="
 
-# Check gcloud CLI
-if ! command -v gcloud &>/dev/null; then
-  echo "❌ Error: 'gcloud' CLI is required but not installed." >&2
-  exit 1
-fi
+# The gcloud presence check lives in preflight_sdk above, which has already
+# run. This is the half that needed GCP_PROJECT_ID.
+preflight_project
+
 
 # Check Terraform CLI
 if ! command -v terraform &>/dev/null; then
@@ -288,12 +476,19 @@ export PYTHON_EXEC
 import cloudpickle, dotenv, pydantic, setuptools, vertexai
 import google.auth, google.cloud.firestore, google.cloud.bigquery
 import google.cloud.bigquery_storage
+import fastapi, uvicorn, httpx, pytest
 " 2>/dev/null || {
   echo "📦 Installing required Python dependencies inside virtual environment..."
   # cloudpickle is what Agent Engine uses to serialise the agent object, but
   # the base google-cloud-aiplatform install does not pull it in, so step 5
   # fails on a fresh virtual environment without it. It is what the
   # [agent_engines] extra would add.
+  #
+  # fastapi and uvicorn are the mobile client backend; httpx is what
+  # fastapi.testclient runs on and pytest is what runs the suite. They live
+  # here because this is the only virtual environment the repository
+  # provisions, and splitting the app across two of them is what left one with
+  # a web framework and no test runner and the other with the reverse.
   "$PYTHON_EXEC" -m pip install -q \
     "google-cloud-firestore>=2.20.0" \
     "google-cloud-bigquery>=3.25.0" \
@@ -303,7 +498,11 @@ import google.cloud.bigquery_storage
     "python-dotenv>=1.0.0" \
     "pydantic>=2.0.0" \
     "protobuf>=4.25.0" \
-    "setuptools"
+    "setuptools" \
+    "fastapi>=0.110.0" \
+    "uvicorn>=0.30.0" \
+    "httpx>=0.27.0" \
+    "pytest>=8.0.0"
 }
 
 # ------------------------------------------------------------------------------
@@ -322,6 +521,15 @@ if [[ "$RUN_TESTS" == true ]]; then
       exit 1
     }
   done
+
+  # The mobile client suite covers the login session contract and the order
+  # schema parity, both offline. It is a pytest run rather than a script
+  # because it is the one suite written as test cases.
+  echo -e "\n--- mobile_client ---"
+  PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" -m pytest "$REDWOOD_DIR/mobile_client/tests" -q || {
+    echo "❌ Error: mobile_client tests failed!" >&2
+    exit 1
+  }
 
   echo -e "\n🎉 All test suites passed."
   exit 0
@@ -384,16 +592,50 @@ fi
 # ------------------------------------------------------------------------------
 # 4. TERRAFORM PROVISIONING
 # ------------------------------------------------------------------------------
-echo -e "\n🔨 Step 1/6: Building the service containers..."
+echo -e "\n🔨 Step 1/7: Building the service containers..."
 
-# Terraform cannot create either Cloud Run service until its image exists, so
-# the builds have to come first rather than alongside.
+# Terraform cannot create any of these Cloud Run services until its image
+# exists, so the builds have to come first rather than alongside.
 CDC_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/redwood-cdc:latest"
 BRIDGE_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/redwood-agent-bridge:latest"
+CHURN_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/redwood-churn:latest"
+APP_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/redwood-app:latest"
 
 ensure_repository() {
-  gcloud services enable cloudbuild.googleapis.com artifactregistry.googleapis.com \
+  gcloud services enable \
+    compute.googleapis.com \
+    iam.googleapis.com \
+    cloudresourcemanager.googleapis.com \
+    cloudbuild.googleapis.com \
+    artifactregistry.googleapis.com \
     --project="$GCP_PROJECT_ID" &>/dev/null || true
+
+  # Regional Cloud Build uses the default Compute Engine service account in
+  # newer projects. On a brand-new project where compute.googleapis.com has
+  # just been enabled, that account may still be propagating in IAM and (under
+  # iam.automaticIamGrantsForDefaultServiceAccounts) starts with zero IAM
+  # roles, so pre-create it and grant roles/cloudbuild.builds.builder before
+  # submitting the first build.
+  gcloud beta services identity create --service=compute.googleapis.com \
+    --project="$GCP_PROJECT_ID" &>/dev/null || true
+
+  local project_number compute_sa
+  project_number=$(gcloud projects describe "$GCP_PROJECT_ID" \
+    --format='value(projectNumber)' 2>/dev/null || true)
+  if [[ -n "$project_number" ]]; then
+    compute_sa="${project_number}-compute@developer.gserviceaccount.com"
+    for _ in {1..12}; do
+      if gcloud iam service-accounts describe "$compute_sa" \
+           --project="$GCP_PROJECT_ID" &>/dev/null; then
+        break
+      fi
+      sleep 5
+    done
+    gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+      --member="serviceAccount:${compute_sa}" \
+      --role="roles/cloudbuild.builds.builder" \
+      --condition=None &>/dev/null || true
+  fi
 
   if ! gcloud artifacts repositories describe "$ARTIFACT_REPOSITORY" \
        --location="$GCP_REGION" --project="$GCP_PROJECT_ID" &>/dev/null; then
@@ -403,6 +645,23 @@ ensure_repository() {
       --project="$GCP_PROJECT_ID" \
       --description="Redwood Retail pipeline and agent images"
   fi
+}
+
+submit_build() {
+  # GCS caches IAM policy evaluations for ~60s after a fresh grant on
+  # ${project_number}-compute@developer.gserviceaccount.com, so allow up to 75s
+  # (5 x 15s waits across 6 attempts) before giving up.
+  local max_attempts=6 attempt
+  for ((attempt=1; attempt<=max_attempts; attempt++)); do
+    if gcloud builds submit "$@"; then
+      return 0
+    fi
+    if [[ $attempt -lt $max_attempts ]]; then
+      echo "⚠️  Cloud Build submission failed (attempt $attempt/$max_attempts); waiting 15s for IAM propagation before retrying..."
+      sleep 15
+    fi
+  done
+  return 1
 }
 
 # Resolve the tag to a digest and deploy that instead. Terraform compares the
@@ -424,34 +683,65 @@ pin_digest() {
   fi
 }
 
+# Three of the four images need a file from outside their own directory, so
+# their build context is the repository root and the Dockerfile is named
+# explicitly. Only the CDC service is self-contained.
+#
+# `gcloud builds submit --tag` cannot name a Dockerfile, so this passes an
+# inline build config instead. It goes to a real temporary file rather than
+# /dev/stdin because gcloud resolves --config by path and expects a .yaml.
+build_from_root() {
+  local image="$1" dockerfile="$2" config
+  config="$(mktemp -t redwood-cloudbuild-XXXXXX.yaml)"
+  cat >"$config" <<EOF
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "$image", "-f", "$dockerfile", "."]
+images: ["$image"]
+EOF
+  # Guarded so a failed build still cleans up before set -e takes the script
+  # down; the exit status is preserved for the caller.
+  local status=0
+  submit_build "$REDWOOD_DIR" \
+    --config="$config" --project="$GCP_PROJECT_ID" --region="$GCP_REGION" || status=$?
+  rm -f "$config"
+  return "$status"
+}
+
 if [[ "$SKIP_IMAGE_BUILD" == true ]]; then
   echo "⏭️  Reusing existing images."
 else
   ensure_repository
 
-  # The bridge shares the CDC service's Firestore event decoder, so its build
-  # context is the repository root rather than its own directory.
   echo "   Building the CDC service..."
-  gcloud builds submit "$REDWOOD_DIR/cdc_service" \
+  submit_build "$REDWOOD_DIR/cdc_service" \
     --tag="$CDC_IMAGE" --project="$GCP_PROJECT_ID" --region="$GCP_REGION"
 
+  # The bridge shares the CDC service's Firestore event decoder.
   echo "   Building the agent bridge..."
-  gcloud builds submit "$REDWOOD_DIR" \
-    --config=/dev/stdin --project="$GCP_PROJECT_ID" --region="$GCP_REGION" <<EOF
-steps:
-  - name: gcr.io/cloud-builders/docker
-    args: ["build", "-t", "$BRIDGE_IMAGE", "-f", "agent_bridge/Dockerfile", "."]
-images: ["$BRIDGE_IMAGE"]
-EOF
+  build_from_root "$BRIDGE_IMAGE" "agent_bridge/Dockerfile"
+
+  # The churn function bakes in the one copy of the churn SQL, which lives at
+  # the repository root because Terraform's daily scheduled query renders the
+  # same file.
+  echo "   Building the churn function..."
+  build_from_root "$CHURN_IMAGE" "churn_service/Dockerfile"
+
+  # The app imports firestore_auth, retail_catalog and customer_profiles from
+  # the root, and builds the Vite bundle in its own Node stage.
+  echo "   Building the app (frontend bundle + FastAPI)..."
+  build_from_root "$APP_IMAGE" "mobile_client/Dockerfile"
 
   echo "✅ Containers published."
 fi
 
 pin_digest "$CDC_IMAGE" TF_VAR_cdc_image_digest
 pin_digest "$BRIDGE_IMAGE" TF_VAR_agent_bridge_image_digest
+pin_digest "$CHURN_IMAGE" TF_VAR_churn_image_digest
+pin_digest "$APP_IMAGE" TF_VAR_app_image_digest
 
 
-echo -e "\n🚀 Step 2/6: Provisioning Infrastructure via Terraform..."
+echo -e "\n🚀 Step 2/7: Provisioning Infrastructure via Terraform..."
 
 # Pre-create Google-managed service identities so the IAM bindings below them
 # succeed on a first run. Eventarc in particular refuses to create a Firestore
@@ -465,10 +755,26 @@ for SVC in aiplatform eventarc firestore; do
 done
 
 terraform -chdir="$TERRAFORM_DIR" init
+
+# Step 1 creates the Artifact Registry repository before Terraform runs so the
+# Cloud Run services have images to reference. On a fresh Terraform state,
+# import that repository so `terraform apply` adopts it instead of failing with
+# 409 Already Exists.
+if ! terraform -chdir="$TERRAFORM_DIR" state show 'google_artifact_registry_repository.pipeline_repo[0]' &>/dev/null; then
+  if gcloud artifacts repositories describe "$ARTIFACT_REPOSITORY" \
+       --location="$GCP_REGION" --project="$GCP_PROJECT_ID" &>/dev/null; then
+    terraform -chdir="$TERRAFORM_DIR" import \
+      'google_artifact_registry_repository.pipeline_repo[0]' \
+      "projects/${GCP_PROJECT_ID}/locations/${GCP_REGION}/repositories/${ARTIFACT_REPOSITORY}"
+  fi
+fi
+
 terraform -chdir="$TERRAFORM_DIR" apply -auto-approve
 
 CDC_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw cdc_service_url 2>/dev/null || true)
 BRIDGE_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw agent_bridge_url 2>/dev/null || true)
+CHURN_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw churn_service_url 2>/dev/null || true)
+APP_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw app_service_url 2>/dev/null || true)
 CHURN_SCHEDULE=$(terraform -chdir="$TERRAFORM_DIR" output -raw churn_schedule_name 2>/dev/null || true)
 echo "✅ Terraform infrastructure provisioning completed."
 # Written as `if` rather than `[[ ... ]] && echo`: the latter evaluates to a
@@ -476,17 +782,23 @@ echo "✅ Terraform infrastructure provisioning completed."
 # run immediately after a successful apply. agent_bridge_url is empty whenever
 # the bridge is disabled, so this is reachable, not theoretical.
 if [[ -n "$CDC_URL" ]]; then
-  echo "   CDC service:  $CDC_URL"
+  echo "   CDC service:    $CDC_URL"
 fi
 if [[ -n "$BRIDGE_URL" ]]; then
-  echo "   Agent bridge: $BRIDGE_URL"
+  echo "   Agent bridge:   $BRIDGE_URL"
+fi
+if [[ -n "$CHURN_URL" ]]; then
+  echo "   Churn function: $CHURN_URL"
+fi
+if [[ -n "$APP_URL" ]]; then
+  echo "   Redwood app:    $APP_URL"
 fi
 
 # ------------------------------------------------------------------------------
 # 5. DATA SEEDING (SYNTHETIC TRANSACTIONS)
 # ------------------------------------------------------------------------------
 if [[ "$SKIP_SEED" != true ]]; then
-  echo -e "\n📦 Step 3/6: Seeding customers and order histories into Firestore..."
+  echo -e "\n📦 Step 3/7: Seeding customers and order histories into Firestore..."
   "$PYTHON_EXEC" "$REDWOOD_DIR/generate_retail_dataset.py" \
     --count "$SEED_COUNT" \
     --workers 4 \
@@ -567,12 +879,69 @@ except Exception:
   echo "✅ $ROW_COUNT orders in $BIGQUERY_DATASET.$BIGQUERY_ORDERS_TABLE."
 
 else
-  echo -e "\n⏭️  Step 3/6: Skipping seeding (--skip-seed requested)."
+  echo -e "\n⏭️  Step 3/7: Skipping seeding (--skip-seed requested)."
 fi
 
 # ------------------------------------------------------------------------------
 # 6. BIGQUERY ML MODEL TRAINING & PREDICTION
 # ------------------------------------------------------------------------------
+# Runs in the cloud, in the redwood-churn function Terraform created above.
+# Nothing here renders SQL or talks to BigQuery; it makes one authenticated
+# HTTP call and relays the log.
+run_churn_pipeline() {
+  local mode="${1:-full}" log token
+
+  if [[ -z "${CHURN_URL:-}" ]]; then
+    echo "❌ No churn function URL from Terraform; cannot run the pipeline." >&2
+    return 1
+  fi
+
+  # Cloud Run requires an ID token whose `aud` is the service URL. A user's own
+  # ID token cannot have one: `gcloud auth print-identity-token` returns a token
+  # minted for the gcloud OAuth client, so its audience is that client id and
+  # the service answers 401 with an HTML error page that says nothing useful.
+  #
+  # So mint the token as the pipeline service account instead, which is both the
+  # account that holds run.invoker on the churn service and exactly what the
+  # backend does at runtime (mobile_client/backend/idtoken.py). The Terraform in
+  # mobile_app.tf grants the deploying user serviceAccountTokenCreator on it for
+  # this reason.
+  #
+  # --include-email is required: without it the token carries no email claim and
+  # Cloud Run's IAM check has no principal to authorise.
+  local invoker_sa="${PIPELINE_SERVICE_ACCOUNT}@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+  token=$(gcloud auth print-identity-token \
+    --impersonate-service-account="$invoker_sa" \
+    --audiences="$CHURN_URL" \
+    --include-email 2>/dev/null || true)
+  if [[ -z "$token" ]]; then
+    echo "❌ Could not mint an identity token for $CHURN_URL as $invoker_sa." >&2
+    echo "   Check that ${ACTIVE_ACCOUNT:-your account} holds roles/iam.serviceAccountTokenCreator on it:" >&2
+    echo "     gcloud iam service-accounts get-iam-policy $invoker_sa" >&2
+    return 1
+  fi
+
+  # -N keeps curl unbuffered so the statement-by-statement log appears here as
+  # it does in the console, and tee puts it on screen while capturing it.
+  #
+  # The run's real outcome is the trailing [exit N] line, not curl's exit
+  # status: the response streams, so its 200 was committed before the first
+  # BigQuery statement ran and curl has no way to learn that a later statement
+  # failed.
+  log=$(curl -sS -N -X POST "$CHURN_URL" \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: application/json" \
+    -d "{\"mode\":\"${mode}\",\"report\":true}" | tee /dev/stderr) || {
+    echo "❌ The call to the churn function failed." >&2
+    return 1
+  }
+
+  if ! grep -q '^\[exit 0\]$' <<<"$log"; then
+    echo "❌ The churn pipeline reported a failure. See the log above." >&2
+    return 1
+  fi
+}
+
 if [[ "$SKIP_BQML" != true ]]; then
   if [[ "${ROW_COUNT:-0}" -eq 0 && "$SKIP_SEED" != true ]]; then
     # Training on an empty table fails with "Input data doesn't contain any
@@ -582,15 +951,18 @@ if [[ "$SKIP_BQML" != true ]]; then
     echo "    Check the CDC service and its triggers:"
     echo "      gcloud run services logs read redwood-cdc --region=$GCP_REGION --limit=50"
     echo "      gcloud eventarc triggers list --location=$GCP_REGION"
-    echo "    Then re-run:"
-    echo "      $PYTHON_EXEC $REDWOOD_DIR/run_bigquery_analysis.py --execute --report"
+    echo "    Then re-run the pipeline:"
+    echo "      curl -N -X POST ${CHURN_URL:-<churn function url>} \\"
+    echo "        -H \"Authorization: Bearer \\$(gcloud auth print-identity-token)\" \\"
+    echo "        -H 'Content-Type: application/json' -d '{\"mode\":\"full\"}'"
   else
-    echo -e "\n🧠 Step 4/6: Building feature views and training the churn model..."
-    "$PYTHON_EXEC" "$REDWOOD_DIR/run_bigquery_analysis.py" --execute --report
+    echo -e "\n🧠 Step 4/7: Building feature views and training the churn model..."
+    echo "   Running in redwood-churn; the log below streams from the function."
+    run_churn_pipeline full
     echo "✅ Churn pipeline completed."
   fi
 else
-  echo -e "\n⏭️  Step 4/6: Skipping churn model training (--skip-bqml requested)."
+  echo -e "\n⏭️  Step 4/7: Skipping churn model training (--skip-bqml requested)."
 fi
 
 # ------------------------------------------------------------------------------
@@ -602,19 +974,20 @@ fi
 # request rather than at startup, so deploying the agent last does not leave
 # the bridge holding a dangling reference.
 if [[ "$SKIP_AGENT_DEPLOY" != true ]]; then
-  echo -e "\n🤖 Step 5/6: Deploying the loyalty agent to Agent Engine..."
+  echo -e "\n🤖 Step 5/7: Deploying the loyalty agent to Agent Engine..."
   echo "   This takes several minutes; the runtime builds an image from the agent package."
   PYTHONPATH="$REDWOOD_DIR" "$PYTHON_EXEC" "$REDWOOD_DIR/scripts/deploy_agent_engine.py"
   echo "✅ Loyalty agent deployed."
 else
-  echo -e "\n⏭️  Step 5/6: Skipping agent deployment (--skip-agent-deploy requested)."
+  echo -e "\n⏭️  Step 5/7: Skipping agent deployment (--skip-agent-deploy requested)."
 fi
 
 
 # ------------------------------------------------------------------------------
 # 7. DEPLOYMENT DASHBOARD & HEALTH SUMMARY
 # ------------------------------------------------------------------------------
-echo -e "\n================================================================="
+echo -e "\n📋 Step 6/7: Deployment summary"
+echo "================================================================="
 echo " 🎉 REDWOOD RETAIL DEPLOYMENT COMPLETE & OPERATIONAL!"
 echo "================================================================="
 echo " Target Project:     $GCP_PROJECT_ID"
@@ -624,6 +997,8 @@ echo " BigQuery Table:     $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CDC_TABLE
 echo " BigQuery Model:     $GCP_PROJECT_ID.$BIGQUERY_DATASET.$BIGQUERY_CHURN_MODEL"
 echo " CDC Service:        ${CDC_URL:-not deployed}"
 echo " Agent Bridge:       ${BRIDGE_URL:-not deployed}"
+echo " Churn Function:     ${CHURN_URL:-not deployed} (IAM-only)"
+echo " Redwood App:        ${APP_URL:-not deployed} (IAM-only)"
 echo " Loyalty Agent:      ${AGENT_DISPLAY_NAME:-redwood-loyalty-agent} (Agent Engine, resolved by display name)"
 echo " Daily churn job:    ${CHURN_SCHEDULE:-see BigQuery scheduled queries}"
 echo "-----------------------------------------------------------------"
@@ -634,9 +1009,88 @@ echo " • Agent Engine: https://console.cloud.google.com/vertex-ai/agents/agent
 echo " • BigQuery Studio: https://console.cloud.google.com/bigquery?project=$GCP_PROJECT_ID"
 echo " • Firestore Databases: https://console.cloud.google.com/firestore/databases?project=$GCP_PROJECT_ID"
 echo "-----------------------------------------------------------------"
-echo " To exercise the demo, write a customer_sessions document with"
-echo " customerId set and agentProcessingStatus set to PENDING. cust_demo2"
-echo " is scored CRITICAL and receives an offer; cust_demo1 is LOW and does"
-echo " not."
 echo " To clean up all resources later, run: ./teardown.sh"
 echo "================================================================="
+
+# ------------------------------------------------------------------------------
+# 8. LAUNCH: authenticated tunnel to the Cloud Run app
+# ------------------------------------------------------------------------------
+# redwood-app is IAM-only -- a browser hitting its run.app URL directly gets a
+# 403, because Cloud Run has no interactive sign-in without IAP. Something local
+# has to sign each request, which is what the tunnel does.
+#
+# Not `gcloud run services proxy`: that cannot authenticate to this service.
+# With user credentials it presents an ID token whose audience is the gcloud
+# OAuth client rather than the service URL, and Cloud Run answers 401; with
+# --impersonate-service-account, which would produce the right audience, the
+# proxy binary rejects the credential type outright. scripts/run_proxy.py does
+# the same job using the token path the backend already uses.
+#
+# Nothing of the application runs here: the tunnel forwards, the container in
+# Cloud Run serves. The script blocks on it because at this point the deploy is
+# finished and "the app is running" is the correct terminal state.
+if [[ "$START_PROXY" != true ]]; then
+  echo ""
+  echo " Skipping the tunnel (--no-proxy). To open the app later:"
+  echo "   $PYTHON_EXEC scripts/run_proxy.py --url $APP_URL --port 8080"
+  exit 0
+fi
+
+if [[ -z "${APP_URL:-}" ]]; then
+  echo ""
+  echo "⚠️  No app URL from Terraform, so there is nothing to proxy to." >&2
+  exit 0
+fi
+
+PROXY_PORT="${PROXY_PORT:-$(find_free_port 8080)}"
+
+# Backgrounded first and only announced once it is listening. Printing
+# http://localhost:$PROXY_PORT any earlier is actively harmful here: the IDE
+# scans terminal output for URLs and immediately binds the port for
+# auto-forwarding, stealing it from the proxy that is still starting. This is
+# the same hazard mobile_client/start_mobile_app.sh documents at its uvicorn
+# launch.
+echo ""
+echo "🔌 Step 7/7: Opening an authenticated tunnel to redwood-app..."
+# Exported rather than passed as flags: the tunnel resolves the account to
+# impersonate through the same helper the backend uses, which reads these.
+PIPELINE_SERVICE_ACCOUNT="$PIPELINE_SERVICE_ACCOUNT" \
+GCP_PROJECT_ID="$GCP_PROJECT_ID" \
+  "$PYTHON_EXEC" "$REDWOOD_DIR/scripts/run_proxy.py" \
+    --url "$APP_URL" --port "$PROXY_PORT" &
+PROXY_PID=$!
+
+cleanup_proxy() {
+  trap - SIGINT SIGTERM EXIT
+  kill -TERM "$PROXY_PID" 2>/dev/null || true
+  wait "$PROXY_PID" 2>/dev/null || true
+  echo ""
+  echo "[INFO] Tunnel closed. redwood-app is still running in $GCP_REGION."
+}
+trap cleanup_proxy SIGINT SIGTERM EXIT
+
+if ! wait_for_port "$PROXY_PORT" 30; then
+  echo "❌ The proxy did not bind port $PROXY_PORT." >&2
+  echo "   Check that ${ACTIVE_ACCOUNT:-your account} holds roles/run.invoker on redwood-app:" >&2
+  echo "     gcloud run services get-iam-policy redwood-app --region=$GCP_REGION" >&2
+  exit 1
+fi
+
+echo ""
+echo "================================================================="
+echo " 🌲 REDWOOD RETAIL IS LIVE (served from Cloud Run)"
+echo "================================================================="
+echo " Mobile App:       http://localhost:$PROXY_PORT/"
+echo " Redwood Console:  http://localhost:$PROXY_PORT/console"
+echo " API Docs:         http://localhost:$PROXY_PORT/docs"
+echo "-----------------------------------------------------------------"
+echo " Both are served by redwood-app in $GCP_REGION. This terminal only"
+echo " holds the authenticated tunnel; Ctrl+C closes it and leaves the"
+echo " service running."
+echo ""
+echo " In the demo, sign in as demo2: it is scored CRITICAL and receives"
+echo " an offer. demo1 is LOW and does not."
+echo "================================================================="
+
+wait "$PROXY_PID"
+

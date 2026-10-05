@@ -1,7 +1,4 @@
-"""
-Pydantic data schemas for Redwood Retail Loyalty Offer Agent.
-Aligns strictly with SDD Level 3 JSON Data Contracts.
-"""
+"""Pydantic data schemas for Redwood Retail Loyalty Offer Agent."""
 
 from datetime import datetime
 from typing import Dict, List, Optional, Any
@@ -28,6 +25,12 @@ class CustomerSession(BaseModel):
     offerId: Optional[str] = None
     activeOfferId: Optional[str] = None
     skipReason: Optional[str] = None
+    # Why, in words, and which branch produced them. skipDetail is the judge's
+    # own sentence where a judgement was made, and the gate's where none was;
+    # escalationGate names the branch, including the one that writes no
+    # sentence because the customer never complained.
+    skipDetail: Optional[str] = None
+    escalationGate: Optional[str] = None
     expireAt: Optional[str] = None
 
 
@@ -44,41 +47,45 @@ class CustomerProfile(BaseModel):
     sentimentScore: float = 0.5
 
 
-class ChurnAssessment(BaseModel):
-    customerId: str
-    churnProbability: float
-    churnRiskTier: str  # LOW, MODERATE, HIGH, CRITICAL
-    evaluationSource: str  # BQML_PREDICT, HEURISTIC_FALLBACK
-    evaluatedAt: str
-
-
 class LoyaltyOffer(BaseModel):
     offerId: str
     customerId: str
     sessionId: str
+
+    # What BigQuery said. Never adjusted by the agent: an earlier version
+    # added 0.25 for a complaint and saturated this to 1.0, which is a
+    # certainty no model asserted.
     churnProbability: float
-    churnScore: Optional[float] = None
     churnRiskTier: str
-    churnTier: Optional[str] = None
+
+    # What the agent acted on. Equal to churnRiskTier unless friction the
+    # model had not seen was escalated, in which case the pair shows exactly
+    # which part of the decision was the model's and which was the agent's.
+    eligibilityTier: Optional[str] = None
+    escalated: bool = False
+    escalationReason: Optional[str] = None
+    escalationTrigger: Optional[Dict[str, Any]] = None
+
     title: str
-    headline: Optional[str] = None
     description: str
-    messageBody: Optional[str] = None
     promoCode: str
-    voucherCode: Optional[str] = None
     discountPercent: int
-    discountPercentage: Optional[int] = None
     freeExpressShipping: bool = False
     perks: List[str] = Field(default_factory=list)
     personalizedApology: Optional[str] = None
-    generationSource: str = "GEMINI_AI"  # GEMINI_AI, DETERMINISTIC_RULES
-    baselineChurnRisk: Optional[float] = None
-    evaluationSource: Optional[str] = None
+
+    # Follow-up bookkeeping. 1 is the first offer a customer receives in a
+    # cooldown window; 2 is the one issued after they redeemed it.
+    offerSequence: int = 1
+    supersedesOfferId: Optional[str] = None
+    discountCeilingApplied: Optional[int] = None
+
     status: str = "ACTIVE"  # ACTIVE, REDEEMED, EXPIRED
     createdAt: str
     validUntil: str
-    expiresAt: Optional[str] = None
     cooldownUntil: str
     claimedAt: Optional[str] = None
-    ttlExpiryAt: str
+    # Stored as datetime for Firestore TTL policy expiration.
+    ttlExpiryAt: datetime
     metadata: Dict[str, Any] = Field(default_factory=dict)
+

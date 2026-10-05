@@ -7,11 +7,12 @@ import {
   Truck,
   Star,
   AlertTriangle,
-  FileCode,
-  ArrowRight
+  ArrowRight,
+  Gift
 } from "lucide-react";
 import {
   CartItem,
+  LoyaltyOffer,
   PrincipalProfile,
   ShippingCity,
   OrderDocument
@@ -21,12 +22,13 @@ interface CartTabProps {
   cart: CartItem[];
   activePrincipalId: string;
   principal: PrincipalProfile;
+  /** The agent's offer, if this customer has one that is still unspent. */
+  offer: LoyaltyOffer | null;
   cities: ShippingCity[];
   complaintReasons: string[];
   onUpdateQuantity: (sku: string, qty: number) => void;
   onRemoveItem: (sku: string) => void;
   onClearCart: () => void;
-  onInspectJSON: () => void;
   onSubmitOrder: (orderPayload: any) => Promise<OrderDocument | null>;
   onOrderSuccess: (order: OrderDocument) => void;
 }
@@ -35,12 +37,12 @@ export const CartTab: React.FC<CartTabProps> = ({
   cart,
   activePrincipalId,
   principal,
+  offer,
   cities,
   complaintReasons,
   onUpdateQuantity,
   onRemoveItem,
   onClearCart,
-  onInspectJSON,
   onSubmitOrder,
   onOrderSuccess,
 }) => {
@@ -59,12 +61,16 @@ export const CartTab: React.FC<CartTabProps> = ({
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  // Financial calculations
+  // Financial calculations. This mirrors order_engine so the ledger below
+  // matches the document the backend will write, and like the backend it takes
+  // the discount from the agent's offer and nowhere else: there is no tier
+  // rate, and free shipping is a perk on the offer rather than a rule about
+  // who is spending how much.
   const subtotal = cart.reduce((acc, item) => acc + item.unitPrice * item.quantity, 0);
-  const discountRate = principal?.discountRate ?? 0.0;
-  const discountTotal = Math.round(subtotal * discountRate * 100) / 100;
+  const discountPercent = offer?.discountPercent ?? 0;
+  const discountTotal = Math.round(subtotal * (discountPercent / 100) * 100) / 100;
   const taxAmount = Math.round(subtotal * 0.21 * 100) / 100;
-  const shippingFee = activePrincipalId === "demo1" && subtotal > 1000 ? 0.0 : 45.0;
+  const shippingFee = offer?.freeExpressShipping ? 0.0 : 45.0;
   const grandTotal = Math.round((subtotal - discountTotal + taxAmount + shippingFee) * 100) / 100;
 
   // Sentiment Preview
@@ -107,7 +113,10 @@ export const CartTab: React.FC<CartTabProps> = ({
       serviceLevel,
       feedbackRating,
       feedbackText: feedbackText.trim() || undefined,
-      complaintReason: feedbackRating <= 2 ? complaintReason : undefined
+      complaintReason: feedbackRating <= 2 ? complaintReason : undefined,
+      // The id only. The backend loads the offer and takes the percentage off
+      // the document, so nothing the browser says about the price is believed.
+      offerId: offer?.offerId
     };
 
     try {
@@ -140,19 +149,32 @@ export const CartTab: React.FC<CartTabProps> = ({
 
   return (
     <div className="flex-1 flex flex-col overflow-y-auto px-4 py-3 space-y-3 pb-28">
-      {/* Active User Tier Benefit Card */}
+      {/* Agent offer card. The discount shown here is whatever the loyalty
+          agent decided for this customer; with no offer the cart is list price. */}
       <div className="bg-gradient-to-r from-slateDark-850 via-slateDark-800 to-slateDark-850 border border-slate-700/60 rounded-2xl p-3 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-lg bg-brand-500/20 border border-brand-500/40 flex items-center justify-center text-brand-400 font-bold text-xs font-mono">
-            {Math.round(discountRate * 100)}%
-          </div>
+          {offer ? (
+            <div className="w-8 h-8 rounded-lg bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400 font-bold text-xs font-mono">
+              {offer.discountPercent}%
+            </div>
+          ) : (
+            <div className="w-8 h-8 rounded-lg bg-slate-700/40 border border-slate-600/50 flex items-center justify-center text-slate-400">
+              <Gift className="w-4 h-4" />
+            </div>
+          )}
           <div>
             <p className="text-xs font-bold text-slate-200">
               {principal?.displayName} ({activePrincipalId})
             </p>
-            <p className="text-[10px] text-amber-400/90 font-mono">
-              Tier: {principal?.loyaltyTier} • {Math.round(discountRate * 100)}% Auto Discount
-            </p>
+            {offer ? (
+              <p className="text-[10px] text-emerald-400/90 font-mono">
+                Retention offer • {offer.promoCode}
+              </p>
+            ) : (
+              <p className="text-[10px] text-slate-500 font-mono">
+                No active offer • list price
+              </p>
+            )}
           </div>
         </div>
         <button
@@ -281,7 +303,7 @@ export const CartTab: React.FC<CartTabProps> = ({
         <div className="flex items-center justify-between">
           <h4 className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
             <Star className="w-3.5 h-3.5 text-amber-400 fill-amber-400" />
-            <span>Customer Rating & Sentiment</span>
+            <span>Customer Rating</span>
           </h4>
           <span
             className={`text-[10px] font-mono px-2 py-0.5 rounded-full border ${
@@ -360,7 +382,10 @@ export const CartTab: React.FC<CartTabProps> = ({
         </div>
         {discountTotal > 0 && (
           <div className="flex justify-between text-emerald-400">
-            <span>Loyalty Tier Discount ({Math.round(discountRate * 100)}%)</span>
+            <span>
+              Agent retention offer ({discountPercent}%)
+              {offer?.promoCode ? ` · ${offer.promoCode}` : ""}
+            </span>
             <span>-€{discountTotal.toFixed(2)}</span>
           </div>
         )}
@@ -400,18 +425,10 @@ export const CartTab: React.FC<CartTabProps> = ({
             </div>
           ) : (
             <>
-              <span>Place Order as {activePrincipalId}</span>
+              <span>Place Order</span>
               <ArrowRight className="w-4 h-4" />
             </>
           )}
-        </button>
-
-        <button
-          onClick={onInspectJSON}
-          className="w-full py-2 px-3 rounded-xl bg-slateDark-850 hover:bg-slate-800 text-slate-400 hover:text-slate-200 text-xs font-mono border border-slate-800 flex items-center justify-center gap-1.5 transition-colors"
-        >
-          <FileCode className="w-3.5 h-3.5 text-brand-400" />
-          <span>Inspect Generated JSON Schema</span>
         </button>
       </div>
     </div>

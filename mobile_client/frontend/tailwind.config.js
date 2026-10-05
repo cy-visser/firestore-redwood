@@ -2,6 +2,9 @@
 export default {
   content: [
     "./index.html",
+    // The console is a second entry point with its own body classes. Without
+    // it here, they are silently never generated.
+    "./console.html",
     "./src/**/*.{js,ts,jsx,tsx}",
   ],
   darkMode: "class",

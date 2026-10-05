@@ -1,28 +1,5 @@
 #!/usr/bin/env python3
-"""
-Verify the Redwood Retail demo flow against a deployed environment.
-
-Writes a customer_sessions document exactly the way the mobile client will,
-then waits for the agent to move it out of PENDING. Nothing here calls the
-bridge or the agent directly, which is the point: a pass means the Eventarc
-trigger, the bridge, the Agent Engine deployment, the BigQuery churn lookup
-and the Firestore write all worked unaided. Reaching into any of them would
-turn a failure of the wiring into a passing test.
-
-This replaces scripts/test_agent_runtime.py, which probed the A2A agent card
-on a multi-agent runtime that no longer exists.
-
-The two demo customers exercise opposite branches, so running both checks the
-agent is deciding rather than always issuing:
-
-    cust_demo2  scored CRITICAL  -> an offer is written
-    cust_demo1  scored LOW       -> skipped with LOW_CHURN_RISK
-
-Usage:
-    python scripts/verify_demo_flow.py
-    python scripts/verify_demo_flow.py --customer cust_demo2
-    python scripts/verify_demo_flow.py --keep
-"""
+"""Verify the Redwood Retail demo flow against a deployed environment."""
 
 from __future__ import annotations
 
@@ -44,30 +21,19 @@ from google.cloud.firestore_v1.base_query import FieldFilter  # noqa: E402
 SESSIONS_COLLECTION = "customer_sessions"
 OFFERS_COLLECTION = "loyalty_offers"
 
-# Expectation per customer: whether the agent should end up issuing an offer.
-# Derived from the seeded order histories, which deliberately put demo1 in a
-# healthy pattern and demo2 in a lapsed one.
+# Expected offer outcome per customer based on seeded order histories.
 EXPECTATIONS = {
     "cust_demo2": True,
     "cust_demo1": False,
 }
 
-
-# Statuses the agent passes through rather than finishes on. PENDING is the
-# state the session is written in; PROCESSING means the agent has claimed it
-# and is still working. Neither is a result to report.
 NON_TERMINAL_STATUSES = {None, "", "PENDING", "PROCESSING"}
 
 
 def wait_for_agent(
     fs: firestore.Client, session_id: str, timeout: int
 ) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Poll the session until the agent leaves a terminal status on it.
-
-    On timeout the last document seen is still returned, because whether the
-    session was ever claimed is what distinguishes a delivery failure from an
-    agent failure.
-    """
+    """Poll the session until the agent records a terminal status."""
     deadline = time.time() + timeout
     data: Dict[str, Any] = {}
     while time.time() < deadline:
@@ -99,18 +65,11 @@ def run_case(
     fs.collection(SESSIONS_COLLECTION).document(session_id).set({
         "sessionId": session_id,
         "customerId": customer_id,
-        # The bridge only forwards sessions still marked PENDING. Without this
-        # the event is delivered and deliberately ignored.
         "agentProcessingStatus": "PENDING",
         "status": "PENDING",
-        # loginTimestamp is the field the composite indexes order on. loginAt
-        # is carried too because the mobile client writes it and queries in
-        # the console filter on it.
         "loginTimestamp": now,
         "loginAt": now,
         "createdAt": now,
-        # The collection's TTL policy purges on expireAt. A --keep run would
-        # otherwise leave verification sessions in the database forever.
         "expireAt": now + timedelta(days=1),
         "channel": "VERIFICATION",
     })
