@@ -493,6 +493,10 @@ echo "================================================================="
 # run. This is the half that needed GCP_PROJECT_ID.
 preflight_project
 
+# Every interactive gcloud prompt belongs in preflight above. Disabling prompts
+# from here on stops subsequent gcloud calls from hanging on stdin.
+export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+
 
 # Check Terraform CLI
 if ! command -v terraform &>/dev/null; then
@@ -671,50 +675,14 @@ BRIDGE_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITO
 CHURN_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/redwood-churn:latest"
 APP_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/redwood-app:latest"
 
-ensure_repository() {
-  gcloud services enable \
-    compute.googleapis.com \
-    iam.googleapis.com \
-    cloudresourcemanager.googleapis.com \
-    cloudbuild.googleapis.com \
-    artifactregistry.googleapis.com \
-    --project="$GCP_PROJECT_ID" &>/dev/null || true
-
-  # Regional Cloud Build uses the default Compute Engine service account in
-  # newer projects. On a brand-new project where compute.googleapis.com has
-  # just been enabled, that account may still be propagating in IAM and (under
-  # iam.automaticIamGrantsForDefaultServiceAccounts) starts with zero IAM
-  # roles, so pre-create it and grant roles/cloudbuild.builds.builder before
-  # submitting the first build.
-  gcloud beta services identity create --service=compute.googleapis.com \
-    --project="$GCP_PROJECT_ID" &>/dev/null || true
-
-  local project_number compute_sa
-  project_number=$(gcloud projects describe "$GCP_PROJECT_ID" \
-    --format='value(projectNumber)' 2>/dev/null || true)
-  if [[ -n "$project_number" ]]; then
-    compute_sa="${project_number}-compute@developer.gserviceaccount.com"
-    for _ in {1..12}; do
-      if gcloud iam service-accounts describe "$compute_sa" \
-           --project="$GCP_PROJECT_ID" &>/dev/null; then
-        break
-      fi
-      sleep 5
-    done
-    gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
-      --member="serviceAccount:${compute_sa}" \
-      --role="roles/cloudbuild.builds.builder" \
-      --condition=None &>/dev/null || true
-  fi
-
-  if ! gcloud artifacts repositories describe "$ARTIFACT_REPOSITORY" \
-       --location="$GCP_REGION" --project="$GCP_PROJECT_ID" &>/dev/null; then
-    echo "Creating Artifact Registry repository '$ARTIFACT_REPOSITORY'..."
-    gcloud artifacts repositories create "$ARTIFACT_REPOSITORY" \
-      --repository-format=docker --location="$GCP_REGION" \
-      --project="$GCP_PROJECT_ID" \
-      --description="Redwood Retail pipeline and agent images"
-  fi
+ensure_build_prerequisites() {
+  echo "   Provisioning APIs, Cloud Build permissions, and Artifact Registry via Terraform..."
+  terraform -chdir="$TERRAFORM_DIR" init
+  terraform -chdir="$TERRAFORM_DIR" apply -auto-approve \
+    -target=google_project_service.services \
+    -target=google_project_service_identity.compute_sa \
+    -target=google_project_iam_member.compute_sa_cloudbuild_builder \
+    -target=google_artifact_registry_repository.pipeline_repo
 }
 
 submit_build() {
@@ -781,7 +749,7 @@ EOF
 if [[ "$SKIP_IMAGE_BUILD" == true ]]; then
   echo "⏭️  Reusing existing images."
 else
-  ensure_repository
+  ensure_build_prerequisites
 
   echo "   Building the CDC service..."
   submit_build "$REDWOOD_DIR/cdc_service" \
@@ -813,32 +781,7 @@ pin_digest "$APP_IMAGE" TF_VAR_app_image_digest
 
 echo -e "\n🚀 Step 2/7: Provisioning Infrastructure via Terraform..."
 
-# Pre-create Google-managed service identities so the IAM bindings below them
-# succeed on a first run. Eventarc in particular refuses to create a Firestore
-# trigger until both its own and Firestore's service agent exist, and the
-# resulting error names neither of them.
-gcloud services enable aiplatform.googleapis.com eventarc.googleapis.com \
-  firestore.googleapis.com --project="$GCP_PROJECT_ID" &>/dev/null || true
-for SVC in aiplatform eventarc firestore; do
-  gcloud beta services identity create --service="${SVC}.googleapis.com" \
-    --project="$GCP_PROJECT_ID" &>/dev/null || true
-done
-
 terraform -chdir="$TERRAFORM_DIR" init
-
-# Step 1 creates the Artifact Registry repository before Terraform runs so the
-# Cloud Run services have images to reference. On a fresh Terraform state,
-# import that repository so `terraform apply` adopts it instead of failing with
-# 409 Already Exists.
-if ! terraform -chdir="$TERRAFORM_DIR" state show 'google_artifact_registry_repository.pipeline_repo[0]' &>/dev/null; then
-  if gcloud artifacts repositories describe "$ARTIFACT_REPOSITORY" \
-       --location="$GCP_REGION" --project="$GCP_PROJECT_ID" &>/dev/null; then
-    terraform -chdir="$TERRAFORM_DIR" import \
-      'google_artifact_registry_repository.pipeline_repo[0]' \
-      "projects/${GCP_PROJECT_ID}/locations/${GCP_REGION}/repositories/${ARTIFACT_REPOSITORY}"
-  fi
-fi
-
 terraform -chdir="$TERRAFORM_DIR" apply -auto-approve
 
 CDC_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw cdc_service_url 2>/dev/null || true)

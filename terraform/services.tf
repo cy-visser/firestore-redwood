@@ -46,4 +46,14 @@ resource "google_project_service_identity" "aiplatform_sa" {
   ]
 }
 
+resource "google_project_service_identity" "compute_sa" {
+  provider = google-beta
+  project  = var.project_id
+  service  = "compute.googleapis.com"
+
+  depends_on = [
+    google_project_service.services["compute.googleapis.com"]
+  ]
+}
+
 

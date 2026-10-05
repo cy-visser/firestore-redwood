@@ -117,9 +117,16 @@ resource "google_service_account_iam_member" "re_dedicated_agent_engine_sa_user"
   ]
 }
 
-# Note: roles/cloudbuild.builds.builder on the default Compute Engine service
-# account (${project_number}-compute@developer.gserviceaccount.com) is granted
-# by deploy.sh in Step 1 (before Terraform runs) and intentionally omitted here
-# so `teardown.sh` (`terraform destroy`) does not revoke it and trigger a ~60s
-# GCS IAM negative-cache 403 window on the next `./deploy.sh`.
+# Regional Cloud Build uses the default Compute Engine service account in newer
+# projects, which starts with zero IAM roles when automatic IAM grants for
+# default service accounts are disabled.
+resource "google_project_iam_member" "compute_sa_cloudbuild_builder" {
+  project = var.project_id
+  role    = "roles/cloudbuild.builds.builder"
+  member  = "serviceAccount:${data.google_project.project.number}-compute@developer.gserviceaccount.com"
+
+  depends_on = [
+    google_project_service_identity.compute_sa
+  ]
+}
 
