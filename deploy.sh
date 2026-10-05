@@ -222,6 +222,25 @@ preflight_sdk() {
 
 # Checks that need GCP_PROJECT_ID, so these run after .env is sourced.
 preflight_project() {
+  # The untouched template value is the most common first-run mistake, and it
+  # deserves a better message than "not visible".
+  if [[ "$GCP_PROJECT_ID" == "your-gcp-project-id" ]]; then
+    echo "❌ GCP_PROJECT_ID in .env is still the template placeholder." >&2
+    echo "   Set it to an existing project you can deploy into, or run" >&2
+    echo "   ./deploy.sh --create-project to create one (see README, section 0)." >&2
+    exit 1
+  fi
+
+  # Checked first, before anything below offers to repoint ADC or gcloud's
+  # active project: accepting those for a project that does not exist leaves
+  # the workstation's global config pointing at nothing. Also cheaper to fail
+  # here than inside a Terraform apply.
+  if ! gcloud projects describe "$GCP_PROJECT_ID" &>/dev/null; then
+    echo "❌ Project '$GCP_PROJECT_ID' is not visible to ${ACTIVE_ACCOUNT:-your account}." >&2
+    echo "   Check GCP_PROJECT_ID in .env, or run ./deploy.sh --create-project." >&2
+    exit 1
+  fi
+
   # Without a quota project the client libraries send requests with no billing
   # project attached, and BigQuery answers with a "user without a project"
   # error that names nothing useful. gcloud has no read-side command for this,
@@ -251,13 +270,42 @@ except Exception:
     offer "Switch it?" gcloud config set project "$GCP_PROJECT_ID" || true
   fi
 
-  # Cheaper to fail here than inside a Terraform apply.
-  if ! gcloud projects describe "$GCP_PROJECT_ID" &>/dev/null; then
-    echo "❌ Project '$GCP_PROJECT_ID' is not visible to ${ACTIVE_ACCOUNT:-your account}." >&2
-    echo "   Check GCP_PROJECT_ID in .env, or run ./deploy.sh --create-project." >&2
+  echo "   ✅ Project $GCP_PROJECT_ID is reachable"
+}
+
+# Terraform state is local (terraform/terraform.tfstate) with no backend or
+# workspaces, and every resource in it records the project it lives in. Pointing
+# .env at a different project while that state is present makes Terraform plan
+# to destroy the whole demo in the old project and recreate it in the new one --
+# and the main apply runs with -auto-approve. Refuse instead.
+guard_state_project() {
+  local state_file="$TERRAFORM_DIR/terraform.tfstate" state_project
+  [[ -f "$state_file" ]] || return 0
+  state_project=$(python3 -c "
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+out = s.get('outputs', {}).get('project_id', {}).get('value')
+if out:
+    print(out); sys.exit(0)
+for r in s.get('resources', []):
+    for i in r.get('instances', []):
+        p = (i.get('attributes') or {}).get('project')
+        if p:
+            print(p); sys.exit(0)
+" "$state_file" 2>/dev/null || true)
+
+  if [[ -n "$state_project" && "$state_project" != "$GCP_PROJECT_ID" ]]; then
+    echo "❌ terraform/terraform.tfstate belongs to project '$state_project', but .env says '$GCP_PROJECT_ID'." >&2
+    echo "   Continuing would destroy the Redwood deployment in '$state_project'. Either:" >&2
+    echo "     - tear the old one down first: set GCP_PROJECT_ID=$state_project, run ./deploy.sh --teardown, then switch, or" >&2
+    echo "     - keep it and start fresh state for the new project:" >&2
+    echo "         mv terraform/terraform.tfstate terraform/terraform.tfstate.$state_project" >&2
+    echo "         mv terraform/terraform.tfstate.backup terraform/terraform.tfstate.backup.$state_project" >&2
     exit 1
   fi
-  echo "   ✅ Project $GCP_PROJECT_ID is reachable"
 }
 
 # Bind a socket to find a port nothing holds, and poll until something answers
@@ -349,7 +397,9 @@ fi
 # 1. Environment & Prerequisites Verification
 # ------------------------------------------------------------------------------
 if [[ ! -f "$REDWOOD_DIR/.env" ]]; then
-  echo "❌ Error: .env file not found in $REDWOOD_DIR. Please create and configure .env." >&2
+  echo "❌ Error: .env file not found in $REDWOOD_DIR." >&2
+  echo "   Existing project:  cp .env.example .env, then set GCP_PROJECT_ID (and GCP_REGION)." >&2
+  echo "   No project yet:    ./deploy.sh --create-project creates one and writes .env for you." >&2
   exit 1
 fi
 
@@ -545,6 +595,9 @@ if [[ "$VERIFY_DEMO" == true ]]; then
   }
   exit 0
 fi
+
+# Everything from here on runs Terraform against the root state.
+guard_state_project
 
 # ------------------------------------------------------------------------------
 # 2. TEARDOWN LIFECYCLE

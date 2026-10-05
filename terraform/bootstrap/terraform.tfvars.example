@@ -20,8 +20,10 @@ project_name = "Redwood Retail CDC"
 # Primary single deployment region
 region = "europe-west4"
 
-# Optional: Grant roles/owner to this account upon creation (e.g. admin@ganeshraja.altostrat.com)
-primary_owner_user_email = "admin@ganeshraja.altostrat.com"
+# Optional: Grant roles/owner to an additional account upon creation. The account
+# running the bootstrap normally becomes Owner already, so leave this unset unless
+# you are creating the project on someone else's behalf.
+# primary_owner_user_email = "you@example.com"
 
 # Deletion policy: PREVENT or DELETE
 deletion_policy = "DELETE"

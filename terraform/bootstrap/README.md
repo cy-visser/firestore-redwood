@@ -46,12 +46,12 @@ Copy the example variables file:
 ```bash
 cp terraform.tfvars.example terraform.tfvars
 ```
-Edit `terraform.tfvars` with your billing account ID, organization/folder ID, and owner email:
+Edit `terraform.tfvars` with your billing account ID and, optionally, an organization/folder ID:
 ```hcl
 billing_account_id       = "012345-6789AB-CDEF01"
 project_prefix           = "redwood-retail"
-primary_owner_user_email = "admin@ganeshraja.altostrat.com"
 region                   = "europe-west4"
+# primary_owner_user_email = "you@example.com"   # only to grant Owner to an additional account
 ```
 
 ### 2. Initialize and Apply
