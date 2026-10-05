@@ -301,7 +301,7 @@ resource "google_eventarc_trigger" "firestore_write" {
     google_project_iam_member.eventarc_service_agent,
     google_project_iam_member.sa_eventarc_receiver,
     google_cloud_run_v2_service_iam_member.cdc_invoker,
-    terraform_data.firestore_database,
+    google_firestore_database.database,
   ]
 }
 

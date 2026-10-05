@@ -16,6 +16,9 @@
 # failed there with the far less informative "tsc: not found".
 FROM node:24-slim AS frontend
 
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NPM_CONFIG_LOGLEVEL=error
+
 WORKDIR /build
 
 # Lockfile first so npm ci is cached across source-only changes.
@@ -44,7 +47,9 @@ FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 

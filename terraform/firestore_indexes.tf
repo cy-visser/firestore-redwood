@@ -25,7 +25,7 @@ resource "google_firestore_index" "loyalty_offers_active_by_customer" {
   }
 
   depends_on = [
-    terraform_data.firestore_database
+    google_firestore_database.database
   ]
 }
 
@@ -47,7 +47,7 @@ resource "google_firestore_index" "customer_sessions_pending_queue" {
   }
 
   depends_on = [
-    terraform_data.firestore_database
+    google_firestore_database.database
   ]
 }
 
@@ -69,7 +69,7 @@ resource "google_firestore_index" "customer_sessions_by_customer" {
   }
 
   depends_on = [
-    terraform_data.firestore_database
+    google_firestore_database.database
   ]
 }
 
@@ -97,7 +97,7 @@ resource "google_firestore_index" "loyalty_offers_recent_by_customer" {
   }
 
   depends_on = [
-    terraform_data.firestore_database
+    google_firestore_database.database
   ]
 }
 
@@ -126,7 +126,7 @@ resource "google_firestore_index" "orders_by_customer" {
   }
 
   depends_on = [
-    terraform_data.firestore_database
+    google_firestore_database.database
   ]
 }
 
@@ -140,7 +140,7 @@ resource "google_firestore_field" "customer_sessions_ttl" {
   ttl_config {}
 
   depends_on = [
-    terraform_data.firestore_database
+    google_firestore_database.database
   ]
 }
 
@@ -154,7 +154,7 @@ resource "google_firestore_field" "loyalty_offers_ttl" {
   ttl_config {}
 
   depends_on = [
-    terraform_data.firestore_database
+    google_firestore_database.database
   ]
 }
 
@@ -177,7 +177,7 @@ resource "google_firestore_field" "pipeline_traces_ttl" {
   ttl_config {}
 
   depends_on = [
-    terraform_data.firestore_database
+    google_firestore_database.database
   ]
 }
 

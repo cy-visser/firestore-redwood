@@ -176,7 +176,7 @@ resource "google_cloud_run_v2_service" "app" {
     google_project_service.services["run.googleapis.com"],
     google_project_iam_member.sa_firestore_owner,
     google_project_iam_member.sa_bigquery_job_user,
-    terraform_data.firestore_database,
+    google_firestore_database.database,
   ]
 }
 

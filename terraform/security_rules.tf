@@ -32,6 +32,6 @@ resource "google_firebaserules_release" "firestore" {
 
   depends_on = [
     google_firebaserules_ruleset.firestore,
-    terraform_data.firestore_database
+    google_firestore_database.database
   ]
 }

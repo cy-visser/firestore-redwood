@@ -171,6 +171,10 @@ offer() {
 preflight_sdk() {
   echo -e "\n🔑 Step 0/7: Checking the Cloud SDK and your credentials..."
 
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    echo "⚠️  Running under sudo ($SUDO_USER -> root); run ./deploy.sh without sudo so .venv and .terraform are owned by your user." >&2
+  fi
+
   if ! command -v gcloud &>/dev/null; then
     echo "❌ The gcloud CLI is not installed, or is not on PATH." >&2
     echo "   Install it:        https://cloud.google.com/sdk/docs/install" >&2
@@ -543,6 +547,8 @@ import fastapi, uvicorn, httpx, pytest
   # here because this is the only virtual environment the repository
   # provisions, and splitting the app across two of them is what left one with
   # a web framework and no test runner and the other with the reverse.
+  export PIP_ROOT_USER_ACTION=ignore
+  export PIP_DISABLE_PIP_VERSION_CHECK=1
   REDWOOD_PIP_PACKAGES=(
     "google-cloud-firestore>=2.20.0"
     "google-cloud-bigquery>=3.25.0"
@@ -782,6 +788,20 @@ pin_digest "$APP_IMAGE" TF_VAR_app_image_digest
 echo -e "\n🚀 Step 2/7: Provisioning Infrastructure via Terraform..."
 
 terraform -chdir="$TERRAFORM_DIR" init
+
+# Migrate existing states off the legacy terraform_data local-exec wrapper
+# without triggering its destroy-time provisioner, and adopt the database into
+# the native google_firestore_database resource if it already exists in GCP.
+terraform -chdir="$TERRAFORM_DIR" state rm terraform_data.firestore_database &>/dev/null || true
+if ! terraform -chdir="$TERRAFORM_DIR" state show google_firestore_database.database &>/dev/null; then
+  if gcloud firestore databases describe --database="$FIRESTORE_DATABASE_ID" \
+       --project="$GCP_PROJECT_ID" &>/dev/null; then
+    terraform -chdir="$TERRAFORM_DIR" import \
+      google_firestore_database.database \
+      "projects/${GCP_PROJECT_ID}/databases/${FIRESTORE_DATABASE_ID}"
+  fi
+fi
+
 terraform -chdir="$TERRAFORM_DIR" apply -auto-approve
 
 CDC_URL=$(terraform -chdir="$TERRAFORM_DIR" output -raw cdc_service_url 2>/dev/null || true)
