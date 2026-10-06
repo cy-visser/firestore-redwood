@@ -200,6 +200,17 @@ class DemoPersona:
     city: str
     country_code: str
     baseline_orders: int
+    account_age_days: int
+    days_since_last_purchase: int
+    login_frequency_monthly: int
+    avg_session_duration_minutes: float
+    app_engagement_score: float
+    cart_abandonment_count: int
+    abandoned_cart_value_90d: float
+    support_tickets_count: int
+    open_support_tickets_count: int
+    complaints_count: int
+    return_rate_percent: float
     # Satisfaction and grievance, pinned for the same reason the label is: the
     # demo asserts that demo1 draws no escalation and demo2 does, and a sampled
     # friction event would make that true only on some runs.
@@ -222,6 +233,17 @@ DEMO_PERSONAS: List[DemoPersona] = [
         city="Amsterdam",
         country_code="NL",
         baseline_orders=14,
+        account_age_days=720,
+        days_since_last_purchase=21,
+        login_frequency_monthly=24,
+        avg_session_duration_minutes=14.5,
+        app_engagement_score=0.92,
+        cart_abandonment_count=1,
+        abandoned_cart_value_90d=420.0,
+        support_tickets_count=1,
+        open_support_tickets_count=0,
+        complaints_count=0,
+        return_rate_percent=1.5,
         feedback_rating=5,
         sentiment_score=0.92,
         has_active_complaint=False,
@@ -239,6 +261,17 @@ DEMO_PERSONAS: List[DemoPersona] = [
         city="Munich",
         country_code="DE",
         baseline_orders=7,
+        account_age_days=480,
+        days_since_last_purchase=95,
+        login_frequency_monthly=9,
+        avg_session_duration_minutes=7.5,
+        app_engagement_score=0.52,
+        cart_abandonment_count=3,
+        abandoned_cart_value_90d=840.0,
+        support_tickets_count=4,
+        open_support_tickets_count=1,
+        complaints_count=1,
+        return_rate_percent=12.0,
         feedback_rating=1,
         sentiment_score=-0.72,
         has_active_complaint=True,
@@ -246,7 +279,7 @@ DEMO_PERSONAS: List[DemoPersona] = [
         # them as two separate signals: the standing complaint on the account is
         # the repeated late delivery, the thing that happened last is the refund
         # it led to. Either one alone would fire the acute path; together they
-        # match the five support tickets this persona already carries.
+        # match the support tickets this persona already carries.
         primary_complaint_reason="LATE_DELIVERY",
         recent_friction_event="REFUND_REQUESTED",
     ),
@@ -336,8 +369,8 @@ def build_customer(
 ) -> Customer:
     """Construct a single customer profile.
 
-    When ``persona`` is supplied the archetype, identity and label-window
-    outcome are pinned rather than sampled.
+    When ``persona`` is supplied the archetype, identity, engagement/support
+    metrics and label-window outcome are pinned rather than sampled.
     """
     if persona is not None:
         archetype = ARCHETYPES_BY_NAME[persona.archetype]
@@ -346,6 +379,16 @@ def build_customer(
         customer_email = f"{persona.principal_id}@redwood-demo.example"
         customer_segment = persona.customer_segment
         loyalty_tier = persona.loyalty_tier
+        account_age_days = persona.account_age_days
+        login_frequency_monthly = persona.login_frequency_monthly
+        avg_session_duration_minutes = persona.avg_session_duration_minutes
+        app_engagement_score = persona.app_engagement_score
+        cart_abandonment_count = persona.cart_abandonment_count
+        abandoned_cart_value_90d = persona.abandoned_cart_value_90d
+        support_tickets_count = persona.support_tickets_count
+        open_support_tickets_count = persona.open_support_tickets_count
+        complaints_count = persona.complaints_count
+        return_rate_percent = persona.return_rate_percent
     else:
         archetype = rng.choices(
             ARCHETYPES, weights=[a.weight for a in ARCHETYPES], k=1
@@ -363,26 +406,29 @@ def build_customer(
             "NONE": "CASUAL_SHOPPER",
         }.get(loyalty_tier, "CASUAL_SHOPPER")
 
-    lo, hi = archetype.login_frequency_range
-    login_frequency_monthly = rng.randint(lo, hi)
+        account_age_days = rng.randint(120, 1900)
+        lo, hi = archetype.login_frequency_range
+        login_frequency_monthly = rng.randint(lo, hi)
 
-    lo, hi = archetype.engagement_score_range
-    app_engagement_score = round(rng.uniform(lo, hi), 2)
+        lo, hi = archetype.engagement_score_range
+        app_engagement_score = round(rng.uniform(lo, hi), 2)
 
-    lo, hi = archetype.session_minutes_range
-    avg_session_duration_minutes = round(rng.uniform(lo, hi), 1)
+        lo, hi = archetype.session_minutes_range
+        avg_session_duration_minutes = round(rng.uniform(lo, hi), 1)
 
-    lo, hi = archetype.cart_abandonment_range
-    cart_abandonment_count = rng.randint(lo, hi)
+        lo, hi = archetype.cart_abandonment_range
+        cart_abandonment_count = rng.randint(lo, hi)
+        abandoned_cart_value_90d = round(cart_abandonment_count * rng.uniform(120.0, 680.0), 2)
 
-    lo, hi = archetype.support_tickets_range
-    support_tickets_count = rng.randint(lo, hi)
+        lo, hi = archetype.support_tickets_range
+        support_tickets_count = rng.randint(lo, hi)
+        open_support_tickets_count = min(support_tickets_count, rng.randint(0, 2))
 
-    lo, hi = archetype.complaints_range
-    complaints_count = rng.randint(lo, hi)
+        lo, hi = archetype.complaints_range
+        complaints_count = rng.randint(lo, hi)
 
-    lo, hi = archetype.return_rate_range
-    return_rate_percent = round(rng.uniform(lo, hi), 1)
+        lo, hi = archetype.return_rate_range
+        return_rate_percent = round(rng.uniform(lo, hi), 1)
 
     iam_principal = None
     if persona is not None and project_id:
@@ -395,16 +441,16 @@ def build_customer(
         customer_segment=customer_segment,
         loyalty_tier=loyalty_tier,
         is_loyalty_member=0 if loyalty_tier == "NONE" else 1,
-        account_age_days=rng.randint(120, 1900),
+        account_age_days=account_age_days,
         archetype=archetype,
         login_frequency_monthly=login_frequency_monthly,
         avg_session_duration_minutes=avg_session_duration_minutes,
         app_engagement_score=app_engagement_score,
         app_sessions_last_30d=max(0, int(login_frequency_monthly * rng.uniform(0.8, 1.6))),
         cart_abandonment_count=cart_abandonment_count,
-        abandoned_cart_value_90d=round(cart_abandonment_count * rng.uniform(120.0, 680.0), 2),
+        abandoned_cart_value_90d=abandoned_cart_value_90d,
         support_tickets_count=support_tickets_count,
-        open_support_tickets_count=min(support_tickets_count, rng.randint(0, 2)),
+        open_support_tickets_count=open_support_tickets_count,
         complaints_count=complaints_count,
         return_frequency=int(return_rate_percent // 4),
         return_rate_percent=return_rate_percent,
@@ -522,7 +568,12 @@ def generate_order_dates(
             cutoff - timedelta(days=rng.randint(30, 190)),
         ]
 
-    if persona is not None and persona.baseline_orders:
+    if persona is not None and not purchases_after_cutoff and persona.baseline_orders > 1:
+        dates = [
+            now - timedelta(days=max(persona.days_since_last_purchase, 450 - i * 60))
+            for i in range(persona.baseline_orders)
+        ]
+    elif persona is not None and persona.baseline_orders:
         # Trim to roughly the persona's intended order count, keeping the most
         # recent orders so recency stays representative.
         dates = dates[-persona.baseline_orders:]

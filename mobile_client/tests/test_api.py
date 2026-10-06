@@ -374,8 +374,8 @@ class TestDemo2Recovery(unittest.TestCase):
                 }
                 self._add_app_orders("cust_demo2", prior)
                 order = self._preview()
-                self.assertEqual(order["engagement"]["loginFrequencyMonthly"], 6)
-                self.assertEqual(order["supportMetrics"]["returnRatePercent"], 15.0)
+                self.assertEqual(order["engagement"]["loginFrequencyMonthly"], 5)
+                self.assertEqual(order["supportMetrics"]["returnRatePercent"], 16.5)
                 self.assertEqual(order["supportMetrics"]["supportTicketsCount"], 4)
 
     def test_third_well_rated_order_carries_the_recovered_snapshot(self):
@@ -390,7 +390,7 @@ class TestDemo2Recovery(unittest.TestCase):
     def test_a_poor_rating_is_not_recovery(self):
         self._add_app_orders("cust_demo2", 3)
         order = self._preview(rating=1)
-        self.assertEqual(order["engagement"]["loginFrequencyMonthly"], 6)
+        self.assertEqual(order["engagement"]["loginFrequencyMonthly"], 5)
         # The complaint still adds its ticket on top of the struggling snapshot.
         self.assertEqual(order["supportMetrics"]["supportTicketsCount"], 5)
         self.assertTrue(order["supportMetrics"]["hasActiveComplaint"])

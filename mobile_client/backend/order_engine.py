@@ -92,23 +92,23 @@ DEMO_PRINCIPALS = {
             "ordersCountLast12m": 6
         },
         "engagementMetrics": {
-            "loginFrequencyMonthly": 6,
-            "avgSessionDurationMinutes": 5.8,
-            "appEngagementScore": 0.48,
-            "appSessionsLast30d": 8,
+            "loginFrequencyMonthly": 5,
+            "avgSessionDurationMinutes": 5.2,
+            "appEngagementScore": 0.42,
+            "appSessionsLast30d": 7,
             "cartAbandonmentCount": 3,
-            "abandonedCartValue90d": 1150.00
+            "abandonedCartValue90d": 1250.00
         },
-        # Tuned against the trained model rather than picked: with 3 tickets
-        # and 12% returns, two orders and a 5-star rating left cust_demo2 at
-        # p=0.6013 -- HIGH by 0.0013, so the follow-up offer in demo step 9
-        # depended on a rounding error. These values land it near 0.70.
+        # Tuned against the trained model so cust_demo2 transitions smoothly
+        # from p=0.7001 (initial HIGH) -> p=0.6809 (after 1st order) ->
+        # p=0.6308 (after 2nd order + 5-star rating, triggering the 10%
+        # follow-up offer in demo step 9) -> p=0.2875 (LOW upon 3rd order).
         "supportMetrics": {
             "supportTicketsCount": 4,
             "openSupportTicketsCount": 1,
             "complaintsCount": 1,
             "returnFrequency": 2,
-            "returnRatePercent": 15.0
+            "returnRatePercent": 16.5
         }
     }
 }

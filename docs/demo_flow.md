@@ -76,9 +76,9 @@ The seeder creates two personas with deliberately opposite histories, so the dem
 |  | `cust_demo1` | `cust_demo2` |
 | :---- | :---- | :---- |
 | Behaviour | Buying regularly | Lapsed |
-| Days since last purchase | 22 | 197 |
-| Churn probability | 0.0327 | 0.8856 |
-| Tier | LOW | CRITICAL |
+| Days since last purchase | 22 | 95 |
+| Churn probability | 0.0327 | 0.7001 |
+| Tier | LOW | HIGH |
 | Agent decision | Skip | Issue an offer |
 | Discount on an order | None | Whatever the agent's offer says |
 
@@ -93,10 +93,10 @@ A suggested order, roughly ten minutes:
 1. **Press Reset Demo** in the console. `customer_sessions` and `loyalty_offers` are empty, and the agent is warm.  
 2. **Log in as `demo1`.** Nothing is issued. Point at `skipReason: LOW_CHURN_RISK` on the session document: BigQuery called this customer LOW, so the agent declined to spend margin.  
 3. **Place an order as `demo1`.** Full price. There is no tier discount in the system at all — the only thing that can discount an order is an offer the agent decided to issue.  
-4. **Switch to `demo2` and log in.** An offer appears in `loyalty_offers` within seconds and reaches the phone over SSE (Server-Sent Events), carrying the churn probability and tier that justified it. Note that `churnProbability` is BigQuery's number unchanged, and that `churnRiskTier` and `eligibilityTier` agree — no judgement was needed, because the model already said CRITICAL.  
+4. **Switch to `demo2` and log in.** An offer appears in `loyalty_offers` within seconds and reaches the phone over SSE (Server-Sent Events), carrying the churn probability and tier that justified it. Note that `churnProbability` is BigQuery's number unchanged, and that `churnRiskTier` and `eligibilityTier` agree — no judgement was needed, because the model already said HIGH.  
 5. **Place an order as `demo2`.** The same cart is now 15% cheaper with free shipping, and the ledger line names the offer and its promo code. This is the moment the whole chain pays off: BigQuery scored, the agent decided, Firestore delivered, the price changed.  
 6. **Order again as `demo2`.** Full price. The offer is attached to the first order and cannot discount a second.  
-7. **Rate the order 5 stars, then press Recalculate Churn.** The purchase and the rating move `cust_demo2` from 0.9288 to 0.6242 — better, but still HIGH. The customer is recovering, not recovered.  
+7. **Rate the order 5 stars, then press Recalculate Churn.** The purchase and the rating move `cust_demo2` from 0.7001 to 0.6308 — better, but still HIGH. The customer is recovering, not recovered.  
 8. **Log in as `demo2` once more.** The redeemed offer no longer silences the agent, but it does not repeat itself either: it issues a *follow-up* at a stepped-down 10%, carrying `offerSequence: 2` and `supersedesOfferId` pointing at the offer just redeemed. The discount tracks the risk down.  
 9. **Log in once more.** `FOLLOW_UP_LIMIT_REACHED`. One follow-up is the cap, so the agent cannot discount its way into a spiral. Had the first offer still been ACTIVE rather than redeemed, the reason would instead read `ACTIVE_OFFER_ALREADY_EXISTS` — the guardrails hold on both paths.  
 10. **Show the order arriving in `retail_cdc`** within seconds, with `customer_id = 'cust_demo2'` — the same identity the churn model and the agent use. The console's BigQuery node has been showing how long that leg took since the moment the order was placed.

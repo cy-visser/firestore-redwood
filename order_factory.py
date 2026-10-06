@@ -295,6 +295,18 @@ def build_customer_orders(customer: Customer, rng: random.Random) -> List[Dict[s
     orders: List[Dict[str, Any]] = []
     for seq, order_date in enumerate(customer.order_dates, start=1):
         orders.append(build_order(customer, order_date, seq, rng, orders))
+    if customer.is_demo_persona and orders:
+        for o in orders:
+            if o["orderStatus"] == "CANCELLED":
+                o["orderStatus"] = "DELIVERED"
+        last = orders[-1]
+        last["customerFeedback"]["rating"] = customer.feedback_rating
+        last["customerFeedback"]["sentimentScore"] = customer.sentiment_score
+        last["customerFeedback"]["hasActiveComplaint"] = customer.has_active_complaint
+        last["customerFeedback"]["primaryComplaintReason"] = customer.primary_complaint_reason
+        last["supportMetrics"]["sentimentScore"] = customer.sentiment_score
+        last["supportMetrics"]["hasActiveComplaint"] = customer.has_active_complaint
+        last["supportMetrics"]["primaryComplaintReason"] = customer.primary_complaint_reason
     return orders
 
 
