@@ -25,7 +25,14 @@ The power of Firestore in this use case is its native capability of synchronizin
 
 1. Install [`gcloud`](https://cloud.google.com/sdk/docs/install), [`terraform`](https://developer.hashicorp.com/terraform/install) (1.5 or later) and [`python3`](https://www.python.org/downloads/).
 
-2. Create your own GCP project and link a billing account:
+2. Clone the repository:
+
+   ```sh
+   git clone git@github.com:cy-visser/firestore-redwood.git
+   cd firestore-redwood
+   ```
+
+3. Create your own GCP project and link a billing account:
 
    ```sh
    gcloud projects create <PROJECT_ID>
@@ -33,7 +40,7 @@ The power of Firestore in this use case is its native capability of synchronizin
    gcloud billing projects link <PROJECT_ID> --billing-account=<BILLING_ACCOUNT_ID>
    ```
 
-3. Sign in and select the project:
+4. Sign in and select the project:
 
    ```sh
    gcloud auth login
@@ -42,15 +49,13 @@ The power of Firestore in this use case is its native capability of synchronizin
    gcloud auth application-default set-quota-project <PROJECT_ID>
    ```
 
-4. Clone the repository and create `.env`:
+5. Create `.env` and set your project and region (`deploy.sh` passes these to Terraform automatically):
 
    ```sh
-   git clone git@github.com:cy-visser/firestore-redwood.git
-   cd firestore-redwood
    cp .env.example .env
    ```
 
-5. Edit `.env` and set:
+   Edit `.env`:
 
    ```sh
    GCP_PROJECT_ID=<PROJECT_ID>
@@ -86,16 +91,7 @@ The power of Firestore in this use case is its native capability of synchronizin
 
 ## 2\. The two demo customers
 
-The seeder creates two personas with deliberately opposite histories, so the demo shows the agent deciding rather than always issuing.
-
-|  | `cust_demo1` | `cust_demo2` |
-| :---- | :---- | :---- |
-| Behaviour | Buying regularly | Lapsed |
-| Days since last purchase | 22 | 95 |
-| Churn probability | 0.0327 | 0.7001 |
-| Tier | LOW | HIGH |
-| Agent decision | Skip | Issue an offer |
-| Discount on an order | None | Whatever the agent's offer says |
+The seeder creates two personas with deliberately opposite histories. Churn risk runs once a day, but for demo purposes you can manually trigger it from the console.
 
 ---
 
@@ -106,15 +102,13 @@ A suggested order, roughly ten minutes:
 1. **Press Reset Demo** in the console. `customer_sessions` and `loyalty_offers` are empty, and the agent is warm.
 2. **Log in as `demo1`.** Nothing is issued. Point at `skipReason: LOW_CHURN_RISK` on the session document: BigQuery called this customer LOW, so the agent declined to spend margin.
 3. **Place an order as `demo1`.** Full price. There is no tier discount in the system at all — the only thing that can discount an order is an offer the agent decided to issue.
-4. **Switch to `demo2` and log in.** An offer appears in `loyalty_offers` within seconds and reaches the phone over SSE (Server-Sent Events), carrying the churn probability and tier that justified it. Note that `churnProbability` is BigQuery's number unchanged, and that `churnRiskTier` and `eligibilityTier` agree — no judgement was needed, because the model already said HIGH.
-5. **Place an order as `demo2`.** The same cart is now 15% cheaper with free shipping, and the ledger line names the offer and its promo code. This is the moment the whole chain pays off: BigQuery scored, the agent decided, Firestore delivered, the price changed.
-6. **Order again as `demo2`.** Full price. The offer is attached to the first order and cannot discount a second.
-7. **Rate the order 5 stars, then press Recalculate Churn.** The purchase and the rating move `cust_demo2` from 0.7001 to 0.6308 — better, but still HIGH. The customer is recovering, not recovered.
-8. **Log in as `demo2` once more.** The redeemed offer no longer silences the agent, but it does not repeat itself either: it issues a *follow-up* at a stepped-down 10%, carrying `offerSequence: 2` and `supersedesOfferId` pointing at the offer just redeemed. The discount tracks the risk down.
-9. **Log in once more.** `FOLLOW_UP_LIMIT_REACHED`. One follow-up is the cap, so the agent cannot discount its way into a spiral. Had the first offer still been ACTIVE rather than redeemed, the reason would instead read `ACTIVE_OFFER_ALREADY_EXISTS` — the guardrails hold on both paths.
-10. **Show the order arriving in `retail_cdc`** within seconds, with `customer_id = 'cust_demo2'` — the same identity the churn model and the agent use. The console's BigQuery node has been showing how long that leg took since the moment the order was placed.
-
-The point worth making in step 5 is that no part of the path was polled or scheduled. The login itself caused the offer.
+4. **Switch to `demo2` and log in.** An offer appears in `loyalty_offers` within seconds and reaches the phone over SSE (Server-Sent Events), carrying the churn probability and tier that justified it. 
+5. **Place an order as `demo2` with 5 star rating.** The same cart is now 15% cheaper with free shipping, and the ledger line names the offer and its promo code. 
+6. **Go to Console and press Recalculate Churn.** The purchase and the rating move `cust_demo2` improved, but still HIGH. The customer is recovering, not recovered.
+7. **Log in as `demo2` once more.** The agent issues a *follow-up* at a stepped-down 10%, carrying `offerSequence: 2` and `supersedesOfferId` pointing at the offer just redeemed. The discount tracks the risk down.
+8. **Go to Console and press Recalculate Churn again.** The purchase and the rating move `cust_demo2` improved, but still HIGH
+9. **Log in once more.** No offer issued. In console you will see `skipReason: FOLLOW_UP_LIMIT_REACHED`. One follow-up is the cap, so the agent cannot discount its way into a spiral. Had the first offer still been ACTIVE rather than redeemed, the reason would instead read `ACTIVE_OFFER_ALREADY_EXISTS` — the guardrails hold on both paths.
+10. **Go to Console and press Recalculate Churn again.** The churn rating for `cust_demo2` is now LOW risk.,
 
 ---
 
@@ -124,7 +118,7 @@ An offer carries two tiers side by side: `churnRiskTier` is the model's, and `el
 
 1. `cust_demo1` is healthy, so BigQuery scores it below the gate (`LOW`) and the agent would normally skip it.
 2. **Place an order as `demo1`, rate that order 1 star, and pick a complaint reason.** That writes `customerFeedback.feedbackTimestamp` onto the order.
-3. **Log in as `demo1` again.** BigQuery still scores this customer LOW — it was scored overnight and the complaint is minutes old, so the model provably cannot have seen it. The agent notices exactly that: it compares the order's `feedbackTimestamp` against `calculation_timestamp` on the scored row.
-4. **Only because the complaint is newer does the agent ask the ADK `LlmAgent` judge a single question:** does this change the picture? Read `escalationReason` off the offer document — those are the judge's own words — and point at `judge escalate …` on the Agent Engine node, which is the cost of asking.
+3. **Go to Console and press Recalculate Churn.** The purchase and the rating move `cust_demo1` declined, but is still LOW risk.
+4. **Log in as `demo1` again.** Customer is LOW Risk, however the Agent will judge whether or not create a loyalty offer. Read `escalationReason` and `escalationTrigger` in the Loyalty offer document in the console. This is the Agent reasoning whether to give an offer or not.
 
-Declining is the default and the common case (`skipReason: ESCALATION_DECLINED`) — a customer who is fine stays fine, and a rule that always fires is not a judgement. When the judge does escalate, Gemini tends to reference the complaint in the offer copy; `SORRYDELIVERY15` was a real promo code from a live run.
+**Press Reset demo** in the console to start over

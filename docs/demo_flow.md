@@ -38,34 +38,69 @@ The power of Firestore in this use case is its native capability of synchronizin
 
 ## 1\. Deploying
 
-```sh
-./deploy.sh
-```
+1. Install [`gcloud`](https://cloud.google.com/sdk/docs/install), [`terraform`](https://developer.hashicorp.com/terraform/install) (1.5 or later) and [`python3`](https://www.python.org/downloads/).
 
-One command. Six steps, in this order and for these reasons:
+2. Clone the repository:
 
-| Step | What it does | Why here |
-| :---- | :---- | :---- |
-| 1/6 | Builds and pushes the CDC and bridge images | Terraform deploys by digest, so the images must exist first |
-| 2/6 | `terraform apply` | Creates everything except the agent |
-| 3/6 | Seeds Firestore, then reconciles BigQuery | Reconciliation is unconditional |
-| 4/6 | Builds feature views, trains the model, scores every customer | The agent needs scores to read |
-| 5/6 | Deploys the agent to Agent Engine | Stages through the bucket Terraform created |
-| 6/6 | Prints the summary |  |
+   ```sh
+   git clone git@github.com:cy-visser/firestore-redwood.git
+   cd firestore-redwood
+   ```
 
-### Useful variations
+3. Create your own GCP project and link a billing account:
 
-```sh
-./deploy.sh --dry-run            # Validate config and show the Terraform plan
-./deploy.sh --skip-image-build   # Reuse the images already in Artifact Registry
-./deploy.sh --skip-seed          # Leave Firestore as it is
-./deploy.sh --skip-bqml          # Do not retrain the churn model
-./deploy.sh --skip-agent-deploy  # Leave the deployed agent alone
-./deploy.sh --seed-count 1000    # Seed 1,000 customers instead of 400
-./deploy.sh --create-project     # Provision a new project first
-```
+   ```sh
+   gcloud projects create <PROJECT_ID>
+   gcloud billing accounts list
+   gcloud billing projects link <PROJECT_ID> --billing-account=<BILLING_ACCOUNT_ID>
+   ```
 
-The `--skip-*` flags matter in practice: a full run rebuilds two container images, retrains the model and redeploys the agent, and the agent deployment alone takes two to three minutes.
+4. Sign in and select the project:
+
+   ```sh
+   gcloud auth login
+   gcloud auth application-default login
+   gcloud config set project <PROJECT_ID>
+   gcloud auth application-default set-quota-project <PROJECT_ID>
+   ```
+
+5. Create `.env` and set your project and region (`deploy.sh` passes these to Terraform automatically):
+
+   ```sh
+   cp .env.example .env
+   ```
+
+   Edit `.env`:
+
+   ```sh
+   GCP_PROJECT_ID=<PROJECT_ID>
+   GCP_REGION=europe-west4
+   ```
+
+6. Deploy:
+
+   ```sh
+   ./deploy.sh
+   ```
+
+7. Open the **Mobile App** and **Redwood Console** URLs printed at the end (`http://localhost:<port>/` and `http://localhost:<port>/console`). Keep the terminal open; `Ctrl+C` closes the tunnel (run `./deploy.sh --proxy` to reopen it later).
+
+### Other commands
+
+| Command | Use |
+| :---- | :---- |
+| `./deploy.sh --proxy` | Reopen the local tunnel to `redwood-app` without redeploying |
+| `./deploy.sh --dry-run` | Show the Terraform plan without changing anything |
+| `./deploy.sh --skip-image-build` | Redeploy without rebuilding the container images |
+| `./deploy.sh --skip-seed` | Redeploy without reseeding Firestore |
+| `./deploy.sh --skip-bqml` | Redeploy without retraining the churn model |
+| `./deploy.sh --skip-agent-deploy` | Redeploy without redeploying the agent |
+| `./deploy.sh --seed-count 1000` | Seed 1,000 customers instead of 400 |
+| `./deploy.sh --no-proxy` | Deploy without opening the local tunnel |
+| `./deploy.sh --teardown` | Delete all deployed resources (the project is kept) |
+
+> [!IMPORTANT]
+> To deploy into a different project from the same checkout, run `./deploy.sh --teardown` first.
 
 ---
 

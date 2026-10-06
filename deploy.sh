@@ -22,7 +22,6 @@ SKIP_BQML=false
 DRY_RUN=false
 TEARDOWN_MODE=false
 AUTO_APPROVE=false
-CREATE_PROJECT=false
 RUN_TESTS=false
 VERIFY_DEMO=false
 SKIP_IMAGE_BUILD=false
@@ -39,7 +38,6 @@ Single-command full deployment and lifecycle management for Redwood Retail.
 
 Options:
   -h, --help               Show this help message and exit.
-  -p, --create-project     Provision a new GCP project using terraform/bootstrap before deploying components.
   -s, --seed-count <N>     Number of synthetic customers to generate (default: 400). Each
                            produces roughly 4-20 orders depending on archetype, and the two
                            demo personas are seeded in addition to this count.
@@ -65,7 +63,6 @@ Examples:
   ./deploy.sh --no-proxy              # Deploy and exit without holding a tunnel
   ./deploy.sh --run-tests             # Execute the self-test suites
   ./deploy.sh --verify-demo           # Check the deployed stack end to end
-  ./deploy.sh --create-project        # Bootstrap a new GCP project first, then deploy components
   ./deploy.sh --seed-count 1000       # Deploy and seed 1,000 customers
   ./deploy.sh --dry-run               # Preview Terraform execution plan
   ./deploy.sh --teardown              # Destroy all cloud resources cleanly
@@ -78,10 +75,6 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       usage
       exit 0
-      ;;
-    -p|--create-project)
-      CREATE_PROJECT=true
-      shift
       ;;
     -s|--seed-count)
       SEED_COUNT="$2"
@@ -365,60 +358,11 @@ sys.exit(1)
 preflight_sdk
 
 # ------------------------------------------------------------------------------
-# 0. Optional: Project Bootstrap Lifecycle
-# ------------------------------------------------------------------------------
-if [[ "$CREATE_PROJECT" == true ]]; then
-  echo "🚀 Bootstrapping new Google Cloud Project via Terraform..."
-  if [[ ! -f "$TERRAFORM_DIR/bootstrap/terraform.tfvars" ]]; then
-    echo "❌ Error: $TERRAFORM_DIR/bootstrap/terraform.tfvars not found." >&2
-    echo "Please copy $TERRAFORM_DIR/bootstrap/terraform.tfvars.example to $TERRAFORM_DIR/bootstrap/terraform.tfvars and set billing_account_id." >&2
-    exit 1
-  fi
-
-  echo "📦 Initializing Terraform Bootstrap module..."
-  terraform -chdir="$TERRAFORM_DIR/bootstrap" init -upgrade
-
-  if [[ "$DRY_RUN" == true ]]; then
-    echo "🔍 Planning project creation..."
-    terraform -chdir="$TERRAFORM_DIR/bootstrap" plan
-    if [[ ! -f "$REDWOOD_DIR/.env" ]]; then
-      echo -e "\nℹ️  Dry-run plan for project bootstrap completed successfully."
-      echo "To preview application components, run ./deploy.sh --create-project without --dry-run or provide an existing GCP_PROJECT_ID in .env."
-      exit 0
-    fi
-  else
-    # An `if` for the same reason as the Terraform output reporting below:
-    # under `set -e` the `&&` form exits the script whenever the test is false,
-    # which here means every run that did not pass --yes.
-    APPROVE_FLAG=""
-    if [[ "$AUTO_APPROVE" == true ]]; then
-      APPROVE_FLAG="-auto-approve"
-    fi
-    echo "🏗️  Applying project creation..."
-    terraform -chdir="$TERRAFORM_DIR/bootstrap" apply $APPROVE_FLAG
-
-    BOOTSTRAP_PROJECT_ID=$(terraform -chdir="$TERRAFORM_DIR/bootstrap" output -raw project_id 2>/dev/null || true)
-    if [[ -n "$BOOTSTRAP_PROJECT_ID" ]]; then
-      echo "✅ Successfully provisioned project: $BOOTSTRAP_PROJECT_ID"
-      if [[ ! -f "$REDWOOD_DIR/.env" && -f "$REDWOOD_DIR/.env.example" ]]; then
-        cp "$REDWOOD_DIR/.env.example" "$REDWOOD_DIR/.env"
-        echo "📄 Created .env from .env.example"
-      fi
-      if [[ -f "$REDWOOD_DIR/.env" ]]; then
-        sed -i.bak -E "s|^GCP_PROJECT_ID=.*|GCP_PROJECT_ID=$BOOTSTRAP_PROJECT_ID|" "$REDWOOD_DIR/.env" && rm -f "$REDWOOD_DIR/.env.bak"
-        echo "📝 Updated GCP_PROJECT_ID in $REDWOOD_DIR/.env to: $BOOTSTRAP_PROJECT_ID"
-      fi
-    fi
-  fi
-fi
-
-# ------------------------------------------------------------------------------
 # 1. Environment & Prerequisites Verification
 # ------------------------------------------------------------------------------
 if [[ ! -f "$REDWOOD_DIR/.env" ]]; then
   echo "❌ Error: .env file not found in $REDWOOD_DIR." >&2
-  echo "   Existing project:  cp .env.example .env, then set GCP_PROJECT_ID (and GCP_REGION)." >&2
-  echo "   No project yet:    ./deploy.sh --create-project creates one and writes .env for you." >&2
+  echo "   Run: cp .env.example .env, then set GCP_PROJECT_ID (and GCP_REGION)." >&2
   exit 1
 fi
 
